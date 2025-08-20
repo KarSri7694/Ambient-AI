@@ -1,5 +1,6 @@
 import ffmpeg;
 import os
+import whisperx
 
 # Function to convert audio files to WAV format
 def convert_audio_to_wav(input_file):
@@ -12,4 +13,7 @@ def convert_audio_to_wav(input_file):
         return False
     return True 
 
-convert_audio_to_wav("uploads/test.ogg");
+def whisper_transcribe(input_file):
+    # Placeholder for transcription logic
+    # This function should implement the transcription logic using Whisper or any other library
+    pass
