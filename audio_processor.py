@@ -1,48 +1,61 @@
 import whisperx
 import torch
+import warnings
+
+# Suppress specific UserWarnings from torchaudio and pyannote
+warnings.filterwarnings("ignore", category=UserWarning, module='torchaudio')
+warnings.filterwarnings("ignore", category=UserWarning, module='pyannote')
+# Suppress the ReproducibilityWarning
+warnings.filterwarnings("ignore", message="TensorFloat-32 is disabled", category=UserWarning)
+
 
 
 class AudioProcessor:
     def __init__(self):
         """
-        Initializes the AudioProcessor and preloads models to RAM (CPU).
+        Initializes the AudioProcessor and preloads models to VRAM.
         This is a slow, one-time operation that happens on server start.
         """
-        print("🚀 Preloading AI models to RAM, this may take a moment...")
+        print("Loading whisperX in GPU")
         
-        # Check for GPU and set devices
-        self.device_gpu = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.device_cpu = torch.device("cpu")
-        
-        # --- Preload WhisperX to CPU ---
-        # The key is device='cpu'. This forces the model into system RAM.
+        # Check for GPU
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA (GPU) is not available. This processor requires a GPU.")
+
+        # --- Preload WhisperX to GPU ---
+        # For GPU, float16 is much faster.
         self.whisper_model = whisperx.load_model(
             "medium",
-            device="cpu",
-            compute_type="float32", # Use float32 for CPU for better compatibility
-            language="en" # Optional: specify language if known
+            device="cuda",
+            compute_type="float16", 
         )
         
-        print("✅ WhisperX model preloaded to RAM.")
-        # In the future, you would also preload Pyannote and your LLM here.
-        input("Press Enter to exit...")  # Keep the script running for testing
+        print("✅ WhisperX model Loaded to VRAM.")
 
     def transcribe_audio(self, wav_filepath):
         """
         Transcribes an audio file using the preloaded model.
+        Specifying the language avoids detection and speeds up transcription.
         """
-        print("🧠 Moving WhisperX to GPU for transcription...")
-        # 1. Move the preloaded model to the GPU (fast)
-        self.whisper_model.to(self.device_gpu)
-        
+        # 1. Load audio
+        audio = whisperx.load_audio(wav_filepath)
+
         # 2. Transcribe the audio on the GPU
-        result = self.whisper_model.transcribe(wav_filepath, batch_size=4)
+        # By adding the language parameter, you avoid the "No language specified" warning.
+        result = self.whisper_model.transcribe(audio, batch_size=4)
         
-        # 3. Move the model back to the CPU (fast) to free up VRAM
-        self.whisper_model.to(self.device_cpu)
+        print("✅ Transcription complete.")
         
-        print("✅ Transcription complete. Model moved back to CPU.")
+        # 3. Save transcription to a file
+        transcription_path = "transcriptions/transcription.txt"
+        with open(transcription_path, "w", encoding="utf-8") as f:
+            for segment in result['segments']:
+                f.write(f"[{segment['start']:.2f}s -> {segment['end']:.2f}s] {segment['text']}\n")
+        
+        print(f"Transcription saved to {transcription_path}")
         return result['segments'] # Return the transcribed segments
-    
-audio_pipeline = AudioProcessor()
-# Example usage
+
+    # Example usage
+transciber= AudioProcessor()
+transciber.transcribe_audio("uploads/2025-08-22_00-47-04.wav")
+

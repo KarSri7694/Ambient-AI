@@ -6,7 +6,7 @@ from audio_preprocessor import convert_audio_to_wav
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
-ALLOWED_EXTENSIONS = {'wav', 'mp3', 'ogg', 'aac', 'm4a'}
+ALLOWED_EXTENSIONS = {'wav', 'mp3', 'ogg', 'aac', 'm4a', 'opus'}
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
