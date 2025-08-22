@@ -2,7 +2,8 @@ from flask import Flask, request, template_rendered
 from werkzeug.utils import secure_filename
 import os
 from datetime import datetime
-from audio_preprocessor import convert_audio_to_wav
+from audio_preprocessor import convert_audio_to_wav, add_audio_to_queue
+import threading
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
@@ -23,15 +24,16 @@ def upload_file():
     file = request.files['file']
     
     # Generate a timestamped filename
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
     extension= file.filename.rsplit('.', 1)[1].lower() if '.' in file.filename else ''
     filename = f"{timestamp}.{extension}"
     
     if file and allowed_file(file.filename):
         filename = secure_filename(filename)
         file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
-        # Convert the uploaded audio file to WAV format
-        convert_audio_to_wav(os.path.join(app.config['UPLOAD_FOLDER'], filename))
+        # Convert the uploaded audio file to WAV format, run this in a separate thread
+        threading.Thread(target=add_audio_to_queue, args=(os.path.join(app.config['UPLOAD_FOLDER'], filename),)).start()
+        
         
         return f'''<p>File uploaded successfully!</p>
         <p>File name: {filename}</p>
