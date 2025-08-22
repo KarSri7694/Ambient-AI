@@ -10,17 +10,24 @@ app.config['UPLOAD_FOLDER'] = 'uploads'
 ALLOWED_EXTENSIONS = {'wav', 'mp3', 'ogg', 'aac', 'm4a', 'opus'}
 
 def allowed_file(filename):
+    """Checks if the uploaded file has an allowed extension."""
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 @app.route("/")
 @app.route("/home")
-def hello_world():
-    return '''<p>Hello, World!</p>\n 
-    <p>Upload a file: <a href="/upload-form">Click here</a></p>
+def home():
+    """Serves the home page with a link to the upload form."""
+    return '''
+        <p>Welcome to the Audio Transcription Service!</p>
+        <p>Upload an audio file to begin: <a href="/upload-form">Click here</a></p>
     '''
 
 @app.route("/uploads", methods=["POST"]) 
 def upload_file():
+    """Handles the file upload, saves the file, and starts the transcription process in a background thread."""
+    if 'file' not in request.files:
+        return "<p>No file part in the request.</p>", 400
+    
     file = request.files['file']
     
     # Generate a timestamped filename
@@ -41,16 +48,18 @@ def upload_file():
         <p>Go to <a href="/">Home</a></p>
         '''
     else:
-        return '''<p>Invalid file type. Please upload a valid audio file.</p>
-        '''
+        return f'''
+            <p>Invalid file type. Allowed types are: {', '.join(ALLOWED_EXTENSIONS)}</p>
+            <p><a href="/upload-form">Try again</a></p>
+        ''', 400
 
 @app.route("/upload-form")
 def show_upload_form():
-    # This HTML form will send a POST request to your /uploads route
+    """Displays the HTML form for file uploads."""
     return '''
        <!doctype html>
-       <title>Upload a File</title>
-       <h1>Upload a New File</h1>
+       <title>Upload an Audio File</title>
+       <h1>Upload a New Audio File </h1>
        <form method="post" action="/uploads" enctype="multipart/form-data">
          <input type="file" name="file">
          <input type="submit" value="Upload">
@@ -58,5 +67,9 @@ def show_upload_form():
     '''
     
 if __name__ == '__main__':
-    # The host='0.0.0.0' makes the server accessible on your local network
+    # Ensure the 'uploads' and 'transcriptions' directories exist.
+    os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+    os.makedirs('transcriptions', exist_ok=True)
+    
+    # The host='0.0.0.0' makes the server accessible on your local network.
     app.run(host='0.0.0.0', port=5000, debug=True)

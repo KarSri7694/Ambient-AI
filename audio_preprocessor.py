@@ -4,7 +4,7 @@ from whisper_transcriber import AudioProcessor
 
 base=""
 extension=".wav"
-
+audio_processor= AudioProcessor()
 def add_audio_to_queue(input_file):
     with open("audio_queue.txt", "a") as f:
         f.write(f"{input_file}\n")
@@ -12,10 +12,11 @@ def add_audio_to_queue(input_file):
     
 def start_conversion():
     lines = []
-    with open("audio_queue.txt", "r") as f:
+    with open("audio_queue.txt", "r+") as f:
         lines = f.readlines()
     for line in lines:
         input_file = line.strip()
+        line=""
         if os.path.exists(input_file):
             success = convert_audio_to_wav(input_file)
             if success:
@@ -40,6 +41,6 @@ def convert_audio_to_wav(input_file):
     return True 
 
 def whisper_transcribe(input_file):
-    AudioProcessor().transcribe_audio(input_file)
+    audio_processor.transcribe_audio(input_file)
     
 # Example usage
