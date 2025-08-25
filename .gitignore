@@ -3,3 +3,6 @@
 /uploads
 /transcriptions
 audio_queue.txt
+*.wav
+*.opus
+*.m4a
