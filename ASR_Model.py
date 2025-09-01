@@ -1,15 +1,10 @@
 from faster_whisper import WhisperModel
 from pyannote.audio import Pipeline
-from pyannote.audio.pipelines import SpeakerDiarization
-from pyannote.audio import Audio, Inference, Model
 from pyannote.core import Annotation, Segment
 from speechbrain.inference.speaker import EncoderClassifier
-from pydub import AudioSegment
 import sqlite3
-import numpy as np
 from silero_vad import load_silero_vad, get_speech_timestamps
 import hashlib
-import os
 from collections import defaultdict
 import warnings
 import torch
@@ -185,8 +180,7 @@ class ASR:
             end_time = f"{int(turn.end // 60):02d}:{turn.end % 60:05.2f}"
         
             print(f"[{start_time} - {end_time}] {identified_name}")
-        
-        
+
 
 transcriber = ASR(audio_file="")
 transcriber.run()
