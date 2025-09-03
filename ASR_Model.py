@@ -27,9 +27,18 @@ UPDATE_THRESHOLD = 0.9
 CREATE_NEW_EMBEDDING_THRESHOLD = 0.1
 
 class ASR:
-    
+    '''
+    Automatic Speech Recognition (ASR) model that transcribes and diarises audio files, and identifies speakers using voice embeddings.
+    '''
     def __init__(self, model_size = TURBO, device = "cuda", compute_type = "int8_float16", audio_file=None):
-        
+        '''
+        Initialize the ASR model with specified parameters.
+        Args:
+            model_size (str): Size of the Whisper model to use. Options are "small", "medium", "large-v3", "turbo". Default is "turbo".
+            device (str): Device to run the model on. Options are "cuda" or "cpu". Default is "cuda".
+            compute_type (str): Type of computation to use. Options are "int8_float16
+            audio_file (str): Path to the audio file to transcribe and diarize. Default is None.
+        '''
         self.HFToken = self.load_HFToken()
         self.transcribe_model = WhisperModel(model_size, device=device, compute_type=compute_type)
         self.diarisation_model = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=self.HFToken)
@@ -48,6 +57,9 @@ class ASR:
             return f.read().strip("\n")
 
     def transcribe_audio(self, vad_filter = False):
+        '''
+
+        '''
         segments, _ = self.transcribe_model.transcribe(self.audio_file, vad_filter=vad_filter)
         # for segment in segments:
         #     print(f"text: {segment.text}, start: {segment.start}, end: {segment.end}") 
@@ -59,6 +71,9 @@ class ASR:
         return segments
     
     def diarise_audio(self):
+        '''
+        Diarise the audio file using VAD and pyannote.audio's diarisation model.
+        '''
         silero_segmentation = Annotation()
         waveform, sample_rate = torchaudio.load(self.audio_file)
         
@@ -84,8 +99,10 @@ class ASR:
             for turn, _, speaker in self.diarizied_segments.itertracks(yield_label=True):
                 f.write(f"start={turn.start:.2f}s stop={turn.end:.2f}s speaker={speaker}\n")
     
-
     def connect_db(self):
+        '''
+        Connect to the SQLite database and create the VOICE_EMBEDDINGS table if it doesn't exist.
+        '''
         conn = sqlite3.connect(VOICE_DATABASE)
         cursor = conn.cursor()
         cursor.execute('''CREATE TABLE IF NOT EXISTS VOICE_EMBEDDINGS (
@@ -99,6 +116,10 @@ class ASR:
         return conn
     
     def compare_embeddings(self):
+        '''
+        Compare the embeddings of the diarised segments with the embeddings stored in the database.
+        Returns a mapping of speaker labels to identified names.
+        '''
         diarized_segments = self.diarizied_segments
         audio_file = self.audio_file
         waveform, samplerate = torchaudio.load(audio_file)
@@ -131,24 +152,33 @@ class ASR:
                     name, embedding_blob =row[0], row[1] 
                     buffer = io.BytesIO(embedding_blob)
                     stored_embedding = torch.load(buffer)
-                    print(f"stored embedding shape: {stored_embedding.shape}")
-                    print(f"new embedding shape: {embedding.shape}")
                     similiarity_score = torch.nn.functional.cosine_similarity(embedding, stored_embedding, dim=2).item()
-                    print(name)
                     if similiarity_score > highest_similiarity_score:
                         highest_similiarity_score = similiarity_score
                         best_name = name
                 
                 if highest_similiarity_score > SIMILARITY_THRESHOLD:
-                    print(f"Speaker identified as: {best_name}, Accuracy: {(highest_similiarity_score)*100:.2f}%")
+                    # print(f"Speaker identified as: {best_name}, Accuracy: {(highest_similiarity_score)*100:.2f}%")
                     speaker_mapping[speaker] = best_name
                 else:
-                    print(f"No matching speaker found. best name: {best_name} Highest Score: {highest_similiarity_score:.4f}")
+                    # print(f"No matching speaker found. best name: {best_name} Highest Score: {highest_similiarity_score:.4f}")
                     speaker_mapping[speaker] = f"UNKNOWN_{best_name}"
-                    
-        return speaker_mapping
+           
+        # If no speakers were identified, return an empty mapping
+        if not speaker_mapping:
+            print("\nCould not identify any speakers.")
+            return
+        print("\n--- Final Speaker Timeline ---")
+        # Now, iterate through the original segments and use the map to show the final result
+        for turn, _, speaker_label in self.diarizied_segments.itertracks(yield_label=True):
+            # Look up the identified name from our map
+            identified_name = speaker_mapping.get(speaker_label, speaker_label) # Fallback to the label if not found
+            print(f"[{turn.end:.5f} - {turn.start:.5f}] {identified_name}")
                     
     def create_embeddings(self):
+        '''
+        Create embeddings for the entire audio file and store it in the database.
+        '''
         buffer = io.BytesIO()
         waveform, samplerate = torchaudio.load(self.audio_file)
         with self.connect_db() as conn:
@@ -161,26 +191,13 @@ class ASR:
             conn.commit()
                               
     def run(self):
+        '''
+        Run the ASR model to transcribe and diarise the audio file, and identify speakers.
+        '''
         self.diarise_audio()
-        speaker_map = self.compare_embeddings()
+        self.compare_embeddings()
         # self.create_embeddings()
-        if not speaker_map:
-            print("\nCould not identify any speakers.")
-            return
-
-        print("\n--- Final Speaker Timeline ---")
-        # Now, iterate through the original segments and use the map to show the final result
-        for turn, _, speaker_label in self.diarizied_segments.itertracks(yield_label=True):
-            # Look up the identified name from our map
-            identified_name = speaker_map.get(speaker_label, speaker_label) # Fallback to the label if not found
         
-            # Format start and end times for readability
-            #AI CODE
-            start_time = f"{int(turn.start // 60):02d}:{turn.start % 60:05.2f}"
-            end_time = f"{int(turn.end // 60):02d}:{turn.end % 60:05.2f}"
-        
-            print(f"[{start_time} - {end_time}] {identified_name}")
 
-
-transcriber = ASR(audio_file="")
+transcriber = ASR(model_size=TURBO,audio_file="")
 transcriber.run()
