@@ -5,7 +5,7 @@ import soundfile as sf
 from demucs.pretrained import get_model
 from demucs.apply import apply_model
 import torch
-
+from ASR_Model import ASR
 
 '''
 Process to convert raw audio to cleaned audio:
@@ -158,3 +158,8 @@ class AudioPreprocessor:
             print(f"Error in normalization: {e}")
             return False
 
+preprocessor = AudioPreprocessor()
+preprocessor.run()
+
+asr = ASR()
+asr.run("voice_samples\\g_podcast_final.wav")

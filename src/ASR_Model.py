@@ -9,12 +9,14 @@ from collections import defaultdict
 import warnings
 import torch
 import io
+from pathlib import Path
+import os
 # import torchaudio without warnings
 with warnings.catch_warnings():
     warnings.filterwarnings("ignore", category=UserWarning, module='torchaudio')
     warnings.filterwarnings("ignore", category=FutureWarning, module='torchaudio')    
     import torchaudio
-
+    
 #Whisper model sizes
 SMALL = "small"
 MEDIUM = "medium"
@@ -27,8 +29,12 @@ VAD_MODEL = "silero_vad"
 EMBEDDING_MODEL = "speechbrain/spkrec-ecapa-voxceleb"
 
 #File paths
-VOICE_DATABASE = "voice_database.db"
+current_dir = Path(__file__).parent
+project_root = current_dir.parent
+os.chdir(project_root)
+VOICE_DATABASE = "database\\voice_database.db"
 HF_TOKEN_FILE = "HFToken.txt"
+TRANSCRIPTIONS_DIR = "transcriptions"
 
 #Thresholds
 MIN_TIME_THRESHOLD = 0.2
@@ -109,18 +115,21 @@ class ASR:
         '''
         Connect to the SQLite database and create the VOICE_EMBEDDINGS table if it doesn't exist.
         '''
-        conn = sqlite3.connect(VOICE_DATABASE)
-        cursor = conn.cursor()
-        cursor.execute('''CREATE TABLE IF NOT EXISTS VOICE_EMBEDDINGS (
+        try:
+            conn = sqlite3.connect(VOICE_DATABASE)
+            cursor = conn.cursor()
+            cursor.execute('''CREATE TABLE IF NOT EXISTS VOICE_EMBEDDINGS (
                             uid INTEGER PRIMARY KEY AUTOINCREMENT,
                             name TEXT,
                             embedding BLOB NOT NULL,
                             embedding_hash TEXT NOT NULL UNIQUE,
                             audio BLOB
                     )''')
-        conn.commit()
-        return conn
-    
+            conn.commit()
+            return conn
+        except sqlite3.OperationalError as e:
+            print(f"Error connecting to database: {e}")
+        
     def compare_embeddings(self, audio_file=None):
         '''
         Compare the embeddings of the diarised segments with the embeddings stored in the database.
@@ -155,12 +164,14 @@ class ASR:
             for speaker, tensor in speaker_tensors.items():
                 highest_similiarity_score = 0
                 best_name = "UNKNOWN"
+                tensor = tensor.to(torch.device("cuda"))
                 embedding= self.encoder.encode_batch(tensor)
                 # embedding shape = (1, 1, 192)
                 for row in cursor.execute("SELECT name, embedding FROM VOICE_EMBEDDINGS"):
                     name, embedding_blob =row[0], row[1] 
                     buffer = io.BytesIO(embedding_blob)
                     stored_embedding = torch.load(buffer)
+                    stored_embedding = stored_embedding.to(torch.device("cuda"))
                     similiarity_score = torch.nn.functional.cosine_similarity(embedding, stored_embedding, dim=2).item()
                     if similiarity_score > highest_similiarity_score:
                         highest_similiarity_score = similiarity_score
@@ -224,7 +235,7 @@ class ASR:
                     final_transcript.append((start_time, end_time, identified_name, text))
                     break
                     
-        with open(f"final_transcript_{str(file_counter)}.txt", "w", encoding="utf-8") as f:
+        with open(os.path.join(TRANSCRIPTIONS_DIR,f"final_transcript_{str(file_counter)}.txt"), "w", encoding="utf-8") as f:
             for entry in final_transcript:
                 f.write(f"[{entry[0]:.4f} - {entry[1]:.4f}] -> {entry[2]}:{entry[3]}\n")
             
@@ -244,4 +255,4 @@ class ASR:
         # self.create_embeddings()
         
 transcriber = ASR(model_size=TURBO, device="cuda", compute_type="int8_float16")
-transcriber.run(audio_file="")
+transcriber.run(audio_file="voice_samples\\ayush_chat_final.wav")
