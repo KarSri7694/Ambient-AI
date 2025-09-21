@@ -29,8 +29,8 @@ SCOPES = ['https://www.googleapis.com/auth/calendar.events']
 
 def get_calendar_service():
     creds = None
-    token_path = os.path.join(os.getcwd(), 'token.pickle')
-    creds_path = os.path.join(os.getcwd(), 'credentials.json')  # put OAuth client secrets here
+    token_path = os.path.join("D:\\Projects\\ambient_ai", 'token.pickle')
+    creds_path = os.path.join("D:\\Projects\\ambient_ai", 'credentials.json')  # put OAuth client secrets here
 
     if os.path.exists(token_path):
         with open(token_path, 'rb') as token_file:
@@ -41,7 +41,7 @@ def get_calendar_service():
             creds.refresh(Request())
         else:
             if not os.path.exists(creds_path):
-                raise FileNotFoundError("credentials.json not found. Create OAuth client credentials and place credentials.json in the project root.")
+                raise FileNotFoundError(f"credentials.json not found. Create OAuth client credentials and place credentials.json in the project root. current path: {creds_path}")
             flow = InstalledAppFlow.from_client_secrets_file(creds_path, SCOPES)
             creds = flow.run_local_server(port=0)
         with open(token_path, 'wb') as token_file:
@@ -49,8 +49,6 @@ def get_calendar_service():
 
     service = build('calendar', 'v3', credentials=creds)
     return service
-
-
 
 @mcp.tool
 def add_task(content :str = None, due_string : str = None ):
@@ -68,7 +66,6 @@ def add_task(content :str = None, due_string : str = None ):
         print(f"Task: {content} added successfully")
     except Exception as e:
         print(f"Error: {e}")
-
 
 @mcp.tool
 def schedule_meeting(title: str = None, date: str = None, time: str = None, participants: list = None, duration_minutes: int = 30):
@@ -140,7 +137,6 @@ def schedule_meeting(title: str = None, date: str = None, time: str = None, part
     except Exception as e:
         return {"error": str(e)}
     
-
 @mcp.tool
 def add(a: int, b: int) -> int:
     return a + b
