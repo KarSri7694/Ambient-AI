@@ -9,9 +9,9 @@ import pickle
 import datetime
 import uuid
 
-#add_task()
-#schedule_meeting()
-#get_task()
+#add_task() -- Done
+#schedule_meeting() -- Done
+#get_task()  
 #edit_task()
 #manage_person_profile()
 #create_obsidian_note()
@@ -49,6 +49,16 @@ def get_calendar_service():
 
     service = build('calendar', 'v3', credentials=creds)
     return service
+
+@mcp.tool
+def get_current_datetime():
+    """
+    Get the current date and time in ISO 8601 format.
+    Can be used when current date/time is needed or when user types "now", "today","tomorrow" etc.
+    Returns:
+        A string representing the current date and time in ISO 8601 format.
+    """
+    return datetime.datetime.now().isoformat()
 
 @mcp.tool
 def add_task(content :str = None, due_string : str = None ):
@@ -140,6 +150,7 @@ def schedule_meeting(title: str = None, date: str = None, time: str = None, part
 @mcp.tool
 def add(a: int, b: int) -> int:
     return a + b
+
 
 if __name__ == "__main__":
     mcp.run()
