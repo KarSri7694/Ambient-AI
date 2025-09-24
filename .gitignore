@@ -11,3 +11,6 @@ audio_queue.txt
 HFToken.txt
 voice_database.db
 /model_cache
+token.pickle
+credentials.json
+/database
