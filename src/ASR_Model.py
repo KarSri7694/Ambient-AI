@@ -37,9 +37,9 @@ HF_TOKEN_FILE = "HFToken.txt"
 TRANSCRIPTIONS_DIR = "transcriptions"
 
 #Thresholds
-MIN_TIME_THRESHOLD = 0.2
-SIMILARITY_THRESHOLD = 0.1
-UPDATE_THRESHOLD = 0.9
+MIN_TIME_THRESHOLD = 0.2 #seconds
+SIMILARITY_THRESHOLD = 0.1 #cosine similarity threshold
+UPDATE_THRESHOLD = 0.9 #cosine similarity threshold
 CREATE_NEW_EMBEDDING_THRESHOLD = 0.1
 
 #File counter
@@ -59,9 +59,9 @@ class ASR:
         '''
         self.HFToken = self.load_HFToken()
         self.transcribe_model = WhisperModel(model_size, device=device, compute_type=compute_type)
-        self.diarisation_model = Pipeline.from_pretrained(DIARIZATION_MODEL, use_auth_token=self.HFToken)
+        self.diarisation_model = Pipeline.from_pretrained(DIARIZATION_MODEL, token=self.HFToken)
         self.vad_model = load_silero_vad()
-        self.encoder = EncoderClassifier.from_hparams(source=EMBEDDING_MODEL,run_opts={"device":'cuda'})
+        self.encoder = EncoderClassifier.from_hparams(source="D:\\Projects\\ambient_ai\\spkrec-ecapa-voxceleb", run_opts={"device": device} )
         self.diarizied_segments = None
 
     @staticmethod
@@ -139,13 +139,14 @@ class ASR:
         Returns:
             speaker_mapping (dict): Mapping of speaker labels to identified names.
         '''
+        
         diarized_segments = self.diarizied_segments
         waveform, samplerate = torchaudio.load(audio_file)
         total_sample = waveform.shape[1]
         speaker_audio_tensor = defaultdict(list)
         
         speaker_mapping = {}
-        for turn, _, speaker in diarized_segments.itertracks(yield_label=True):
+        for turn, _, speaker in self.diarizied_segments.speaker_diarization.itertracks(yield_label=True):
             segment_duration = turn.end - turn.start
             if segment_duration > MIN_TIME_THRESHOLD:
                 start_sample = int(turn.start*samplerate)
@@ -166,12 +167,15 @@ class ASR:
                 best_name = "UNKNOWN"
                 tensor = tensor.to(torch.device("cuda"))
                 embedding= self.encoder.encode_batch(tensor)
+                embedding_norm = torch.nn.functional.normalize(embedding, p=2, dim=2) #normalized embedding
+                embedding_norm = embedding_norm.to(torch.device("cuda"))
                 # embedding shape = (1, 1, 192)
                 for row in cursor.execute("SELECT name, embedding FROM VOICE_EMBEDDINGS"):
                     name, embedding_blob =row[0], row[1] 
                     buffer = io.BytesIO(embedding_blob)
                     stored_embedding = torch.load(buffer)
-                    stored_embedding = stored_embedding.to(torch.device("cuda"))
+                    stored_embedding_norm = torch.nn.functional.normalize(stored_embedding, p=2, dim=2)
+                    stored_embedding_norm = stored_embedding_norm.to(torch.device("cuda"))
                     similiarity_score = torch.nn.functional.cosine_similarity(embedding, stored_embedding, dim=2).item()
                     if similiarity_score > highest_similiarity_score:
                         highest_similiarity_score = similiarity_score
@@ -228,7 +232,7 @@ class ASR:
             end_time = segment.end
             text = segment.text
             mid_time = (start_time + end_time) / 2
-            for turn, _, speaker in self.diarizied_segments.itertracks(yield_label=True):
+            for turn, _, speaker in self.diarizied_segments.speaker_diarization.itertracks(yield_label=True):
                 identified_name = speaker_mapping.get(speaker, speaker)
                 if turn.start <= mid_time <= turn.end:
                     # final transcript is a list of tuples (start_time, end_time, speaker, text)
@@ -254,5 +258,5 @@ class ASR:
         self.merge_transcriptions_and_diarization(trancription_segments=segments, speaker_mapping=speaker_mapping, audio_file=audio_file)
         # self.create_embeddings()
         
-transcriber = ASR(model_size=TURBO, device="cuda", compute_type="int8_float16")
-transcriber.run(audio_file="voice_samples\\ayush_chat_final.wav")
+# transcriber = ASR(model_size=TURBO, device="cuda", compute_type="int8_float16")
+# transcriber.run(audio_file="")
