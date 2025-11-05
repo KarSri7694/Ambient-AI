@@ -34,7 +34,7 @@ class AudioPreprocessor:
         self.input_queue_file = input_queue_file
         self.isSample = isSample
         self.VOICE_SAMPLES_DIR = "voice_samples"
-        self.OUTPUT_DIR = "output"
+        self.OUTPUT_DIR = "cleaned_audio"
         self.CONVERTED_SUFFIX = "_converted"
         self.NOISE_REDUCED_SUFFIX = "_cleaned"
         self.NORMALIZED_SUFFIX = "_final"
@@ -85,6 +85,8 @@ class AudioPreprocessor:
                     print(f"Failed to convert: {input_file}")
             else:
                 print(f"File does not exist: {input_file}")    
+        
+        return final_file # Return the last processed file path
         
     def convert_audio_to_wav(self,input_file, output_file):
         '''
@@ -161,5 +163,5 @@ class AudioPreprocessor:
 preprocessor = AudioPreprocessor()
 preprocessor.run()
 
-asr = ASR()
-asr.run("voice_samples\\g_podcast_final.wav")
+# asr = ASR()
+# asr.run("")
