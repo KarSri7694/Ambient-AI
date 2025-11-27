@@ -11,17 +11,21 @@ import torch
 import io
 from pathlib import Path
 import os
+import logging
 # import torchaudio without warnings
 with warnings.catch_warnings():
     warnings.filterwarnings("ignore", category=UserWarning, module='torchaudio')
     warnings.filterwarnings("ignore", category=FutureWarning, module='torchaudio')    
     import torchaudio
     
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(levelname)s - %(message)s')
 #Whisper model sizes
 SMALL = "small"
 MEDIUM = "medium"
 LARGE = "large-v3"
 TURBO = "turbo"
+HIN2HINGLISH = "Hin2Hinglish-ct2/"
 
 #Model identifiers
 DIARIZATION_MODEL = "pyannote/speaker-diarization-3.1"
@@ -41,6 +45,8 @@ CREATE_NEW_EMBEDDING_THRESHOLD = 0.1 #cosine similarity threshold
 
 #File counter
 file_counter = 1
+
+#set working directory to project root
 current_dir = Path(__file__).parent
 project_root = current_dir.parent
 os.chdir(project_root)
@@ -61,7 +67,7 @@ class ASR:
         self.HFToken = self.load_HFToken()
         self.transcribe_model = WhisperModel(model_size, device=device, compute_type=compute_type)
         self.diarisation_model = Pipeline.from_pretrained(DIARIZATION_MODEL, token=self.HFToken)
-        self.vad_model = load_silero_vad()
+        self.vad_model = None
         self.encoder = EncoderClassifier.from_hparams(source="D:\\Projects\\ambient_ai\\spkrec-ecapa-voxceleb", run_opts={"device": device} )
         self.diarizied_segments = None
 
@@ -73,7 +79,7 @@ class ASR:
         with open("HFToken.txt" ,"r") as f:
             return f.read().strip("\n")
 
-    def transcribe_audio(self, vad_filter = False, task = "transcribe", language="hi" , audio_file=None):
+    def transcribe_audio(self, vad_filter = False, task = "transcribe", language="hi" , audio_file=None, word_timestamps=False):
         '''
         Transcribe the audio file using the Whisper model.
         Args:
@@ -84,7 +90,10 @@ class ASR:
         Returns:
             segments (generator object): List of transcription segments with text, start time, and end time.
         '''
-        segments, _ = self.transcribe_model.transcribe(audio_file, vad_filter=vad_filter, task=task, language=language)     
+        segments, _ = self.transcribe_model.transcribe(audio_file, vad_filter=vad_filter, task=task, language=language,word_timestamps=word_timestamps)   
+        # for segment in segments:
+        #     for word_info in segment.words:
+        #         logging.info(f"[{word_info.start:.2f} - {word_info.end:.2f}] {word_info.word}")
         return segments
     
     def diarise_audio(self, audio_file=None):
@@ -93,6 +102,8 @@ class ASR:
         Args:
             audio_file (str): Path to the audio file to diarise.
         '''
+        if self.vad_model is None:
+            self.vad_model = load_silero_vad()
         silero_segmentation = Annotation()
         waveform, sample_rate = torchaudio.load(audio_file)
         
@@ -111,7 +122,8 @@ class ASR:
         
         self.diarisation_model.to(torch.device("cuda"))
         self.diarizied_segments = self.diarisation_model(audio_data)
-        print(self.diarizied_segments.speaker_diarization)
+        logging.info("Diarization Results:")
+        logging.info(self.diarizied_segments.speaker_diarization)
         return self.diarizied_segments
         
     def connect_db(self):
@@ -131,7 +143,7 @@ class ASR:
             conn.commit()
             return conn
         except sqlite3.OperationalError as e:
-            print(f"Error connecting to database: {e}")
+            logging.error(f"Error connecting to database: {e}")
         
     def compare_embeddings(self, audio_file=None):
         '''
@@ -148,30 +160,31 @@ class ASR:
         total_sample = waveform.shape[1]
         speaker_audio_tensor = defaultdict(list)
         speaker_probabilities_list = []
-        
+        test=[]
         #TO REFACTOR THE CODE
         #currently the code combines audio segments for each speaker into a single tensor which is not the best approach
         #need to process each segment individually and compare embeddings one by one and skip segments that are too short
         #speaker_tensors contains combined tensors for each speaker it should be of some form of list of tensors instead along with time info 
         #over the top of my mind i think of a list of tuples (start_time, end_time, speaker_label, tensor) for each speaker and process them one by one
-        speaker_mapping = {}
+        speaker_mapping = []
         for turn, _, speaker in self.diarizied_segments.speaker_diarization.itertracks(yield_label=True):
             segment_duration = turn.end - turn.start
             if segment_duration > MIN_TIME_THRESHOLD:
                 start_sample = int(turn.start*samplerate)
                 end_sample = int(turn.end*samplerate)
                 cropped_tensor = waveform[:, start_sample:end_sample]
+                test.append((turn.start, turn.end, speaker, cropped_tensor))
                 speaker_audio_tensor[speaker].append(cropped_tensor)
         
         speaker_tensors = {
             speaker : torch.cat(tensor_list, dim=1)
             for speaker, tensor_list in speaker_audio_tensor.items()
         }
-        
+        # print(test)
         #using SpeechBrain's embedding model to crate an embedding from audio tensor
         with self.connect_db() as conn:
             cursor = conn.cursor()
-            for speaker, tensor in speaker_tensors.items():
+            for _,_,speaker, tensor in test:
                 highest_similiarity_score = 0
                 best_name = "UNKNOWN"
                 tensor = tensor.to(torch.device("cuda"))
@@ -192,11 +205,10 @@ class ASR:
                         best_name = name
                         speaker_probabilities_list.append((speaker, best_name, highest_similiarity_score))
                         
-                
                 if highest_similiarity_score > SIMILARITY_THRESHOLD:
-                    speaker_mapping[speaker] = f"{best_name} ({(highest_similiarity_score)*100:.2f}%)" 
+                    speaker_mapping.append((speaker, f"{best_name} ({(highest_similiarity_score)*100:.2f}%)"))
                 else:
-                    speaker_mapping[speaker] = f"UNKNOWN_{best_name} ({(highest_similiarity_score)*100:.2f}%)"
+                    speaker_mapping.append((speaker, f"UNKNOWN_{best_name} ({(highest_similiarity_score)*100:.2f}%)"))
            
         # If no speakers were identified, return an empty mapping
         if not speaker_mapping:
@@ -228,7 +240,7 @@ class ASR:
         Merge the transcriptions with the diarisation results to produce a final transcript with speaker labels.
         Args:
             trancription_segments (generator object): List of transcription segments with text, start time, and end time.
-            speaker_mapping (dict): Mapping of speaker labels to identified names.
+            speaker_mapping (list): Mapping of speaker labels to identified names.
             audio_file (str): Path to the audio file.
         '''
         global file_counter
@@ -239,23 +251,26 @@ class ASR:
         
         final_transcript = []
         
+        sentence = ""
         for segment in trancription_segments:
-            start_time = segment.start
-            end_time = segment.end
-            text = segment.text
-            mid_time = (start_time + end_time) / 2
             for turn, _, speaker in self.diarizied_segments.speaker_diarization.itertracks(yield_label=True):
-                identified_name = speaker_mapping.get(speaker, speaker)
-                if turn.start <= mid_time <= turn.end:
-                    # final transcript is a list of tuples (start_time, end_time, speaker, text)
-                    final_transcript.append((start_time, end_time, identified_name, text))
-                    break
-                    
+                segment_start = segment.start
+                segment_end = segment.end
+                # identified_name = speaker_mapping.get(speaker, speaker)
+                identified_name = next((name for s, name in speaker_mapping if s == speaker), speaker)
+                for word_info in segment.words:
+                    word_start = word_info.start
+                    word_text = word_info.word
+                    if turn.start <= word_start <= turn.end or abs(turn.start - word_start) < 0.25:
+                        sentence += word_text + " "
+                final_transcript.append((turn.start, turn.end, identified_name, sentence))
+                sentence = ""
+
         with open(os.path.join(TRANSCRIPTIONS_DIR,f"final_transcript_{str(file_counter)}.txt"), "w", encoding="utf-8") as f:
             for entry in final_transcript:
                 f.write(f"[{entry[0]:.4f} - {entry[1]:.4f}] -> {entry[2]}:{entry[3]}\n")
             
-            print(f"\nFinal transcript for-{audio_file} saved to final_transcript_{str(file_counter)}.txt")
+            logging.info(f"Final transcript for-{audio_file} saved to final_transcript_{str(file_counter)}.txt")
             file_counter += 1
     
     def run(self, audio_file = None):
@@ -266,11 +281,11 @@ class ASR:
         '''
         self.diarise_audio(audio_file=audio_file)
         speaker_mapping = self.compare_embeddings(audio_file=audio_file)
-        segments = self.transcribe_audio(vad_filter=True,audio_file=audio_file ,language="hi")
+        segments = self.transcribe_audio(vad_filter=False,audio_file=audio_file,  word_timestamps=True)
         
         self.merge_transcriptions_and_diarization(trancription_segments=segments, speaker_mapping=speaker_mapping, audio_file=audio_file)
         # self.create_embeddings()
         
 if __name__ == "__main__":
-    transcriber = ASR(model_size=TURBO, device="cuda", compute_type="int8_float16")
+    transcriber = ASR(model_size=HIN2HINGLISH, device="cuda", compute_type="int8_float16",)
     transcriber.run(audio_file="cleaned_audio/tester09_final.wav")
