@@ -40,9 +40,7 @@ class AudioPreprocessor:
         self.NORMALIZED_SUFFIX = "_final"
         
         #load Demucs model for noise reduction
-        self.model = get_model('htdemucs_ft')
-        self.model.to(self.device_gpu if torch.cuda.is_available() else self.device_cpu)
-        
+        self.model = None        
         #create necessary directories if they don't exist
         os.makedirs(self.TEMP_AUDIO_DIR, exist_ok=True)
         os.makedirs(self.VOICE_SAMPLES_DIR, exist_ok=True)
@@ -114,6 +112,10 @@ class AudioPreprocessor:
         Returns:
         bool: True if noise reduction is successful, False otherwise
         '''
+        if self.model is None:
+            self.model = get_model('htdemucs_ft')
+            self.model.to(self.device_gpu if torch.cuda.is_available() else self.device_cpu)
+
         try:
             # Load audio file
             wav, sr = sf.read(input_file)
@@ -160,8 +162,9 @@ class AudioPreprocessor:
             print(f"Error in normalization: {e}")
             return False
 
-preprocessor = AudioPreprocessor()
-preprocessor.run()
+if __name__ == "__main__":
+    preprocessor = AudioPreprocessor()
+    preprocessor.run()
 
 # asr = ASR()
 # asr.run("")

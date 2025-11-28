@@ -91,9 +91,6 @@ class ASR:
             segments (generator object): List of transcription segments with text, start time, and end time.
         '''
         segments, _ = self.transcribe_model.transcribe(audio_file, vad_filter=vad_filter, task=task, language=language,word_timestamps=word_timestamps)   
-        # for segment in segments:
-        #     for word_info in segment.words:
-        #         logging.info(f"[{word_info.start:.2f} - {word_info.end:.2f}] {word_info.word}")
         return segments
     
     def diarise_audio(self, audio_file=None):
@@ -254,9 +251,6 @@ class ASR:
         sentence = ""
         for segment in trancription_segments:
             for turn, _, speaker in self.diarizied_segments.speaker_diarization.itertracks(yield_label=True):
-                segment_start = segment.start
-                segment_end = segment.end
-                # identified_name = speaker_mapping.get(speaker, speaker)
                 identified_name = next((name for s, name in speaker_mapping if s == speaker), speaker)
                 for word_info in segment.words:
                     word_start = word_info.start
