@@ -5,10 +5,8 @@ from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 import shutil
 import os
-from audio_preprocessor import AudioPreprocessor
 
 app = FastAPI()
-preprocessor = AudioPreprocessor()
 
 current_dir = Path(__file__).parent
 project_root = current_dir.parent
