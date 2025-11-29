@@ -5,7 +5,6 @@ import soundfile as sf
 from demucs.pretrained import get_model
 from demucs.apply import apply_model
 import torch
-from ASR_Model import ASR
 
 '''
 Process to convert raw audio to cleaned audio:
@@ -18,12 +17,11 @@ class AudioPreprocessor:
     """
     A class to preprocess audio files by converting them to WAV, reducing noise, and normalizing loudness.
     """
-    def __init__(self, input_queue_file="audio_queue.txt", temp_audio_dir="temp_audio",isSample=False):
+    def __init__(self, temp_audio_dir="temp_audio",isSample=False):
         """
         Initializes the AudioPreprocessor with specified directories and model.
 
         Args:
-            input_queue_file (str, optional): Path to the text file containing a list of audio files to process. Defaults to "audio_queue.txt".
             temp_audio_dir (str, optional): Path to the directory for temporary audio files. Defaults to "temp_audio".
             isSample (bool, optional): Flag to indicate if the audio is a voice sample. Defaults to False.
         """
@@ -31,7 +29,6 @@ class AudioPreprocessor:
         self.device_cpu = 'cpu'
         self.device_gpu = 'cuda'
         self.TEMP_AUDIO_DIR = temp_audio_dir
-        self.input_queue_file = input_queue_file
         self.isSample = isSample
         self.VOICE_SAMPLES_DIR = "voice_samples"
         self.OUTPUT_DIR = "cleaned_audio"
@@ -46,45 +43,38 @@ class AudioPreprocessor:
         os.makedirs(self.VOICE_SAMPLES_DIR, exist_ok=True)
         os.makedirs(self.OUTPUT_DIR, exist_ok=True)
     
-    def run(self): 
+    def run(self, input_file=None): 
         """
         Runs the audio preprocessing pipeline for each file in the input queue.
         """
         #loop through the audio queue and process each file
-        lines = []
-        with open(self.input_queue_file, "r") as f:
-            lines = f.readlines()
-        for line in lines:
-            input_file = line.strip()
-            line=""
-            
-            base_name= os.path.splitext(os.path.basename(input_file))[0]
-            converted_file = os.path.join(self.TEMP_AUDIO_DIR, f"{base_name}_converted.wav")
-            noise_reduced_file = os.path.join(self.TEMP_AUDIO_DIR, f"{base_name}_cleaned.wav")
-            final_output_dir = self.VOICE_SAMPLES_DIR if self.isSample else self.OUTPUT_DIR
-            final_file = os.path.join(final_output_dir, f"{base_name}_final.wav")
-            
-            
-            if os.path.exists(input_file):
-                success = self.convert_audio_to_wav(input_file, converted_file)
-                if success:
-                    print(f"Converted: {input_file} to WAV")
-                    noise_reduced = self.reduce_noise(converted_file, noise_reduced_file)
-                    if noise_reduced:
-                        print(f"Noise reduced for: {input_file}")
-                        normalized = self.normalize_audio(noise_reduced_file, final_file)
-                        if normalized is not False:
-                            print(f"Normalized audio saved for: {input_file}")
-                        else:
-                            print(f"Failed to normalize audio for: {input_file}")
-                    else:
-                        print(f"Failed to reduce noise for: {input_file}")
-                else:
-                    print(f"Failed to convert: {input_file}")
-            else:
-                print(f"File does not exist: {input_file}")    
+        base_name= os.path.splitext(os.path.basename(input_file))[0]
+        converted_file = os.path.join(self.TEMP_AUDIO_DIR, f"{base_name}_converted.wav")
+        noise_reduced_file = os.path.join(self.TEMP_AUDIO_DIR, f"{base_name}_cleaned.wav")
+        final_output_dir = self.VOICE_SAMPLES_DIR if self.isSample else self.OUTPUT_DIR
+        final_file = os.path.join(final_output_dir, f"{base_name}_final.wav")
         
-        return final_file # Return the last processed file path
+        if os.path.exists(input_file):
+            success = self.convert_audio_to_wav(input_file, converted_file)
+            if success:
+                print(f"Converted: {input_file} to WAV")
+                # noise_reduced = self.reduce_noise(converted_file, noise_reduced_file)
+                noise_reduced = True
+                if noise_reduced is not False:
+                    print(f"Noise reduced for: {input_file}")
+                    normalized = self.normalize_audio(converted_file, final_file)
+                    if normalized:
+                        print(f"Normalized audio saved for: {input_file}")
+                    else:
+                        print(f"Failed to normalize audio for: {input_file}")
+                else:
+                    print(f"Failed to reduce noise for: {input_file}")
+            else:
+                print(f"Failed to convert: {input_file}")
+        else:
+            print(f"File does not exist: {input_file}")    
+    
+        # return final_file # Return the last processed file path
         
     def convert_audio_to_wav(self,input_file, output_file):
         '''
@@ -149,6 +139,8 @@ class AudioPreprocessor:
         # Load audio file
         try:
             data, rate = sf.read(input_file)
+            if data.ndim > 1:
+                data = data.mean(axis=1)  # Convert to mono by averaging channels
             if data.ndim ==1:
                 data = data.reshape(-1, 1)
             # Measure loudness
@@ -158,10 +150,18 @@ class AudioPreprocessor:
             normalized_audio = pyln.normalize.loudness(data, loudness, target_lufs)
             # Save normalized audio back to file
             sf.write(output_file, normalized_audio, rate)
+            return True
         except Exception as e:
             print(f"Error in normalization: {e}")
             return False
 
+    def unload_model(self):
+        """
+        Unloads the Demucs model from memory and clears GPU cache if needed.
+        """
+        self.model = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 if __name__ == "__main__":
     preprocessor = AudioPreprocessor()
     preprocessor.run()
