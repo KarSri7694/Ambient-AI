@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ambient AI</title>
+    <body>
+        <h1>Upload Audio File</h1>
+        <form action="/upload-audio/" method="post" enctype="multipart/form-data">
+            <input type="file" name="file" accept="audio/*" required>
+            <button type="submit">Upload</button>
+        </form>
+        {% if message %}
+        <p style="color: green;">{{ message }}</p>
+        {% endif %}
+    </body>
+</html>
