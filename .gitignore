@@ -14,3 +14,6 @@ voice_database.db
 token.pickle
 credentials.json
 /database
+/Hin2Hinglish-ct2
+/spkrec-ecapa-voxceleb
+/temp_audio
