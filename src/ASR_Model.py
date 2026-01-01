@@ -43,6 +43,10 @@ SIMILARITY_THRESHOLD = 0.1 #cosine similarity threshold
 UPDATE_THRESHOLD = 0.9 #cosine similarity threshold
 CREATE_NEW_EMBEDDING_THRESHOLD = 0.1 #cosine similarity threshold
 
+#Audio chunking parameters
+CHUNK_SECONDS = 20 * 60    # 20 min chunks
+CHUNK_OVERLAP = 2          # 2 sec overlap
+
 #File counter
 file_counter = 1
 
@@ -65,10 +69,11 @@ class ASR:
             compute_type (str): Type of computation to use. Options are "int8_float16
         '''
         self.HFToken = self.load_HFToken()
-        self.transcribe_model = WhisperModel(model_size, device=device, compute_type=compute_type)
-        self.diarisation_model = Pipeline.from_pretrained(DIARIZATION_MODEL, token=self.HFToken)
+        self.model_size = model_size
+        self.transcribe_model = None
+        self.diarisation_model = None
         self.vad_model = None
-        self.encoder = EncoderClassifier.from_hparams(source="D:\\Projects\\ambient_ai\\spkrec-ecapa-voxceleb", run_opts={"device": device} )
+        self.encoder = None
         self.diarizied_segments = None
 
     @staticmethod
@@ -79,7 +84,7 @@ class ASR:
         with open("HFToken.txt" ,"r") as f:
             return f.read().strip("\n")
 
-    def transcribe_audio(self, vad_filter = False, task = "transcribe", language="hi" , audio_file=None, word_timestamps=False):
+    def transcribe_audio(self, vad_filter = False, task = "transcribe", language="hi" , audio_file=None, word_timestamps=False, compute_type="int8_float16",device="cuda"):
         '''
         Transcribe the audio file using the Whisper model.
         Args:
@@ -90,7 +95,12 @@ class ASR:
         Returns:
             segments (generator object): List of transcription segments with text, start time, and end time.
         '''
-        segments, _ = self.transcribe_model.transcribe(audio_file, vad_filter=vad_filter, task=task, language=language,word_timestamps=word_timestamps)   
+        if self.transcribe_model is None:
+            self.transcribe_model = WhisperModel(self.model_size, device=device, compute_type=compute_type)
+        segments, _ = self.transcribe_model.transcribe(audio_file, vad_filter=vad_filter, task=task, language=language,word_timestamps=word_timestamps, chunk_length=30)   
+        self.transcribe_model = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         return segments
     
     def diarise_audio(self, audio_file=None):
@@ -99,6 +109,8 @@ class ASR:
         Args:
             audio_file (str): Path to the audio file to diarise.
         '''
+        if self.diarisation_model is None:
+            self.diarisation_model= Pipeline.from_pretrained(DIARIZATION_MODEL, token=self.HFToken)
         if self.vad_model is None:
             self.vad_model = load_silero_vad()
         silero_segmentation = Annotation()
@@ -121,6 +133,8 @@ class ASR:
         self.diarizied_segments = self.diarisation_model(audio_data)
         logging.info("Diarization Results:")
         logging.info(self.diarizied_segments.speaker_diarization)
+        logging.info(type(self.diarizied_segments))
+        logging.info(type(self.diarizied_segments.speaker_diarization))
         return self.diarizied_segments
         
     def connect_db(self):
@@ -151,8 +165,8 @@ class ASR:
         Returns:
             speaker_mapping (dict): Mapping of speaker labels to identified names.
         '''
-        
-        diarized_segments = self.diarizied_segments
+        if self.encoder is None:
+            self.encoder = EncoderClassifier.from_hparams(source="D:\\Projects\\ambient_ai\\spkrec-ecapa-voxceleb", run_opts={"device": "cuda"})
         waveform, samplerate = torchaudio.load(audio_file)
         total_sample = waveform.shape[1]
         speaker_audio_tensor = defaultdict(list)
@@ -221,6 +235,8 @@ class ASR:
         Args:
             audio_file (str): Path to the audio file to process.
         '''
+        if self.encoder is None:
+            EncoderClassifier.from_hparams(source="D:\\Projects\\ambient_ai\\spkrec-ecapa-voxceleb", run_opts={"device": "cuda"} )
         buffer = io.BytesIO()
         waveform, samplerate = torchaudio.load(audio_file)
         with self.connect_db() as conn:
@@ -267,6 +283,16 @@ class ASR:
             logging.info(f"Final transcript for-{audio_file} saved to final_transcript_{str(file_counter)}.txt")
             file_counter += 1
     
+    def unload_model(self):
+        '''
+        Unload the ASR and diarisation models from memory to free up resources.
+        '''
+        
+        self.transcribe_model = None
+        self.diarisation_model = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    
     def run(self, audio_file = None):
         '''
         Run the ASR model to transcribe and diarise the audio file, and identify speakers.
@@ -275,11 +301,26 @@ class ASR:
         '''
         self.diarise_audio(audio_file=audio_file)
         speaker_mapping = self.compare_embeddings(audio_file=audio_file)
-        segments = self.transcribe_audio(vad_filter=False,audio_file=audio_file,  word_timestamps=True)
+        segments = self.transcribe_audio(vad_filter=True,audio_file=audio_file,  word_timestamps=True)
         
         self.merge_transcriptions_and_diarization(trancription_segments=segments, speaker_mapping=speaker_mapping, audio_file=audio_file)
         # self.create_embeddings()
         
+    def split_waveform(self, waveform, sample_rate, chunk_sec, overlap_sec):
+        chunks = []
+        chunk_samples = chunk_sec * sample_rate
+        overlap_samples = overlap_sec * sample_rate
+        total_samples = waveform.shape[1]
+
+        start = 0
+        while start < total_samples:
+            end = min(start + chunk_samples, total_samples)
+            chunk_wave = waveform[:, start:end]
+            offset_time = start / sample_rate
+            chunks.append((chunk_wave, offset_time))
+            start = start + chunk_samples - overlap_samples
+
+        return chunks   
 if __name__ == "__main__":
-    transcriber = ASR(model_size=HIN2HINGLISH, device="cuda", compute_type="int8_float16",)
+    transcriber = ASR(model_size=HIN2HINGLISH, device="cuda", compute_type="int8_float16")
     transcriber.run(audio_file="cleaned_audio/tester09_final.wav")
