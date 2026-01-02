@@ -2,14 +2,60 @@ import openai
 import llama_MCP_bridge
 import asyncio
 import json
+import requests
 
-api_uri= "http://localhost:8080/v1"
+api_uri= "http://localhost:8080"
+tools = None
+s_prompt = """You are an advanced AI assistant integrated with various tools to help users with their requests.
+When you need to perform a specific action or retrieve information, you can call the appropriate tool by name, providing the necessary arguments in JSON format.
+Make sure to use the tools effectively to assist the user. """
 
 client = openai.OpenAI(
     base_url=api_uri,
     api_key="testkey"
 )
-tools = None
+
+currently_loaded_model = None
+
+def read_transcription(file_path):
+    with open(file_path, 'r') as f:
+        transcription = f.read()
+    return transcription
+
+async def load_model(model_name: str):
+    global currently_loaded_model
+    if currently_loaded_model == model_name:
+        print(f"Model {model_name} is already loaded.")
+        return
+    
+    # Unload previous model if any
+    if currently_loaded_model is not None:
+        unload_model(currently_loaded_model)
+    
+    model = {
+        "model": model_name
+    }
+    
+    response = requests.post(f"{api_uri}/models/load", json=model)
+    if response.status_code == 200:
+        print(f"Successfully loaded model: {model_name}")
+        currently_loaded_model = model_name
+    else:
+        print(f"Failed to load model: {model_name}. Response: {response.text}")    
+
+async def unload_model(model_name: str):
+    global currently_loaded_model
+    model = {
+        "model": model_name
+    }
+    
+    response = requests.post(f"{api_uri}/models/unload", json=model)
+    if response.status_code == 200:
+        print(f"Successfully unloaded model: {model_name}")
+        currently_loaded_model = None
+    else:
+        print(f"Failed to unload model: {model_name}. Response: {response.text}")
+
 async def start_mcp():
     try:
         await llama_MCP_bridge.start_servers("mcp.json")
@@ -41,6 +87,8 @@ async def cleanup_mcp():
     
 async def start_input_loop():
     message = []
+    system_prompt = {"role": "system", "content": s_prompt}
+    message.append(system_prompt)
     print(f"\n\nEnter messages to send to the model (type 'exit' to quit):\n")
     while True:
         user_input = input()
@@ -49,63 +97,73 @@ async def start_input_loop():
         user_message = {"role": "user", "content": user_input}
         message.append(user_message)
         
-        completion = client.chat.completions.create(
-            model="Qwen3-4B-Thinking-2507-Q4_K_M.gguf",
-            messages=message,    
-            tools=tools,
-            stream=True
-        )
+        # Loop until the model stops calling tools
+        max_iterations = 10  # Safety limit to prevent infinite loops
+        iteration = 0
+        
+        while iteration < max_iterations:
+            iteration += 1
+            print(f"\n--- Iteration {iteration} ---")
+            
+            completion = client.chat.completions.create(
+                model="Qwen3-4B-Thinking-2507-Q4_K_M.gguf",
+                messages=message,    
+                tools=tools,
+                stream=True
+            )
 
-        assistant_message = ""
-        tool_calls = []
-        current_tool_call = None
-        
-        print("Streaming response:")
-        for chunk in completion:
-            delta = chunk.choices[0].delta
+            assistant_message = ""
+            tool_calls = []
             
-            # 1. Check for standard content (The final answer)
-            if delta.content:
-                print(delta.content, end="", flush=True)
-                assistant_message += delta.content
+            print("Streaming response:")
+            for chunk in completion:
+                delta = chunk.choices[0].delta
                 
-            # 2. Check for reasoning content (The "Thought")
-            # We use getattr or dict access because the attribute might not exist on the object
-            reasoning = getattr(delta, 'reasoning_content', None)
-            if reasoning:
-                # Print it differently so you know it's reasoning (e.g., in yellow)
-                print(f"\033[93m{reasoning}\033[0m", end="", flush=True)    
-            # print(delta)   
+                # 1. Check for standard content (The final answer)
+                if delta.content:
+                    print(delta.content, end="", flush=True)
+                    assistant_message += delta.content
+                    
+                # 2. Check for reasoning content (The "Thought")
+                reasoning = getattr(delta, 'reasoning_content', None)
+                if reasoning:
+                    print(f"\033[93m{reasoning}\033[0m", end="", flush=True)    
+                
+                if delta.tool_calls:
+                    for tool_call_delta in delta.tool_calls:
+                        index = tool_call_delta.index
+                        
+                        # Initialize new tool call if needed
+                        while len(tool_calls) <= index:
+                            tool_calls.append({
+                                "id": "",
+                                "type": "function",
+                                "function": {"name": "", "arguments": ""}
+                            })
+                        
+                        # Update tool call ID
+                        if tool_call_delta.id:
+                            tool_calls[index]["id"] = tool_call_delta.id
+                        
+                        # Update function name
+                        if tool_call_delta.function.name:
+                            tool_calls[index]["function"]["name"] += tool_call_delta.function.name
+                        
+                        # Update function arguments
+                        if tool_call_delta.function.arguments:
+                            tool_calls[index]["function"]["arguments"] += tool_call_delta.function.arguments
             
-            if delta.tool_calls:
-                for tool_call_delta in delta.tool_calls:
-                    index = tool_call_delta.index
-                    
-                    # Initialize new tool call if needed
-                    while len(tool_calls) <= index:
-                        tool_calls.append({
-                            "id": "",
-                            "type": "function",
-                            "function": {"name": "", "arguments": ""}
-                        })
-                    
-                    # Update tool call ID
-                    if tool_call_delta.id:
-                        tool_calls[index]["id"] = tool_call_delta.id
-                    
-                    # Update function name
-                    if tool_call_delta.function.name:
-                        tool_calls[index]["function"]["name"] += tool_call_delta.function.name
-                    
-                    # Update function arguments
-                    if tool_call_delta.function.arguments:
-                        tool_calls[index]["function"]["arguments"] += tool_call_delta.function.arguments
-        
-        print("\n")
-        
-        # If tool calls were made, execute them
-        if tool_calls:
-            # Add assistant message with tool calls
+            print("\n")
+            
+            # If NO tool calls were made, the model is done
+            if not tool_calls:
+                # Add final assistant message and break the loop
+                assistant_message_obj = {"role": "assistant", "content": assistant_message}
+                message.append(assistant_message_obj)
+                print("✓ Model finished (no more tool calls)\n")
+                break
+            
+            # If tool calls were made, execute them and continue the loop
             assistant_message_obj = {
                 "role": "assistant",
                 "content": assistant_message if assistant_message else None,
@@ -153,41 +211,21 @@ async def start_input_loop():
                     }
                     message.append(tool_response_message)
             
-            # Get the final response after tool execution
-            print("Getting final response after tool execution...\n")
-            completion = client.chat.completions.create(
-                model="Qwen3-4B-Thinking-2507-Q4_K_M.gguf",
-                messages=message,    
-                tools=tools,
-                stream=True
-            )
-            
-            final_response = ""
-            for chunk in completion:
-                delta = chunk.choices[0].delta
-                if delta.content:
-                    print(delta.content, end="", flush=True)
-                    final_response += delta.content
-                
-                reasoning = getattr(delta, 'reasoning_content', None)
-                if reasoning:
-                    print(f"\033[93m{reasoning}\033[0m", end="", flush=True)
-            
-            message.append({"role": "assistant", "content": final_response})
-        else:
-            # No tool calls, just add the assistant message
-            assistant_message_obj = {"role": "assistant", "content": assistant_message}
-            message.append(assistant_message_obj)
+            # Loop continues - model will see tool results and decide next action
         
-        print("\n")  
+        if iteration >= max_iterations:
+            print(f"⚠️  Reached maximum iterations ({max_iterations}). Stopping.\n")
+        
         print("User-->")
 
 async def main():
     try:
+        await load_model("Qwen-4b-Thinking-2507-Q4_K_M")
         await start_mcp()
         tools = await get_tools()
         await start_input_loop()
     finally:
+        await unload_model("Qwen-4b-Thinking-2507-Q4_K_M")
         await cleanup_mcp()
 
 if __name__ == "__main__":
