@@ -2,16 +2,17 @@ import openai
 import llama_MCP_bridge
 import asyncio
 import json
+import threading
 import requests
 
 api_uri= "http://localhost:8080"
+api_uri_v1 = f"{api_uri}/v1"
 tools = None
-s_prompt = """You are an advanced AI assistant integrated with various tools to help users with their requests.
-When you need to perform a specific action or retrieve information, you can call the appropriate tool by name, providing the necessary arguments in JSON format.
-Make sure to use the tools effectively to assist the user. """
+s_prompt = """
+"""
 
 client = openai.OpenAI(
-    base_url=api_uri,
+    base_url=api_uri_v1,
     api_key="testkey"
 )
 
@@ -41,7 +42,8 @@ async def load_model(model_name: str):
         print(f"Successfully loaded model: {model_name}")
         currently_loaded_model = model_name
     else:
-        print(f"Failed to load model: {model_name}. Response: {response.text}")    
+        print(f"Failed to load model: {model_name}. Response: {response.text}")
+    return    
 
 async def unload_model(model_name: str):
     global currently_loaded_model
@@ -82,6 +84,7 @@ async def execute_tool(tool_name, tool_args):
 async def cleanup_mcp():
     try:
         await llama_MCP_bridge.cleanup()
+        print("MCP cleanup completed.")
     except Exception as e:
         print(f"Error during MCP cleanup: {e}")
     
@@ -106,7 +109,7 @@ async def start_input_loop():
             print(f"\n--- Iteration {iteration} ---")
             
             completion = client.chat.completions.create(
-                model="Qwen3-4B-Thinking-2507-Q4_K_M.gguf",
+                model=currently_loaded_model,
                 messages=message,    
                 tools=tools,
                 stream=True
@@ -184,9 +187,16 @@ async def start_input_loop():
                     tool_args = json.loads(tool_args_str) if tool_args_str else {}
                     tool_response = await execute_tool(tool_name, tool_args)
                     
-                    # Convert response to string
+                    # Convert response to string - MCP returns CallToolResult with content list
                     if hasattr(tool_response, 'content'):
-                        response_content = str(tool_response.content)
+                        # content is a list of TextContent/ImageContent/etc objects
+                        content_parts = []
+                        for item in tool_response.content:
+                            if hasattr(item, 'text'):
+                                content_parts.append(item.text)
+                            else:
+                                content_parts.append(str(item))
+                        response_content = '\n'.join(content_parts)
                     else:
                         response_content = str(tool_response)
                     
