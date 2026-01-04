@@ -257,31 +257,65 @@ class ASR:
             audio_file (str): Path to the audio file.
         '''
         global file_counter
-        
+
         if self.diarizied_segments is None:
             print("Diarisation has not been performed yet.")
             return
-        
-        final_transcript = []
-        
-        sentence = ""
-        for segment in trancription_segments:
-            for turn, _, speaker in self.diarizied_segments.speaker_diarization.itertracks(yield_label=True):
-                identified_name = next((name for s, name in speaker_mapping if s == speaker), speaker)
-                for word_info in segment.words:
-                    word_start = word_info.start
-                    word_text = word_info.word
-                    if turn.start <= word_start <= turn.end or abs(turn.start - word_start) < 0.25:
-                        sentence += word_text + " "
-                final_transcript.append((turn.start, turn.end, identified_name, sentence))
-                sentence = ""
 
-        with open(os.path.join(TRANSCRIPTIONS_DIR,f"final_transcript_{str(file_counter)}.txt"), "w", encoding="utf-8") as f:
+        # Build a quick lookup for speaker labels -> names.
+        speaker_lookup = {speaker: name for speaker, name in (speaker_mapping or [])}
+
+        # Freeze generators so we can iterate multiple times.
+        segments = list(trancription_segments)
+        turns = list(self.diarizied_segments.speaker_diarization.itertracks(yield_label=True))
+
+        if not segments:
+            logging.warning("No transcription segments to merge.")
+            return
+
+        if not turns:
+            logging.warning("No diarization turns to merge.")
+            return
+
+        tolerance = 0.25  # seconds
+        merged = []
+        for turn, _, speaker in turns:
+            identified_name = speaker_lookup.get(speaker, speaker)
+            merged.append({
+                "start": turn.start,
+                "end": turn.end,
+                "speaker": identified_name,
+                "words": []
+            })
+
+        # Assign each word to its corresponding diarization window.
+        for segment in segments:
+            word_list = getattr(segment, "words", []) or []
+            for word_info in word_list:
+                word_start = word_info.start
+                word_text = word_info.word
+                for entry in merged:
+                    if entry["start"] - tolerance <= word_start <= entry["end"] + tolerance:
+                        entry["words"].append(word_text)
+                        break
+
+        final_transcript = []
+        for entry in merged:
+            if not entry["words"]:
+                continue
+            sentence = " ".join(entry["words"]).strip()
+            final_transcript.append((entry["start"], entry["end"], entry["speaker"], sentence))
+
+        if not final_transcript:
+            logging.warning("No words matched diarization turns; transcript not written.")
+            return
+
+        with open(os.path.join(TRANSCRIPTIONS_DIR, f"final_transcript_{str(file_counter)}.txt"), "w", encoding="utf-8") as f:
             for entry in final_transcript:
                 f.write(f"[{entry[0]:.4f} - {entry[1]:.4f}] -> {entry[2]}:{entry[3]}\n")
-            
-            logging.info(f"Final transcript for-{audio_file} saved to final_transcript_{str(file_counter)}.txt")
-            file_counter += 1
+
+        logging.info(f"Final transcript for-{audio_file} saved to final_transcript_{str(file_counter)}.txt")
+        file_counter += 1
     
     def unload_model(self):
         '''
@@ -290,6 +324,8 @@ class ASR:
         
         self.transcribe_model = None
         self.diarisation_model = None
+        self.vad_model = None
+        self.encoder = None
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     
