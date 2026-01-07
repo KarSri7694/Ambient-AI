@@ -9,13 +9,6 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from utils.todoist_helper import TodoistHelper
 
-class Handler(FileSystemEventHandler):
-    def on_created(self, event):
-        return event.src_path
-            
-observer = Observer()
-observer.schedule(FileSystemEventHandler(), path='transcriptions/', recursive=False)
-observer.start()
 
 api_uri= "http://localhost:8080"
 api_uri_v1 = f"{api_uri}/v1"
