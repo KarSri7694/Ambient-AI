@@ -284,23 +284,28 @@ async def start_input_loop():
                 await start_llm_interaction(mode="transcription", user_input=content)
         elif mode == '3':
             print("Late night execution mode selected.")
-            pending_tasks = night_shift.get_pending_tasks()
-            if pending_tasks == []:
-                print("No pending tasks found.")
-            else:
-                for task in pending_tasks:
-                    task_description = task['description']
-                    print(f"\nProcessing night task ID {task['id']}: {task_description}")
-                    await start_llm_interaction(mode="night_task", user_input=task_description + "\n" + notifications_str, system_prompt=night_shift_prompt)
-                    night_shift.mark_task_complete(task['id'], status="completed")
+            
+            while True:
+                #First process night shift tasks from night_queue
+                pending_tasks = night_shift.get_pending_tasks()
+                if pending_tasks == []:
+                    print("No pending tasks found.")
+                else:
+                    for task in pending_tasks:
+                        task_description = task['description']
+                        print(f"\nProcessing night task ID {task['id']}: {task_description}")
+                        await start_llm_interaction(mode="night_task", user_input=task_description + "\n" + notifications_str, system_prompt=night_shift_prompt)
+                        night_shift.mark_task_complete(task['id'], status="completed")
+                    todoist_helper = TodoistHelper()
+                    tasks = todoist_helper.get_tasks()
+                    for task in tasks:
+                        task_description = f"Task: {task['content']}, ID: {task['id']}"
+                        print(f"\nProcessing Todoist task ID {task['id']}: {task['content']}")
+                        await start_llm_interaction(mode="night_task", user_input=task_description + "\n" + notifications_str, system_prompt=night_shift_prompt)
+                        todoist_helper.complete_task(task['id'])
+                print("Sleeping for 30 seconds before checking for new night tasks...")
+                await asyncio.sleep(30)  
                 
-                todoist_helper = TodoistHelper()
-                tasks = todoist_helper.get_tasks()
-                for task in tasks:
-                    task_description = f"Task: {task['content']}, ID: {task['id']}"
-                    print(f"\nProcessing Todoist task ID {task['id']}: {task['content']}")
-                    await start_llm_interaction(mode="night_task", user_input=task_description + "\n" + notifications_str, system_prompt=night_shift_prompt)
-                    todoist_helper.complete_task(task['id'])
     
         elif mode.lower() == 'exit':
             print("Exiting program.")
@@ -312,6 +317,9 @@ async def main():
         await start_mcp()
         await get_tools()
         await start_input_loop()
+    except requests.exceptions.ConnectionError as e:
+        print(f"LLAMA-SERVER is not running.")
+        print(f"Error connecting to LLM API at {api_uri}: {e}")
     finally:
         await unload_model(currently_loaded_model)
         await cleanup_mcp()
