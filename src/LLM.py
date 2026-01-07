@@ -2,20 +2,42 @@ import openai
 import llama_MCP_bridge
 import asyncio
 import json
-import threading
 import requests
 from pathlib import Path
+import night_shift
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+from utils.todoist_helper import TodoistHelper
+
+class Handler(FileSystemEventHandler):
+    def on_created(self, event):
+        return event.src_path
+            
+observer = Observer()
+observer.schedule(FileSystemEventHandler(), path='transcriptions/', recursive=False)
+observer.start()
 
 api_uri= "http://localhost:8080"
 api_uri_v1 = f"{api_uri}/v1"
 tools = None
 transcription_files_content = {}
 
-s_prompt = """
-You are assitant of Kartikeya Srivastava, you have to help him in his daily tasks.
+username = ""
+s_prompt = f"""
+You are assitant of {username}, you have to help him in his daily tasks.
 You have access to various tools to help you accomplish tasks. The user will pass a conversation to you, you have to interpret it and decide which tools to use to best assist the user.
 When you need to perform a task, use the appropriate tool from the available tools list 
 if possible convert text to english before passing to tools
+Any task that requires extensive time or resources should be queued for night-time execution using the `queue_night_task` tool. This reqires research, downloading large files, or any task that the user specifies to be done at night.
+If a task is SLOW (Deep Research, Downloading huge files), use the `queue_night_task` tool. Dont use tavily for such tasks.
+For all else, use standard tools.
+You will also be provided with notifications from the system about important events that were started. Take these into account when assisting the user.
+"""
+
+night_shift_prompt = """
+You are an autonomous agent working through a list of night-time tasks queued by Kartikeya Srivastava.
+You have access to various tools to help you accomplish these tasks.
+DO NOT use the `queue_night_task` tool here.
 """
 
 client = openai.OpenAI(
@@ -23,6 +45,7 @@ client = openai.OpenAI(
     api_key="testkey"
 )
 
+message = []
 currently_loaded_model = None
 
 def read_transcription(transcriptions_dir):
@@ -33,8 +56,7 @@ def read_transcription(transcriptions_dir):
         with open(file, 'r') as f:
             content = f.read()
             transcription_files_content[file.name] = content
-        
-    
+         
 async def load_model(model_name: str):
     global currently_loaded_model
     if currently_loaded_model == model_name:
@@ -100,13 +122,13 @@ async def cleanup_mcp():
     except Exception as e:
         print(f"Error during MCP cleanup: {e}")
 
-async def start_llm_interaction(mode:str = "user", user_input:str = ""):
-    message = []
-    system_prompt = {"role": "system", "content": s_prompt}
+async def start_llm_interaction(mode:str = "user", user_input:str = "", system_prompt:str = s_prompt):
+    global message
+    system_prompt = {"role": "system", "content": system_prompt}
     message.append(system_prompt)
-    print(f"\n\nEnter messages to send to the model (type 'exit' to quit):\n")
+    print(f"\n\nEnter messages to send to the model (type 'exit' to quit):")
     user_message = {"role": "user", "content": user_input}
-    message.append(user_message)
+    message.append(user_message)    
     
     # Loop until the model stops calling tools
     max_iterations = 10  # Safety limit to prevent infinite loops
@@ -236,19 +258,25 @@ async def start_llm_interaction(mode:str = "user", user_input:str = ""):
     
 async def start_input_loop():
     #Set modes 
-    
     while True:
         print("1. Enter User interaction mode")
         print("2. Enter Transcription Automation mode")
         print("3. Enter late night execution mode")
         print("Type 'exit' to quit.\n\n")
         mode = input("Select mode (1, 2, or 3): ")
+        notifications = night_shift.get_unread_notifications()
+        if notifications == []:
+            notifications_str = "No new notifications."
+        else:
+            notifications_str = "New notifications: \n"
+            for note in notifications:
+                notifications_str += f"- {note['message']} (Source: {note['source']})\n"
         if mode == '1':
             while True:
                 user_input = input("User--> ")
                 if user_input.lower() == 'exit':
                     break
-                await start_llm_interaction(mode="user", user_input=user_input)
+                await start_llm_interaction(mode="user", user_input=user_input + "\n" + notifications_str, system_prompt="You are a helpful assistant. You can use tools to assist the user.")
         elif mode == '2':
             read_transcription("transcriptions/")
             for filename, content in transcription_files_content.items():
@@ -256,6 +284,24 @@ async def start_input_loop():
                 await start_llm_interaction(mode="transcription", user_input=content)
         elif mode == '3':
             print("Late night execution mode selected.")
+            pending_tasks = night_shift.get_pending_tasks()
+            if pending_tasks == []:
+                print("No pending tasks found.")
+            else:
+                for task in pending_tasks:
+                    task_description = task['description']
+                    print(f"\nProcessing night task ID {task['id']}: {task_description}")
+                    await start_llm_interaction(mode="night_task", user_input=task_description + "\n" + notifications_str, system_prompt=night_shift_prompt)
+                    night_shift.mark_task_complete(task['id'], status="completed")
+                
+                todoist_helper = TodoistHelper()
+                tasks = todoist_helper.get_tasks()
+                for task in tasks:
+                    task_description = f"Task: {task['content']}, ID: {task['id']}"
+                    print(f"\nProcessing Todoist task ID {task['id']}: {task['content']}")
+                    await start_llm_interaction(mode="night_task", user_input=task_description + "\n" + notifications_str, system_prompt=night_shift_prompt)
+                    todoist_helper.complete_task(task['id'])
+    
         elif mode.lower() == 'exit':
             print("Exiting program.")
             break
@@ -264,10 +310,10 @@ async def main():
     try:
         await load_model("Qwen-4b-Thinking-2507-Q4_K_M")
         await start_mcp()
-        tools = await get_tools()
+        await get_tools()
         await start_input_loop()
     finally:
-        await unload_model("Qwen-4b-Thinking-2507-Q4_K_M")
+        await unload_model(currently_loaded_model)
         await cleanup_mcp()
 
 if __name__ == "__main__":
