@@ -71,11 +71,12 @@ def log_transaction(amount: float, category: str, date: str = None, description:
         return f"Error: {e}"
     
 @mcp.tool
-def view_transactions(limit: int = 10):
-    """
+def view_transactions(fetch_type: str = "Many",limit: int = 10):
+    """ 
     View recent transactions.
     Also to be used when no transaction_id is provided to update_transaction.
     Args:
+        fetch_type: (Optional) Type of fetch: "One": to fetch one record, "All": to fetch all records, "Many": to fetch a limited number of records. Defaults to "Many".
         limit: (Optional) Number of recent transactions to retrieve. Defaults to 10.
     Returns:
         List of recent transactions.
@@ -83,7 +84,12 @@ def view_transactions(limit: int = 10):
     conn = connect_db()
     cursor = conn.cursor()
     cursor.execute('SELECT * FROM transactions ORDER BY date DESC')
-    transactions = cursor.fetchmany(limit)
+    if fetch_type == "One":
+        transactions = cursor.fetchone()
+    elif fetch_type == "All":
+        transactions = cursor.fetchall()
+    elif fetch_type == "Many":
+        transactions = cursor.fetchmany(limit)
     output = ""
     for t in transactions:
         output += f"ID: {t[0]}, Amount: {t[1]}, Category: {t[2]}, Date: {t[5]}, Description: {t[6]}, Type: {t[7]}\n"
