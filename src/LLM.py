@@ -5,8 +5,6 @@ import json
 import requests
 from pathlib import Path
 import night_shift
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
 from utils.todoist_helper import TodoistHelper
 
 
@@ -25,6 +23,7 @@ Any task that requires extensive time or resources should be queued for night-ti
 If a task is SLOW (Deep Research, Downloading huge files), use the `queue_night_task` tool. Dont use tavily for such tasks.
 For all else, use standard tools.
 You will also be provided with notifications from the system about important events that were started. Take these into account when assisting the user.
+If you have no new notifications, ignore the notification section.
 """
 
 night_shift_prompt = """
@@ -49,7 +48,20 @@ def read_transcription(transcriptions_dir):
         with open(file, 'r') as f:
             content = f.read()
             transcription_files_content[file.name] = content
-         
+
+def get_notifications() -> str:
+    '''
+    Fetch unread system notifications 
+    '''
+    notifications = night_shift.get_unread_notifications()
+    if notifications == []:
+        return "No new notifications."
+    else:
+        notifications_str = "New notifications: \n"
+        for note in notifications:
+            notifications_str += f"- {note['message']} (Source: {note['source']})\n"
+        return notifications_str
+    
 async def load_model(model_name: str):
     global currently_loaded_model
     if currently_loaded_model == model_name:
@@ -257,13 +269,7 @@ async def start_input_loop():
         print("3. Enter late night execution mode")
         print("Type 'exit' to quit.\n\n")
         mode = input("Select mode (1, 2, or 3): ")
-        notifications = night_shift.get_unread_notifications()
-        if notifications == []:
-            notifications_str = "No new notifications."
-        else:
-            notifications_str = "New notifications: \n"
-            for note in notifications:
-                notifications_str += f"- {note['message']} (Source: {note['source']})\n"
+        notifications_str = get_notifications()
         if mode == '1':
             while True:
                 user_input = input("User--> ")
@@ -279,7 +285,10 @@ async def start_input_loop():
             print("Late night execution mode selected.")
             
             while True:
-                #First process night shift tasks from night_queue
+                #Read and process notifications
+                notifications_str = get_notifications()
+                await start_llm_interaction(mode="night_task", user_input=notifications_str, system_prompt=night_shift_prompt)
+                #process night shift tasks from night_queue
                 pending_tasks = night_shift.get_pending_tasks()
                 if pending_tasks == []:
                     print("No pending tasks found.")
@@ -296,6 +305,7 @@ async def start_input_loop():
                         print(f"\nProcessing Todoist task ID {task['id']}: {task['content']}")
                         await start_llm_interaction(mode="night_task", user_input=task_description + "\n" + notifications_str, system_prompt=night_shift_prompt)
                         todoist_helper.complete_task(task['id'])
+                           
                 print("Sleeping for 30 seconds before checking for new night tasks...")
                 await asyncio.sleep(30)  
                 
