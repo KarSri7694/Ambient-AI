@@ -285,11 +285,6 @@ async def start_input_loop():
             print("Late night execution mode selected.")
             no_notification_count = 0 # counts the number of times no new notifications are found
             while True:
-                #Read and process notifications
-                notifications_str = get_notifications()
-                if notifications_str == "No new notifications.":
-                    no_notification_count += 1
-                await start_llm_interaction(mode="night_task", user_input=notifications_str, system_prompt=night_shift_prompt)
                 #process night shift tasks from night_queue
                 pending_tasks = night_shift.get_pending_tasks()
                 if pending_tasks == []:
@@ -307,11 +302,15 @@ async def start_input_loop():
                         print(f"\nProcessing Todoist task ID {task['id']}: {task['content']}")
                         await start_llm_interaction(mode="night_task", user_input=task_description + "\n" + notifications_str, system_prompt=night_shift_prompt)
                         todoist_helper.complete_task(task['id'])
-                           
-                print("Sleeping for 30 seconds before checking for new night tasks...")
+                #After processing all tasks, check for new notifications#Read and process notifications
+                notifications_str = get_notifications()
+                if notifications_str == "No new notifications.":
+                    no_notification_count += 1
+                await start_llm_interaction(mode="night_task", user_input=notifications_str, system_prompt=night_shift_prompt)       
                 if (no_notification_count >= 3):
                     print("No new notifications for 3 consecutive checks. Exiting night mode.")
                     break
+                print("Sleeping for 30 seconds before checking for new night tasks...")
                 await asyncio.sleep(30)  
                 
     
