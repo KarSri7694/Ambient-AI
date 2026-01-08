@@ -4,7 +4,7 @@ import asyncio
 import json
 import requests
 from pathlib import Path
-import night_shift
+import night_mode
 from utils.todoist_helper import TodoistHelper
 
 
@@ -53,7 +53,7 @@ def get_notifications() -> str:
     '''
     Fetch unread system notifications 
     '''
-    notifications = night_shift.get_unread_notifications()
+    notifications = night_mode.get_unread_notifications()
     if notifications == []:
         return "No new notifications."
     else:
@@ -286,7 +286,7 @@ async def start_input_loop():
             no_notification_count = 0 # counts the number of times no new notifications are found
             while True:
                 #process night shift tasks from night_queue
-                pending_tasks = night_shift.get_pending_tasks()
+                pending_tasks = night_mode.get_pending_tasks()
                 if pending_tasks == []:
                     print("No pending tasks found.")
                 else:
@@ -294,7 +294,7 @@ async def start_input_loop():
                         task_description = task['description']
                         print(f"\nProcessing night task ID {task['id']}: {task_description}")
                         await start_llm_interaction(mode="night_task", user_input=task_description + "\n" + notifications_str, system_prompt=night_shift_prompt)
-                        night_shift.mark_task_complete(task['id'], status="completed")
+                        night_mode.mark_task_complete(task['id'], status="completed")
                     todoist_helper = TodoistHelper()
                     tasks = todoist_helper.get_tasks()
                     for task in tasks:
@@ -306,7 +306,8 @@ async def start_input_loop():
                 notifications_str = get_notifications()
                 if notifications_str == "No new notifications.":
                     no_notification_count += 1
-                await start_llm_interaction(mode="night_task", user_input=notifications_str, system_prompt=night_shift_prompt)       
+                else:
+                    await start_llm_interaction(mode="night_task", user_input=notifications_str, system_prompt=night_shift_prompt)       
                 if (no_notification_count >= 3):
                     print("No new notifications for 3 consecutive checks. Exiting night mode.")
                     break
@@ -320,7 +321,7 @@ async def start_input_loop():
         
 async def main():
     try:
-        await load_model("Qwen-4b-Thinking-2507-Q4_K_M")
+        await load_model("Qwen3-VL-4b-Instruct-Q4_K_M")
         await start_mcp()
         await get_tools()
         await start_input_loop()
