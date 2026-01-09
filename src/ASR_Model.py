@@ -1,4 +1,5 @@
 from faster_whisper import WhisperModel
+from faster_whisper import BatchedInferencePipeline
 from pyannote.audio import Pipeline
 from pyannote.core import Annotation, Segment
 from speechbrain.inference.speaker import EncoderClassifier
@@ -84,7 +85,7 @@ class ASR:
         with open("HFToken.txt" ,"r") as f:
             return f.read().strip("\n")
 
-    def transcribe_audio(self, vad_filter = False, task = "transcribe", language="hi" , audio_file=None, word_timestamps=False, compute_type="int8_float16",device="cuda"):
+    def transcribe_audio(self, vad_filter = False, task = "transcribe", language="hi" , audio_file=None, word_timestamps=False, compute_type="int8_float16",device="cuda",batch_size=8):
         '''
         Transcribe the audio file using the Whisper model.
         Args:
@@ -97,7 +98,8 @@ class ASR:
         '''
         if self.transcribe_model is None:
             self.transcribe_model = WhisperModel(self.model_size, device=device, compute_type=compute_type)
-        segments, _ = self.transcribe_model.transcribe(audio_file, vad_filter=vad_filter, task=task, language=language,word_timestamps=word_timestamps, chunk_length=30)   
+        batched_model = BatchedInferencePipeline(self.transcribe_model, batch_size=batch_size)
+        segments, _ = batched_model.transcribe(audio_file, vad_filter=vad_filter, task=task, language=language,word_timestamps=word_timestamps, chunk_length=30)   
         self.transcribe_model = None
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -337,7 +339,7 @@ class ASR:
         '''
         self.diarise_audio(audio_file=audio_file)
         speaker_mapping = self.compare_embeddings(audio_file=audio_file)
-        segments = self.transcribe_audio(vad_filter=True,audio_file=audio_file,  word_timestamps=True)
+        segments = self.transcribe_audio(vad_filter=True,audio_file=audio_file,  word_timestamps=True, batch_size=8)
         
         self.merge_transcriptions_and_diarization(trancription_segments=segments, speaker_mapping=speaker_mapping, audio_file=audio_file)
         # self.create_embeddings()
