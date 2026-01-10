@@ -1,5 +1,5 @@
 /venv
-src/__pycache__
+**__pycache__**
 /uploads
 /transcriptions
 audio_queue.txt
