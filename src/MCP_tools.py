@@ -1,31 +1,58 @@
 from fastmcp import FastMCP
 from todoist_api_python.api import TodoistAPI
 import os
-
+import sqlite3
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from google.auth.transport.requests import Request
 import pickle
 import datetime
 import uuid
-
+from google import genai
+from typing import Annotated
+import serpapi
+import night_mode
+from utils.threading_util import run_async
+import yt_dlp
 #add_task() -- Done
 #schedule_meeting() -- Done
 #get_task()  
 #edit_task()
 #manage_person_profile()
 #create_obsidian_note()
+#new_fact_daily/hourly()
 #log_expense()
 #download movie()
 #download music()
 #download books()
 #download tv_shows()
+#search_web()
+#generate_image_online()
+#generate_image_local()
 
 mcp = FastMCP("My MCP Server")
 
 TODOIST_API_TOKEN = os.environ.get("TODOIST_API_TOKEN")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+SERPAPI_API_KEY = os.environ.get("SERPAPI_API_KEY")
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 SCOPES = ['https://www.googleapis.com/auth/calendar.events']
+
+def connect_facts_db():
+    db_path = os.path.join("D:\\Projects\\ambient_ai\\database", "facts.db")
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS facts (
+            fact_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            topic TEXT NOT NULL,
+            fact TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+    ''')
+    conn.commit()
+    return conn
 
 def get_calendar_service():
     creds = None
@@ -61,36 +88,30 @@ def get_current_datetime():
     return datetime.datetime.now().isoformat()
 
 @mcp.tool
-def add_task(content :str = None, due_string : str = None ):
+def add_task(content :Annotated[str, "The content of the task to be added"] ,
+             due_string : Annotated[str, "A natural language description of the due date (e.g., 'tomorrow at 5pm')"] ):
     """
-    Add a task to Todoist with an optional due date.
-    
-    Args:
-        content: (Required) The content of the task to be added.
-        due_string: (Optional) A natural language description of the due date (e.g., 'tomorrow at 5pm').
-    
+    Add a task or reminder to Todoist with an optional due date.    
     """
     api = TodoistAPI(TODOIST_API_TOKEN)
     try:
         task = api.add_task(content = content, due_string=due_string, due_lang="en")
-        print(f"Task: {content} added successfully")
+        if task is not None:
+            return {"Task Status": "Success", "Task ID": task.id, "Content": task.content, "Due Date": task.due}
+        else:
+            return {"error": "Failed to add task"}
     except Exception as e:
-        print(f"Error: {e}")
 
+        return {"error": f"Exception occurred: {str(e)}"}
+    
 @mcp.tool
-def schedule_meeting(title: str = None, date: str = None, time: str = None, participants: list = None, duration_minutes: int = 30):
+def schedule_meeting(title: Annotated[str, "Title of the meeting"] = None,
+                     date: Annotated[str, "Date in YYYY-MM-DD"] = None,
+                     time: Annotated[str, "Time in HH:MM (24h). If omitted, uses current time + 5 minutes"] = None,
+                     participants: Annotated[list, "List of attendee emails (strings)"] = None,
+                     duration_minutes: Annotated[int, "Meeting length in minutes"] = 30):
     """
     Schedule a Google Calendar event with a Google Meet link.
-
-    Args:
-        title: (Required) Title of the meeting.
-        date: (Required) Date in YYYY-MM-DD.
-        time: (Required) Time in HH:MM (24h). If omitted, uses current time + 5 minutes.
-        participants: (Optional) List of attendee emails (strings).
-        duration_minutes: (Optional) Meeting length in minutes.
-
-    Returns:
-        Dictionary with event id and meet link on success, or error message.
     """
     if not title or not date:
         return {"error": "title and date are required"}
@@ -146,11 +167,97 @@ def schedule_meeting(title: str = None, date: str = None, time: str = None, part
         return {"eventId": event.get('id'), "meetLink": meet_link}
     except Exception as e:
         return {"error": str(e)}
-    
-@mcp.tool
+
+
+@mcp.tool(enabled=False)
 def add(a: int, b: int) -> int:
     return a + b
 
+@mcp.tool(enabled=False)
+def google_search(query: Annotated[str, "The google search query"], 
+               num_results: Annotated[int, "Number of top results to return"] = 5) -> str:
+    """
+    Search the web using Google Search and return the top results.
+    """
+    params = {
+        "engine": "google",
+        "q": query,
+        "api_key": ""
+    }
+    
+    search = serpapi.search(params)
+    
+    organic_results = search['organic_results']
+    return organic_results
+
+@mcp.tool()
+def queue_night_task(
+    task_description: Annotated[str, "Detailed description of the task to be added to the night queue"],
+    priority: Annotated[str, "Priority level of the task, 'high', 'medium', 'low'. Tasks that have to be done first get the highest priority"] = "medium"  
+    ):
+    """
+    Add a task to the night queue for later processing.
+    """
+    try:
+        night_mode.add_task(task_description, priority)
+        return f"✅ Queued for tonight: {task_description}"
+    except Exception as e:
+        return f"❌ Database error: {e}"
+
+@mcp.tool()
+@run_async
+def download_youtube_video(
+    video_url: Annotated[str, "The URL of the YouTube video to download"],
+    output_directory: Annotated[str, "The directory where the video will be saved. Video will be saved with its title as filename"] = "downloads"
+    ):
+    """
+    Download a YouTube video using yt-dlp. The video is saved with its original title as the filename.
+    """
+    try:
+        # Ensure output directory exists
+        if not os.path.exists(output_directory):
+            os.makedirs(output_directory, exist_ok=True)
+        
+        # First, extract video info to get the title
+        ydl_info_opts = {
+            'quiet': True,
+            'no_warnings': True,
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_info_opts) as ydl:
+            info = ydl.extract_info(video_url, download=False)
+            video_title = info.get('title', 'video')
+            
+            # Sanitize the title for use as filename (remove invalid characters)
+            invalid_chars = '<>:"/\\|?*'
+            for char in invalid_chars:
+                video_title = video_title.replace(char, '')
+            
+            # Limit filename length to avoid filesystem issues
+            if len(video_title) > 200:
+                video_title = video_title[:200]
+        
+        # Construct the full output path with sanitized title
+        output_path = os.path.join(output_directory, f"{video_title}.mp4")
+        
+        # Download the video
+        ydl_opts = {
+            'outtmpl': output_path,
+            'format': 'bestvideo+bestaudio/best',
+            'merge_output_format': 'mp4',
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([video_url])
+            
+        completion_msg = f"BACKGROUND TASK COMPLETE: Downloaded '{video_title}' successfully to {output_path}"
+        night_mode.add_notification(completion_msg)
+        return f"✅ Downloaded successfully: {video_title}.mp4 → {output_directory}"
+        
+    except Exception as e:
+        completion_msg = f"BACKGROUND TASK FAILED: Downloading {video_url} failed with error: {e}"
+        night_mode.add_notification(completion_msg)
+        return f"❌ Download error: {e}"
 
 if __name__ == "__main__":
     mcp.run()
