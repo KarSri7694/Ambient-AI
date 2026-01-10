@@ -26,8 +26,8 @@ You will also be provided with notifications from the system about important eve
 If you have no new notifications, ignore the notification section.
 """
 
-night_shift_prompt = """
-You are an autonomous agent working through a list of night-time tasks queued by Kartikeya Srivastava.
+night_shift_prompt = f"""
+You are an autonomous agent working through a list of night-time tasks queued by {username}.
 You have access to various tools to help you accomplish these tasks.
 DO NOT use the `queue_night_task` tool here.
 """
