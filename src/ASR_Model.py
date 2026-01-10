@@ -27,6 +27,7 @@ MEDIUM = "medium"
 LARGE = "large-v3"
 TURBO = "turbo"
 HIN2HINGLISH = "Hin2Hinglish-ct2/"
+HIN2HINGLISH_LARGE = "Hin2Hinglish-Large-ct2/"
 
 #Model identifiers
 DIARIZATION_MODEL = "pyannote/speaker-diarization-3.1"
