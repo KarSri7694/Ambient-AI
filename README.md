@@ -68,7 +68,7 @@ Ambient AI features a custom **MCP (Model Context Protocol) Bridge** that allows
 
 ## 🗺️ Future Roadmap
 
-We are actively developing the next generation of autonomous local agents.
+Actively developing the next generation of autonomous local agents.
 
 - [ ] **Hexagonal Architecture Refactor:** Refactoring the entire codebase using the Ports and Adapters pattern to decouple core logic from external tools.
     
