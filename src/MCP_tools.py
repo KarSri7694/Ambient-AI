@@ -14,21 +14,6 @@ import serpapi
 import night_mode
 from utils.threading_util import run_async
 import yt_dlp
-#add_task() -- Done
-#schedule_meeting() -- Done
-#get_task()  
-#edit_task()
-#manage_person_profile()
-#create_obsidian_note()
-#new_fact_daily/hourly()
-#log_expense()
-#download movie()
-#download music()
-#download books()
-#download tv_shows()
-#search_web()
-#generate_image_online()
-#generate_image_local()
 
 mcp = FastMCP("My MCP Server")
 
