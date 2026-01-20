@@ -99,8 +99,8 @@ class ASR:
         '''
         if self.transcribe_model is None:
             self.transcribe_model = WhisperModel(self.model_size, device=device, compute_type=compute_type)
-        batched_model = BatchedInferencePipeline(self.transcribe_model, batch_size=batch_size)
-        segments, _ = batched_model.transcribe(audio_file, vad_filter=vad_filter, task=task, language=language,word_timestamps=word_timestamps, chunk_length=30)   
+        batched_model = BatchedInferencePipeline(self.transcribe_model)
+        segments, _ = batched_model.transcribe(audio_file, vad_filter=vad_filter, task=task, language=language,word_timestamps=word_timestamps, chunk_length=30, batch_size=batch_size)   
         self.transcribe_model = None
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
