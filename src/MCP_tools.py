@@ -62,7 +62,7 @@ def get_calendar_service():
     service = build('calendar', 'v3', credentials=creds)
     return service
 
-@mcp.tool
+@mcp.tool(enabled=False)
 def get_current_datetime():
     """
     Get the current date and time in ISO 8601 format.
@@ -74,13 +74,14 @@ def get_current_datetime():
 
 @mcp.tool
 def add_task(content :Annotated[str, "The content of the task to be added"] ,
-             due_string : Annotated[str, "A natural language description of the due date (e.g., 'tomorrow at 5pm')"] ):
+             due_datetime : Annotated[str, "Due date and time in YYYY-MM-DDTHH:MM:SS format"] ):
     """
     Add a task or reminder to Todoist with an optional due date.    
     """
     api = TodoistAPI(TODOIST_API_TOKEN)
     try:
-        task = api.add_task(content = content, due_string=due_string, due_lang="en")
+        parsed_due_date_time = datetime.datetime.fromisoformat(due_datetime)
+        task = api.add_task(content = content, due_datetime=parsed_due_date_time, due_lang="en")
         if task is not None:
             return {"Task Status": "Success", "Task ID": task.id, "Content": task.content, "Due Date": task.due}
         else:
