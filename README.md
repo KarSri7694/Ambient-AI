@@ -66,7 +66,7 @@ Ambient AI features a custom **MCP (Model Context Protocol) Bridge** that allows
 
 ### 🎥Demo Video
 
-https://github.com/user-attachments/assets/5f1fa9ca-eca8-4858-890b-efec8aec1370
+https://github.com/user-attachments/assets/8fb36fbb-0bcf-48ac-8bd5-6cb925b9b4aa
 
 ---
 ## 🗺️ Future Roadmap
