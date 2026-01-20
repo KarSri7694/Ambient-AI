@@ -81,7 +81,7 @@ def add_task(content :Annotated[str, "The content of the task to be added"] ,
     api = TodoistAPI(TODOIST_API_TOKEN)
     try:
         parsed_due_date_time = datetime.datetime.fromisoformat(due_datetime)
-        task = api.add_task(content = content, due_datetime=parsed_due_date_time, due_lang="en")
+        task = api.add_task(content = content, due_datetime=parsed_due_date_time)
         if task is not None:
             return {"Task Status": "Success", "Task ID": task.id, "Content": task.content, "Due Date": task.due}
         else:

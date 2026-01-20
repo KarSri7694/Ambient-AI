@@ -86,7 +86,7 @@ class ASR:
         with open("HFToken.txt" ,"r") as f:
             return f.read().strip("\n")
 
-    def transcribe_audio(self, vad_filter = False, task = "transcribe", language="hi" , audio_file=None, word_timestamps=False, compute_type="int8_float16",device="cuda",batch_size=8):
+    def transcribe_audio(self, vad_filter = False, task = "transcribe", audio_file=None, word_timestamps=False, compute_type="int8_float16",device="cuda",batch_size=8):
         '''
         Transcribe the audio file using the Whisper model.
         Args:
@@ -100,7 +100,7 @@ class ASR:
         if self.transcribe_model is None:
             self.transcribe_model = WhisperModel(self.model_size, device=device, compute_type=compute_type)
         batched_model = BatchedInferencePipeline(self.transcribe_model)
-        segments, _ = batched_model.transcribe(audio_file, vad_filter=vad_filter, task=task, language=language,word_timestamps=word_timestamps, chunk_length=30, batch_size=batch_size)   
+        segments, _ = batched_model.transcribe(audio_file, vad_filter=vad_filter, task=task,word_timestamps=word_timestamps, chunk_length=30, batch_size=batch_size)   
         self.transcribe_model = None
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
