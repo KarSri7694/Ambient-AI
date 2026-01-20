@@ -59,8 +59,6 @@ Ambient AI features a custom **MCP (Model Context Protocol) Bridge** that allows
     
     - 🔌 **Custom MCP Support:** Users can bridge as many MCP servers as needed (e.g., Filesystem, GitHub).
         
-    - 📊 **Live Dashboard:** Visualizes agent activity and task completion history in real-time.
-        
     - 🎙️ **FastAPI Server:** Endpoint to stream audio notes directly to the ASR model for transcription.
         
 
