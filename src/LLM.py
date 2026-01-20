@@ -6,6 +6,7 @@ import requests
 from pathlib import Path
 import night_mode
 from utils.todoist_helper import TodoistHelper
+from datetime import datetime
 
 
 api_uri= "http://localhost:8080"
@@ -16,7 +17,7 @@ transcription_files_content = {}
 username = ""
 s_prompt = f"""
 You are assitant of {username}, you have to help him in his daily tasks.
-You have access to various tools to help you accomplish tasks. The user will pass a conversation to you, you have to interpret it and decide which tools to use to best assist the user.
+You have access to various tools to help you accomplish tasks. The user will pass a conversation to you, you have to interpret it and decide which tools to use to best assist the user. If in transcriptions, a command has been given that requires physical action, add that task to user to-do list using the appropriate tool.
 When you need to perform a task, use the appropriate tool from the available tools list 
 if possible convert text to english before passing to tools
 Any task that requires extensive time or resources should be queued for night-time execution using the `queue_night_task` tool. This reqires research, downloading large files, or any task that the user specifies to be done at night.
@@ -270,17 +271,19 @@ async def start_input_loop():
         print("Type 'exit' to quit.\n\n")
         mode = input("Select mode (1, 2, or 3): ")
         notifications_str = get_notifications()
+        current_date = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
         if mode == '1':
             while True:
                 user_input = input("User--> ")
+                user_input_with_time = f"current date and time-[{current_date}] {user_input}"
                 if user_input.lower() == 'exit':
                     break
-                await start_llm_interaction(mode="user", user_input=user_input + "\n" + notifications_str, system_prompt="You are a helpful assistant. You can use tools to assist the user.")
+                await start_llm_interaction(mode="user", user_input=user_input_with_time + "\n" + notifications_str, system_prompt="You are a helpful assistant. You can use tools to assist the user.")
         elif mode == '2':
             read_transcription("transcriptions/")
             for filename, content in transcription_files_content.items():
                 print(f"\nProcessing transcription file: {filename}")
-                await start_llm_interaction(mode="transcription", user_input=content)
+                await start_llm_interaction(mode="transcription", user_input=f"current date and time-[{current_date}] {content}")
         elif mode == '3':
             print("Late night execution mode selected.")
             no_notification_count = 0 # counts the number of times no new notifications are found
@@ -293,7 +296,7 @@ async def start_input_loop():
                     for task in pending_tasks:
                         task_description = task['description']
                         print(f"\nProcessing night task ID {task['id']}: {task_description}")
-                        await start_llm_interaction(mode="night_task", user_input=task_description + "\n" + notifications_str, system_prompt=night_shift_prompt)
+                        await start_llm_interaction(mode="night_task", user_input=f"current date and time-[{current_date}] {task_description}" + "\n" + notifications_str, system_prompt=night_shift_prompt)
                         night_mode.mark_task_complete(task['id'], status="completed")
                     todoist_helper = TodoistHelper()
                     tasks = todoist_helper.get_tasks()
@@ -321,7 +324,7 @@ async def start_input_loop():
         
 async def main():
     try:
-        await load_model("Qwen3-VL-4b-Instruct-Q4_K_M")
+        await load_model("Qwen3-4B-Instruct-2507-Q4_K_M")
         await start_mcp()
         await get_tools()
         await start_input_loop()
