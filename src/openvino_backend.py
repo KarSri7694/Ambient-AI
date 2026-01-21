@@ -11,20 +11,23 @@ import time
 import json
 import os
 import re
+import threading
+import queue
 
 try:
     import openvino_genai as ov_genai
+    from openvino_genai import TextStreamer
 except Exception as e:
     ov_genai = None
+    TextStreamer = None
+Pipe = None
+Loaded_model = None
+Model_path = None
 
-_pipe = None
-_loaded_model = None
-_model_path = None
 
-
+streamer = TextStreamer()
 def _find_model_path(model_name: str) -> Optional[str]:
     """Try to locate a model path given a name or path.
-    Checks explicit path, model_cache entries, and a few sensible defaults.
     Returns the first existing path or None.
     """
     p = Path(model_name)
@@ -40,11 +43,11 @@ def load_model(model_name_or_path: str, device: str = "GPU") -> None:
     model_name_or_path can be a filesystem path or a short model name that will be
     searched for under `model_cache/`.
     """
-    global _pipe, _loaded_model, _model_path
+    global Pipe, Loaded_model, Model_path
     if ov_genai is None:
         raise RuntimeError("openvino_genai is not installed. Install it with `pip install openvino-genai`")
 
-    if _loaded_model == model_name_or_path:
+    if Loaded_model == model_name_or_path:
         return
 
     path = _find_model_path(model_name_or_path)
@@ -53,9 +56,9 @@ def load_model(model_name_or_path: str, device: str = "GPU") -> None:
         path = model_name_or_path
 
     # Create pipeline
-    _pipe = ov_genai.LLMPipeline(path, device)
-    _loaded_model = model_name_or_path
-    _model_path = path
+    Pipe = ov_genai.LLMPipeline(path, device)
+    Loaded_model = model_name_or_path
+    Model_path = path
 
 
 def _messages_to_prompt(messages: List[Dict[str, str]]) -> str:
@@ -86,21 +89,21 @@ def chat_completion(
 
     Returns a dictionary with keys: id, object, created, model, choices, usage
     """
-    global _pipe, _loaded_model
-    if _pipe is None or _loaded_model != model:
+    global Pipe, Loaded_model
+    if Pipe is None or Loaded_model != model:
         load_model(model)
 
     prompt = _messages_to_prompt(messages)
 
     config = ov_genai.GenerationConfig()
-    config.max_new_tokens = max_tokens
+    # config.max_new_tokens = max_tokens
     config.temperature = temperature
     config.top_p = top_p
     if stop:
         config.stop_strings = stop
 
     # Generate text (synchronous)
-    result = _pipe.generate(prompt, config)
+    result = Pipe.generate(prompt, config)
     if isinstance(result, (list, tuple)):
         # Some pipeline versions might return tokenized chunks; join if needed
         result_text = "".join(result)
@@ -141,28 +144,47 @@ def stream_chat_completion(
 
     Yields plain text tokens (or chunks). Consumers can reassemble them into full text.
     """
-    global _pipe, _loaded_model
-    if _pipe is None or _loaded_model != model:
+    global Pipe, Loaded_model
+    if Pipe is None or Loaded_model != model:
         load_model(model)
 
     prompt = _messages_to_prompt(messages)
 
     config = ov_genai.GenerationConfig()
-    config.max_new_tokens = max_tokens
+    # config.max_new_tokens = max_tokens
     config.temperature = temperature
     config.top_p = top_p
     if stop:
         config.stop_strings = stop
 
-    # The pipeline may return an iterator/stream of tokens
-    streamer = _pipe.generate(prompt, config)
-
-    # If the returned object is an iterator, yield from it; otherwise yield whole text
-    if hasattr(streamer, "__iter__") and not isinstance(streamer, (str, bytes)):
-        for chunk in streamer:
-            yield str(chunk)
-    else:
-        yield str(streamer)
+    # Use queue for real-time streaming
+    token_queue = queue.Queue()
+    generation_done = threading.Event()
+    
+    def streamer_callback(token_str: str) -> bool:
+        """Callback for each generated token. Return False to continue, True to stop."""
+        token_queue.put(token_str)
+        return False  # Continue generation
+    
+    # Run generation in background thread
+    def generate_thread():
+        try:
+            Pipe.generate(prompt, config, streamer_callback)
+        finally:
+            generation_done.set()
+    
+    thread = threading.Thread(target=generate_thread, daemon=True)
+    thread.start()
+    
+    # Yield tokens as they arrive
+    while not generation_done.is_set() or not token_queue.empty():
+        try:
+            token = token_queue.get(timeout=0.1)
+            yield token
+        except queue.Empty:
+            continue
+    
+    thread.join()
 
 
 def _format_messages_with_tools(messages: List[Dict[str, str]], tools: Optional[List[Dict]] = None) -> str:
@@ -250,8 +272,8 @@ def stream_chat_completion_with_tools(
     Yields dictionaries with keys: id, object, created, model, choices
     Each choice contains 'delta' with either 'content' or 'tool_calls'
     """
-    global _pipe, _loaded_model
-    if _pipe is None or _loaded_model != model:
+    global Pipe, Loaded_model
+    if Pipe is None or Loaded_model != model:
         load_model(model)
 
     prompt = _format_messages_with_tools(messages, tools)
@@ -281,14 +303,31 @@ def stream_chat_completion_with_tools(
     
     # Accumulate full text to check for tool calls
     accumulated_text = ""
+    token_queue = queue.Queue()
+    generation_done = threading.Event()
     
-    # The pipeline may return an iterator/stream of tokens
-    streamer = _pipe.generate(prompt, config)
+    # Use streamer callback for token-by-token generation
+    def streamer_callback(token_str: str) -> bool:
+        """Callback for each generated token. Return False to continue, True to stop."""
+        nonlocal accumulated_text
+        accumulated_text += token_str
+        token_queue.put(token_str)
+        return False  # Continue generation
     
-    if hasattr(streamer, "__iter__") and not isinstance(streamer, (str, bytes)):
-        for chunk in streamer:
-            token = str(chunk)
-            accumulated_text += token
+    # Run generation in background thread
+    def generate_thread():
+        try:
+            Pipe.generate(prompt, config, streamer_callback)
+        finally:
+            generation_done.set()
+    
+    thread = threading.Thread(target=generate_thread, daemon=True)
+    thread.start()
+    
+    # Stream tokens as they arrive
+    while not generation_done.is_set() or not token_queue.empty():
+        try:
+            token = token_queue.get(timeout=0.1)
             
             # Yield content chunk
             yield {
@@ -302,19 +341,10 @@ def stream_chat_completion_with_tools(
                     "finish_reason": None
                 }]
             }
-    else:
-        accumulated_text = str(streamer)
-        yield {
-            "id": completion_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "delta": {"content": accumulated_text},
-                "finish_reason": None
-            }]
-        }
+        except queue.Empty:
+            continue
+    
+    thread.join()
     
     # After streaming, check if there are tool calls in the accumulated text
     tool_calls, remaining_text = _parse_tool_calls_from_text(accumulated_text)
