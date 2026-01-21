@@ -8,11 +8,22 @@ import night_mode
 from utils.todoist_helper import TodoistHelper
 from datetime import datetime
 
+try:
+    import openvino_llm
+    OPENVINO_AVAILABLE = True
+except ImportError:
+    OPENVINO_AVAILABLE = False
+    openvino_llm = None
+
+QWEN3_OPENVINO = "Qwen3-4B-int4-ov/"
 
 api_uri= "http://localhost:8080"
 api_uri_v1 = f"{api_uri}/v1"
 tools = None
 transcription_files_content = {}
+
+# Backend selection: 'server' or 'local'
+BACKEND = 'local' if OPENVINO_AVAILABLE else 'server'
 
 username = ""
 s_prompt = f"""
@@ -71,32 +82,49 @@ async def load_model(model_name: str):
     
     # Unload previous model if any
     if currently_loaded_model is not None:
-        unload_model(currently_loaded_model)
+        await unload_model(currently_loaded_model)
     
-    model = {
-        "model": model_name
-    }
-    
-    response = requests.post(f"{api_uri}/models/load", json=model)
-    if response.status_code == 200:
-        print(f"Successfully loaded model: {model_name}")
-        currently_loaded_model = model_name
+    if BACKEND == 'local':
+        print(f"Loading model locally with OpenVINO: {model_name}")
+        try:
+            openvino_llm.load_model(model_name, device="CPU")
+            print(f"Successfully loaded model: {model_name}")
+            currently_loaded_model = model_name
+        except Exception as e:
+            print(f"Failed to load model locally: {e}")
     else:
-        print(f"Failed to load model: {model_name}. Response: {response.text}")
+        model = {
+            "model": model_name
+        }
+        
+        response = requests.post(f"{api_uri}/models/load", json=model)
+        if response.status_code == 200:
+            print(f"Successfully loaded model: {model_name}")
+            currently_loaded_model = model_name
+        else:
+            print(f"Failed to load model: {model_name}. Response: {response.text}")
     return    
 
 async def unload_model(model_name: str):
     global currently_loaded_model
-    model = {
-        "model": model_name
-    }
     
-    response = requests.post(f"{api_uri}/models/unload", json=model)
-    if response.status_code == 200:
+    if BACKEND == 'local':
+        # Local backend - just reset the global pipeline
+        openvino_llm._pipe = None
+        openvino_llm._loaded_model = None
         print(f"Successfully unloaded model: {model_name}")
         currently_loaded_model = None
     else:
-        print(f"Failed to unload model: {model_name}. Response: {response.text}")
+        model = {
+            "model": model_name
+        }
+        
+        response = requests.post(f"{api_uri}/models/unload", json=model)
+        if response.status_code == 200:
+            print(f"Successfully unloaded model: {model_name}")
+            currently_loaded_model = None
+        else:
+            print(f"Failed to unload model: {model_name}. Response: {response.text}")
 
 async def start_mcp():
     try:
@@ -144,53 +172,98 @@ async def start_llm_interaction(mode:str = "user", user_input:str = "", system_p
         iteration += 1
         print(f"\n--- Iteration {iteration} ---")
         
-        completion = client.chat.completions.create(
-            model=currently_loaded_model,
-            messages=message,    
-            tools=tools,
-            stream=True
-        )
-
         assistant_message = ""
         tool_calls = []
         
-        print("Streaming response:")
-        for chunk in completion:
-            delta = chunk.choices[0].delta
+        if BACKEND == 'local':
+            # Use local OpenVINO backend with tool support
+            print("Streaming response (local):")
             
-            # 1. Check for standard content (The final answer)
-            if delta.content:
-                print(delta.content, end="", flush=True)
-                assistant_message += delta.content
+            # Use the tool-aware streaming function
+            for chunk in openvino_llm.stream_chat_completion_with_tools(
+                messages=message,
+                tools=tools,
+                model=currently_loaded_model,
+                max_tokens=2048,
+                temperature=0.7
+            ):
+                delta = chunk["choices"][0]["delta"]
                 
-            # 2. Check for reasoning content (The "Thought")
-            reasoning = getattr(delta, 'reasoning_content', None)
-            if reasoning:
-                print(f"\033[93m{reasoning}\033[0m", end="", flush=True)    
+                # Check for content
+                if "content" in delta and delta["content"]:
+                    content = delta["content"]
+                    print(content, end="", flush=True)
+                    assistant_message += content
+                
+                # Check for tool calls
+                if "tool_calls" in delta and delta["tool_calls"]:
+                    for tool_call_delta in delta["tool_calls"]:
+                        index = tool_call_delta.get("index", 0)
+                        
+                        # Initialize new tool call if needed
+                        while len(tool_calls) <= index:
+                            tool_calls.append({
+                                "id": "",
+                                "type": "function",
+                                "function": {"name": "", "arguments": ""}
+                            })
+                        
+                        # Update tool call
+                        if "id" in tool_call_delta:
+                            tool_calls[index]["id"] = tool_call_delta["id"]
+                        
+                        if "function" in tool_call_delta:
+                            func = tool_call_delta["function"]
+                            if "name" in func:
+                                tool_calls[index]["function"]["name"] = func["name"]
+                            if "arguments" in func:
+                                tool_calls[index]["function"]["arguments"] = func["arguments"]
+        else:
+            # Use server-based backend
+            completion = client.chat.completions.create(
+                model=currently_loaded_model,
+                messages=message,    
+                tools=tools,
+                stream=True
+            )
             
-            if delta.tool_calls:
-                for tool_call_delta in delta.tool_calls:
-                    index = tool_call_delta.index
+            print("Streaming response:")
+            for chunk in completion:
+                delta = chunk.choices[0].delta
+                
+                # 1. Check for standard content (The final answer)
+                if delta.content:
+                    print(delta.content, end="", flush=True)
+                    assistant_message += delta.content
                     
-                    # Initialize new tool call if needed
-                    while len(tool_calls) <= index:
-                        tool_calls.append({
-                            "id": "",
-                            "type": "function",
-                            "function": {"name": "", "arguments": ""}
-                        })
-                    
-                    # Update tool call ID
-                    if tool_call_delta.id:
-                        tool_calls[index]["id"] = tool_call_delta.id
-                    
-                    # Update function name
-                    if tool_call_delta.function.name:
-                        tool_calls[index]["function"]["name"] += tool_call_delta.function.name
-                    
-                    # Update function arguments
-                    if tool_call_delta.function.arguments:
-                        tool_calls[index]["function"]["arguments"] += tool_call_delta.function.arguments
+                # 2. Check for reasoning content (The "Thought")
+                reasoning = getattr(delta, 'reasoning_content', None)
+                if reasoning:
+                    print(f"\033[93m{reasoning}\033[0m", end="", flush=True)    
+                
+                if delta.tool_calls:
+                    for tool_call_delta in delta.tool_calls:
+                        index = tool_call_delta.index
+                        
+                        # Initialize new tool call if needed
+                        while len(tool_calls) <= index:
+                            tool_calls.append({
+                                "id": "",
+                                "type": "function",
+                                "function": {"name": "", "arguments": ""}
+                            })
+                        
+                        # Update tool call ID
+                        if tool_call_delta.id:
+                            tool_calls[index]["id"] = tool_call_delta.id
+                        
+                        # Update function name
+                        if tool_call_delta.function.name:
+                            tool_calls[index]["function"]["name"] += tool_call_delta.function.name
+                        
+                        # Update function arguments
+                        if tool_call_delta.function.arguments:
+                            tool_calls[index]["function"]["arguments"] += tool_call_delta.function.arguments
         
         print("\n")
         
@@ -323,16 +396,29 @@ async def start_input_loop():
             break
         
 async def main():
+    global BACKEND
+    print(f"\n{'='*60}")
+    print(f"Backend Mode: {BACKEND.upper()}")
+    if BACKEND == 'local':
+        print("Using local OpenVINO GenAI inference")
+    else:
+        print(f"Using server-based inference at {api_uri}")
+    print(f"{'='*60}\n")
+    
     try:
-        await load_model("Qwen3-4B-Instruct-2507-Q4_K_M")
+        await load_model(QWEN3_OPENVINO if BACKEND == 'local' else "Qwen3-4B-Instruct-2507-Q4_K_M")
         await start_mcp()
         await get_tools()
         await start_input_loop()
     except requests.exceptions.ConnectionError as e:
-        print(f"LLAMA-SERVER is not running.")
-        print(f"Error connecting to LLM API at {api_uri}: {e}")
+        if BACKEND == 'server':
+            print(f"LLAMA-SERVER is not running.")
+            print(f"Error connecting to LLM API at {api_uri}: {e}")
+        else:
+            raise
     finally:
-        await unload_model(currently_loaded_model)
+        if currently_loaded_model:
+            await unload_model(currently_loaded_model)
         await cleanup_mcp()
 
 if __name__ == "__main__":
