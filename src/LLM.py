@@ -9,11 +9,11 @@ from utils.todoist_helper import TodoistHelper
 from datetime import datetime
 
 try:
-    import openvino_llm
+    import openvino_backend
     OPENVINO_AVAILABLE = True
 except ImportError:
     OPENVINO_AVAILABLE = False
-    openvino_llm = None
+    openvino_backend = None
 
 QWEN3_OPENVINO = "Qwen3-4B-int4-ov/"
 
@@ -87,7 +87,7 @@ async def load_model(model_name: str):
     if BACKEND == 'local':
         print(f"Loading model locally with OpenVINO: {model_name}")
         try:
-            openvino_llm.load_model(model_name, device="CPU")
+            openvino_backend.load_model(model_name, device="CPU")
             print(f"Successfully loaded model: {model_name}")
             currently_loaded_model = model_name
         except Exception as e:
@@ -110,8 +110,8 @@ async def unload_model(model_name: str):
     
     if BACKEND == 'local':
         # Local backend - just reset the global pipeline
-        openvino_llm._pipe = None
-        openvino_llm._loaded_model = None
+        openvino_backend._pipe = None
+        openvino_backend._loaded_model = None
         print(f"Successfully unloaded model: {model_name}")
         currently_loaded_model = None
     else:
@@ -180,7 +180,7 @@ async def start_llm_interaction(mode:str = "user", user_input:str = "", system_p
             print("Streaming response (local):")
             
             # Use the tool-aware streaming function
-            for chunk in openvino_llm.stream_chat_completion_with_tools(
+            for chunk in openvino_backend.stream_chat_completion_with_tools(
                 messages=message,
                 tools=tools,
                 model=currently_loaded_model,
