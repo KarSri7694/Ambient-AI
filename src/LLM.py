@@ -23,7 +23,7 @@ tools = None
 transcription_files_content = {}
 
 # Backend selection: 'server' or 'local'
-BACKEND = 'local' if OPENVINO_AVAILABLE else 'server'
+BACKEND = ''
 
 username = ""
 s_prompt = f"""
@@ -110,8 +110,8 @@ async def unload_model(model_name: str):
     
     if BACKEND == 'local':
         # Local backend - just reset the global pipeline
-        openvino_backend._pipe = None
-        openvino_backend._loaded_model = None
+        openvino_backend.Pipe = None
+        openvino_backend.Loaded_model = None
         print(f"Successfully unloaded model: {model_name}")
         currently_loaded_model = None
     else:
@@ -184,7 +184,7 @@ async def start_llm_interaction(mode:str = "user", user_input:str = "", system_p
                 messages=message,
                 tools=tools,
                 model=currently_loaded_model,
-                max_tokens=2048,
+                max_tokens=5000,
                 temperature=0.7
             ):
                 delta = chunk["choices"][0]["delta"]
@@ -399,13 +399,15 @@ async def main():
     global BACKEND
     print(f"\n{'='*60}")
     print(f"Backend Mode: {BACKEND.upper()}")
-    if BACKEND == 'local':
-        print("Using local OpenVINO GenAI inference")
-    else:
-        print(f"Using server-based inference at {api_uri}")
-    print(f"{'='*60}\n")
+    
     
     try:
+        BACKEND = input("Select backend - type 'local' for OpenVINO or 'server' for Llama-Server (default 'server'): ").strip().lower()
+        if BACKEND == 'local':
+            print("Using local OpenVINO GenAI inference")
+        else:
+            print(f"Using server-based inference at {api_uri}")
+        print(f"{'='*60}\n")
         await load_model(QWEN3_OPENVINO if BACKEND == 'local' else "Qwen3-4B-Instruct-2507-Q4_K_M")
         await start_mcp()
         await get_tools()
