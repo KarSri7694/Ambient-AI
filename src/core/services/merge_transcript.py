@@ -1,15 +1,18 @@
-from core.models import TranscriptionResult, DiarizationResult
+from core.models import TranscriptionResult, DiarizationResult, SpeakerMapping
 
 class MergeTranscript:
     TOLERANCE = 0.25  # seconds
     
-    def merge(self, transcriptions: list[TranscriptionResult], diarizations: DiarizationResult) -> str:
+    def merge(self, transcriptions: list[TranscriptionResult], diarizations: DiarizationResult, speaker_mapping: list[SpeakerMapping]) -> str:
         """
         Merge transcriptions with diarization by assigning each word to the best-matching speaker.
         Each word is assigned to exactly ONE speaker based on maximum overlap.
         Args:
             transcriptions (list[TranscriptionResult]): List of transcription segments with word timestamps.
             diarizations (DiarizationResult): Diarization result with speaker segments.
+            speaker_mapping (SpeakerMapping)[Optional]: list of Mapping of diarization speaker labels to identified speaker names. If provided, use identified names instead of original labels.
+        Returns:
+            str: Formatted transcript with speaker labels.
         """
         # Flatten all words from all transcription segments
         all_words = []
@@ -29,13 +32,17 @@ class MergeTranscript:
             if best_speaker:
                 word_speaker_assignments.append({
                     "start": word["start"],
+                    "end": word["end"],
                     "speaker": best_speaker,
                     "text": word["text"]
                 })
         
         # Sort by time and build transcript
         word_speaker_assignments.sort(key=lambda x: x["start"])
-        return self._build_transcript(word_speaker_assignments)
+        if speaker_mapping is None:
+            return self._build_transcript(word_speaker_assignments)
+        else:
+            return self._build_transcript(word_speaker_assignments, speaker_mapping)
     
     def _assign_word_to_speaker(self, word: dict, segments) -> str:
         """
@@ -63,7 +70,7 @@ class MergeTranscript:
         
         return best_speaker
     
-    def _build_transcript(self, word_assignments: list[dict]) -> str:
+    def _build_transcript(self, word_assignments: list[dict], speaker_mapping: list[SpeakerMapping]) -> str:
         """
         Build formatted transcript from word-speaker assignments.
         Groups consecutive words by the same speaker.
@@ -76,8 +83,14 @@ class MergeTranscript:
         current_words = []
         
         for assignment in word_assignments:
-            speaker = assignment["speaker"]
+            
+            for s in speaker_mapping:
+                if s.original_label == assignment["speaker"]:
+                    speaker = s.identified_label
+                    break
             word = assignment["text"]
+            word_start = assignment["start"]
+            word_end = assignment["end"]
             
             if speaker != current_speaker:
                 # Save previous speaker's words
