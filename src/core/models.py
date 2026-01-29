@@ -1,7 +1,6 @@
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict
 from datetime import datetime
-import torch
 
 @dataclass(frozen=True)
 class TranscriptionResult:
@@ -27,8 +26,8 @@ class SpeakerSegment:
     start_time: float
     end_time: float
     speaker_label: str
-    audio_tensor: Optional[torch.Tensor] = None
-    embedding: Optional[torch.Tensor] = None
+    audio_tensor: Optional[list[float]] = None
+    embedding: Optional[list[float]] = None
     
     @property
     def duration(self) -> float:
@@ -42,7 +41,7 @@ class SpeakerInfo:
     confidence_score: float = 0.0
     total_speaking_time: float = 0.0
     segment_count: int = 0
-    combined_embedding: Optional[torch.Tensor] = None
+    combined_embedding: Optional[list[float]] = None
 
 @dataclass
 class DiarizationResult:
@@ -66,10 +65,17 @@ class DiarizationResult:
 class SpeakerEmbedding:
     """Holds speaker embedding data"""
     speaker_label: str
-    embedding: torch.Tensor
+    embedding: list[float]
 
 @dataclass
 class SpeakerScore:
     """Holds speaker identification score data"""
     speaker_label: str
+    score: float
+
+@dataclass
+class SpeakerMapping:
+    """Mapping between diarization speaker labels and identified speaker names"""
+    original_label: str
+    identified_label: str
     score: float
