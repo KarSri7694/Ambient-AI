@@ -1,4 +1,4 @@
-from core.models import SpeakerEmbedding, SpeakerScore
+from core.models import SpeakerEmbedding, SpeakerMapping
 from application.ports.identity_port import SpeakerIdentityPort
 from application.ports.voice_repository_port import VoiceRepository
 import torch
@@ -13,13 +13,13 @@ class EcapaVoxcelebAdapter(SpeakerIdentityPort):
         self.voice_repo = voice_repo
         self.classifier = EncoderClassifier.from_hparams(source=model_name_or_path, savedir="pretrained_models/spkrec-ecapa-voxceleb", run_opts={"device": "cuda" if torch.cuda.is_available() else "cpu"})
 
-    def identify_speaker(self, audio_tensor: torch.Tensor, threshold: float = 0.7) -> str:
+    def identify_speaker(self, audio_tensor: torch.Tensor, original_label: str, threshold: float = 0.7) -> str:
         """
         Identify the speaker from the given audio metadata using ECAPA-TDNN model.
         Args:
             audio_metadata (SpeakerEmbedding): Audio metadata containing the embedding tensor.
         Returns:
-            str: Identified speaker label.
+            SpeakerMapping: object containg identified label, original label and score
         """
         # Perform speaker identification
         embedding = self.classifier.encode_batch(audio_tensor)
@@ -34,7 +34,11 @@ class EcapaVoxcelebAdapter(SpeakerIdentityPort):
             if score > highest_score:
                 highest_score = score
                 best_match = speaker_label
-        return best_match
+        return SpeakerMapping(
+            original_label=original_label,
+            identified_label=best_match,
+            score = highest_score
+        )
         
     def create_speaker_embedding(self, audio_tensor: torch.Tensor, speaker_label: str) :
         """
@@ -59,4 +63,8 @@ class EcapaVoxcelebAdapter(SpeakerIdentityPort):
             logging.error(f"Error storing embedding: {e}")
             return False
         
-        
+    def unload_model(self):
+        """
+        Unloads the ECAPA-TDNN model from memory.
+        """
+        self.classifier = None

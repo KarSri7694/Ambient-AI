@@ -24,3 +24,10 @@ class WhisperAdapter(TranscriptionPort):
             word_timestamps=[{"word": word.word, "start": word.start, "end": word.end, "probability": word.probability} for word in segment.words] if word_timestamps else None
         ) for segment in segments]
     
+    def unload_model(self):
+        """
+        Unloads the Whisper model from memory.
+        """
+        self.model = None
+        self.batched_model = None
+        

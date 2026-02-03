@@ -53,3 +53,9 @@ class PyannoteAdapter(DiarizationPort):
             )
             
         return diarization_result
+    
+    def unload_model(self):
+        """
+        Unloads the diarization model from memory.
+        """
+        self.diarization_model = None
