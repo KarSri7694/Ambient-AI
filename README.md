@@ -2,65 +2,168 @@
 
 **The Fully Local, Zero-Interaction Autonomous Agent.**
 
+---
+
 ## 📖 Overview
 
-**Ambient AI** is a fully local autonomous agent designed to 'ambient' around you. Unlike traditional assistants that wait for commands, Ambient AI actively listens to your conversations and watches your screen to understand your intent and context in real-time.
+**Ambient AI** is a fully local autonomous agent designed to *ambient* around you. Unlike traditional assistants that wait for commands, Ambient AI actively listens to your conversations and watches your screen to understand your intent and context in real-time.
 
 Its core philosophy is **Zero-Interaction**, but it goes beyond simple automation. Ambient AI acts as a proactive partner:
 
-- **Contextual Research:** It catches topics you discuss in passing and autonomously performs deep web research or Google searches, presenting you with the answers before you even ask.
-    
-- **Intelligent Planning:** It generates daily to-do lists based on your previous days' context and historical conversations, ensuring nothing slips through the cracks.
-    
-- **Seamless Delegation:** While it works autonomously, you can also assign specific complex workflows by simply adding them to a dedicated **"Ambient AI Tasks"** project in Todoist. The agent picks these up and executes them during your computer's idle time.
+- **Contextual Research:** Catches topics you discuss in passing, autonomously performs deep web research, and presents answers before you even ask.
+- **Intelligent Planning:** Generates daily to-do lists based on your previous days' context and historical conversations.
+- **Seamless Delegation:** Assign complex workflows by adding them to a **"Ambient AI Tasks"** project in Todoist — the agent picks these up and executes them during idle time.
+
+---
+
+## 🏗️ Architecture
+
+The project follows the **Hexagonal Architecture** (Ports & Adapters) pattern, cleanly separating core logic from external dependencies.
+
+```
+src/
+├── core/                        # Domain models & pure logic (NO outward deps)
+│   ├── models.py                # Domain objects (ChatMessage, NightTask, etc.)
+│   └── services/
+│       └── merge_transcript.py          # Pure transcription merging logic
+├── application/                 # Depends on core only
+│   ├── ports/                   # Abstract interfaces (contracts)
+│   │   ├── LLMProvider.py       # LLM generation & streaming
+│   │   ├── modelManager.py      # Model loading/unloading
+│   │   ├── tool_bridge_port.py  # MCP tool system
+│   │   ├── notification_port.py # System notifications
+│   │   ├── task_queue_port.py   # Night task queue
+│   │   ├── task_provider_port.py# External task providers
+│   │   ├── asr_port.py          # Speech recognition
+│   │   ├── identity_port.py     # Speaker identification
+│   │   └── voice_repository_port.py # Voice embedding store
+│   └── services/                # Orchestration (depends on ports + core)
+│       ├── llm_interaction_service.py   # Streaming chat loop + tool execution
+│       └── night_mode_service.py        # Autonomous night-time processing
+├── infrastructure/
+│   └── adapter/                 # Concrete implementations
+│       ├── llamaCppAdapter.py   # llama.cpp OpenAI-compatible server
+│       ├── MCPToolAdapter.py    # MCP bridge wrapper
+│       ├── SQLiteNotificationAdapter.py
+│       ├── SQLiteTaskQueueAdapter.py
+│       ├── TodoistTaskAdapter.py
+│       ├── ASR_Adapter.py       # Whisper transcription
+│       ├── pyannoteAdapter.py   # Speaker diarization
+│       ├── ecapaVoxcelebAdapter.py # Voice identification
+│       └── SQLiteVoiceAdapter.py   # Voice embedding storage
+├── app.py                       # Composition root (entry point)
+├── server.py                    # FastAPI audio streaming server
+└── mcp.json                     # MCP server configuration
+```
+
 ---
 
 ## 🚀 Key Capabilities
 
 ### 👂 The "Ear" (Audio Intelligence)
 
-- **Hinglish Transcription:** Uses a fine-tuned variant of the Whisper model optimized for code-mixed audio.
-    
-    - _Model:_ [Hindi2Hinglish (Oriserve/Whisper-Hindi2Hinglish-Apex)](https://huggingface.co/Oriserve/Whisper-Hindi2Hinglish-Apex)
-        
-- **Speaker Diarization:** Real-time Voice Activity Detection (VAD) and speaker separation using **Pyannote**.
-    
-- **Voice Identity:** Secure voice embedding creation using the **SpeechBrain VoxCeleb** model to distinguish the user from guests.
-    
+- **Hinglish Transcription:** Fine-tuned Whisper model optimized for code-mixed audio — [Hindi2Hinglish (Oriserve)](https://huggingface.co/Oriserve/Whisper-Hindi2Hinglish-Apex)
+- **Speaker Diarization:** Real-time VAD and speaker separation using **Pyannote**
+- **Voice Identity:** Voice embedding creation using **SpeechBrain VoxCeleb** to distinguish the user from guests
 
 ### 🧠 The "Brain" (Reasoning & Control)
 
-- **Local Inference:** Powered by **Qwen 3 VL 4B** as the default model for reasoning and tool use.
-    
-- **Notification System:** A state-aware feedback loop that updates the LLM on the status/outcome of previously performed tasks.
-    
-- **Chat Mode:** A direct interface to interact with the local LLM for general queries and conversation.
-    
+- **Local Inference:** Powered by **Qwen 3 VL 4B** (default) via llama.cpp
+- **Notification System:** State-aware feedback loop that updates the LLM on outcomes of previous tasks
+- **Chat Mode:** Direct interactive interface with the local LLM
+- **Night Mode:** Fully autonomous task processing during idle hours
 
 ### 🛠️ The "Hands" (Tool Ecosystem)
 
-Ambient AI features a custom **MCP (Model Context Protocol) Bridge** that allows unlimited extensibility.
+Custom **MCP Bridge** enabling unlimited extensibility:
 
-- **Productivity:**
-    
-    - ✅ **Todoist:** Automatically extracts and adds tasks based on audio context.
-        
-    - 📅 **Google Meet:** Creates meetings automatically from conversation details.
-        
-    - 📓 **Obsidian:** Manages your personal knowledge base directly.
-        
-- **Research:**
-    
-    - 🌐 **Tavily:** Autonomous web search for deep research.
-        
-    - 🕸️ **Web Browsing:** Full page navigation and extraction.
-        
-- **System & Custom:**
-    
-    - 🔌 **Custom MCP Support:** Users can bridge as many MCP servers as needed (e.g., Filesystem, GitHub).
-        
-    - 🎙️ **FastAPI Server:** Endpoint to stream audio notes directly to the ASR model for transcription.
-        
+| Category | Tool | Description |
+|---|---|---|
+| **Productivity** | ✅ Todoist | Extracts and adds tasks from audio context |
+| | 📅 Google Meet | Creates meetings from conversation details |
+| | 📓 Obsidian | Manages your personal knowledge base |
+| **Research** | 🌐 Tavily | Autonomous deep web search |
+| | 🕸️ Web Browsing | Full page navigation and extraction |
+| **System** | 🔌 Custom MCP | Bridge any MCP server (Filesystem, GitHub, etc.) |
+| | 📊 Live Dashboard | Visualizes agent activity in real-time |
+| | 🎙️ FastAPI Server | Stream audio notes for transcription |
+
+---
+
+## ⚡ Getting Started
+
+### Prerequisites
+
+- **Python 3.11+**
+- **llama.cpp server** — running locally with OpenAI-compatible API (default: `http://localhost:8080`)
+- **Node.js / npm** — required for MCP server tooling (`npx`)
+- **CUDA-capable GPU** — recommended for model inference
+
+### Installation
+
+```bash
+# Clone the repository
+git clone https://github.com/your-username/ambient-ai.git
+cd ambient-ai
+
+# Create and activate virtual environment
+python -m venv venv
+
+# Windows
+./venv/Scripts/activate.ps1
+
+# Linux / macOS
+source venv/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt
+```
+
+### Configuration
+
+1. **LLM Server** — Start llama.cpp server with the model preset manager or manually:
+   ```bash
+   # The app expects the server at http://localhost:8080
+   # It will auto-load the model "Qwen3-VL-4b-Instruct-Q4_K_M" on startup
+   ```
+
+2. **MCP Tools** — Configure your MCP servers in `mcp.json`:
+   ```json
+   {
+     "mcpServers": {
+       "My MCP Server": {
+         "command": "fastmcp",
+         "args": ["run", "path/to/MCP_tools.py"],
+         "env": { "TODOIST_API_TOKEN": "your-token" }
+       }
+     }
+   }
+   ```
+
+3. **Todoist** *(optional)* — Set your API token in the `TODOIST_API_TOKEN` environment variable and configure `todoist.json` with your project ID.
+
+4. **Night Queue Database** — Auto-initializes on first run. To manually initialize:
+   ```bash
+   python src/night_mode.py
+   ```
+
+### Running
+
+```bash
+# Main application (all modes)
+python src/app.py
+
+# FastAPI audio streaming server
+python src/main.py
+```
+
+On launch, you'll be presented with three modes:
+
+| Mode | Description |
+|---|---|
+| **1 — User Interaction** | Interactive chat with the LLM, with full tool access |
+| **2 — Transcription Automation** | Processes `.txt` files in `transcriptions/` through the LLM |
+| **3 — Night Mode** | Autonomous processing of queued tasks, Todoist tasks, and notifications |
 
 ---
 
@@ -72,18 +175,14 @@ https://github.com/user-attachments/assets/bde47b83-526b-4ff2-8b0f-3119021149a1
 
 ## 🗺️ Future Roadmap
 
-Actively developing the next generation of autonomous local agents.
-
-- [ ] **Hexagonal Architecture Refactor:** Refactoring the entire codebase using the Ports and Adapters pattern to decouple core logic from external tools.
-    
-- [ ] **GUI Agent:** Developing a vision-based agent capable of direct screen control (clicking, typing, scrolling). _(Currently in Progress)_
-    
-- [ ] **AgentProg Implementation:** Implementing **Memory Pruning**, **Variable Stores**, and **Global Belief State** based on the [AgentProg Paper (Dec 2025)](https://arxiv.org/pdf/2512.10371v1). This will allow the agent to handle long-horizon tasks (50+ steps) without context overflow or hallucinations.
-    
-- [ ] **Context Fusion:** Merging Audio and Screenshot context streams to create a unified understanding of user intent.
-    
-- [ ] **Model Fine-tuning:** Fine-tuning Qwen 3 specifically for Ambient AI's unique autonomous task workflows.
-    
+- [x] **Hexagonal Architecture Refactor:** Codebase refactored using Ports and Adapters pattern
+- [ ] **GUI Agent:** Vision-based agent for direct screen control *(in progress)*
+- [ ] **AgentProg Implementation:** Memory Pruning, Variable Stores, and Global Belief State — [AgentProg Paper (Dec 2025)](https://arxiv.org/pdf/2512.10371v1)
+- [ ] **Context Fusion:** Merging audio and screenshot context streams
+- [ ] **Model Fine-tuning:** Fine-tuning Qwen 3 for Ambient AI's autonomous workflows
 
 ---
 
+## 📄 License
+
+This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
