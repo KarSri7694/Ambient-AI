@@ -20,3 +20,4 @@ credentials.json
 mcp.json
 models_preset.ini
 /spkrec-ecapa-voxceleb
+/Qwen3-4B-int4-ov
