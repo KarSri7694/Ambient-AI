@@ -25,7 +25,6 @@ Loaded_model = None
 Model_path = None
 
 
-streamer = TextStreamer()
 def _find_model_path(model_name: str) -> Optional[str]:
     """Try to locate a model path given a name or path.
     Returns the first existing path or None.
