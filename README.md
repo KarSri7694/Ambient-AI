@@ -43,6 +43,7 @@ src/
 ├── infrastructure/
 │   └── adapter/                 # Concrete implementations
 │       ├── llamaCppAdapter.py   # llama.cpp OpenAI-compatible server
+│       ├── openVinoAdapter.py   # OpenVINO GenAI local inference
 │       ├── MCPToolAdapter.py    # MCP bridge wrapper
 │       ├── SQLiteNotificationAdapter.py
 │       ├── SQLiteTaskQueueAdapter.py
@@ -146,6 +147,50 @@ pip install -r requirements.txt
    ```bash
    python src/night_mode.py
    ```
+
+### Backend Selection
+
+Ambient AI supports two inference backends. Set the `LLM_BACKEND` environment variable to choose:
+
+| Backend | Value | Description |
+|---|---|---|
+| **llama.cpp** *(default)* | `llamacpp` | Uses an external llama.cpp server with OpenAI-compatible API. Best for CUDA GPUs. |
+| **OpenVINO** | `openvino` | Uses Intel's OpenVINO GenAI runtime. Best for Intel GPUs, CPUs, and NPUs. No separate server needed. |
+
+#### llama.cpp (default — no extra config needed)
+
+The default backend. Just start the llama.cpp server and run the app:
+
+```bash
+python src/app.py
+```
+
+#### OpenVINO
+
+1. **Install the runtime:**
+   ```bash
+   pip install openvino-genai
+   ```
+
+2. **Prepare a model** — You need an OpenVINO-optimized model (IR format). You can convert GGUF/HuggingFace models using the [OpenVINO Model Conversion Guide](https://docs.openvino.ai/latest/openvino_docs_MO_DG_prepare_model_convert_model.html) or download pre-converted models from HuggingFace (look for repos with `-ov` or `-openvino` suffix).
+
+3. **Set environment variables and run:**
+   ```bash
+   # Windows (PowerShell)
+   $env:LLM_BACKEND = "openvino"
+   $env:OPENVINO_MODEL_PATH = "path/to/your/openvino-model-dir"
+   $env:OPENVINO_DEVICE = "GPU"   # Options: CPU, GPU, NPU
+   python src/app.py
+
+   # Linux / macOS
+   LLM_BACKEND=openvino OPENVINO_MODEL_PATH=path/to/model OPENVINO_DEVICE=GPU python src/app.py
+   ```
+
+| Variable | Default | Description |
+|---|---|---|
+| `LLM_BACKEND` | `llamacpp` | `llamacpp` or `openvino` |
+| `OPENVINO_MODEL_PATH` | `Qwen3-4B-int4-ov` | Path to the OpenVINO model directory |
+| `OPENVINO_DEVICE` | `GPU` | Target device: `CPU`, `GPU`, or `NPU` |
 
 ### Running
 
