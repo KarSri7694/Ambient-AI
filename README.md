@@ -222,7 +222,6 @@ https://github.com/user-attachments/assets/bde47b83-526b-4ff2-8b0f-3119021149a1
 
 - [x] **Hexagonal Architecture Refactor:** Codebase refactored using Ports and Adapters pattern
 - [ ] **GUI Agent:** Vision-based agent for direct screen control *(in progress)*
-- [ ] **AgentProg Implementation:** Memory Pruning, Variable Stores, and Global Belief State — [AgentProg Paper (Dec 2025)](https://arxiv.org/pdf/2512.10371v1)
 - [ ] **Context Fusion:** Merging audio and screenshot context streams
 - [ ] **Model Fine-tuning:** Fine-tuning Qwen 3 for Ambient AI's autonomous workflows
 
