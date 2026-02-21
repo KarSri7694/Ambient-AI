@@ -8,12 +8,15 @@ import asyncio
 import logging
 import os
 from pathlib import Path
+import threading
 
 from infrastructure.adapter.llamaCppAdapter import LlamaCppAdapter
 from infrastructure.adapter.MCPToolAdapter import MCPToolAdapter
 from infrastructure.adapter.SQLiteNotificationAdapter import SQLiteNotificationAdapter
 from infrastructure.adapter.SQLiteTaskQueueAdapter import SQLiteTaskQueueAdapter
 from infrastructure.adapter.TodoistTaskAdapter import TodoistTaskAdapter
+from infrastructure.adapter.MSSScreenCaptureAdapter import MssScreenCaptureAdapter
+from application.ports.screen_capture_port import ScreenCapturePort
 from application.services.llm_interaction_service import LLMInteractionService
 from application.services.night_mode_service import NightModeService
 
@@ -104,8 +107,9 @@ async def run_app() -> None:
             print("\n1. Enter User interaction mode")
             print("2. Enter Transcription Automation mode")
             print("3. Enter late night execution mode")
+            print("4. Enter Agentic Control Mode (Vision)")
             print("Type 'exit' to quit.\n")
-            mode = input("Select mode (1, 2, or 3): ")
+            mode = input("Select mode (1, 2, 3, or 4): ")
 
             notifications_str = _format_notifications(notification_adapter)
 
@@ -117,6 +121,10 @@ async def run_app() -> None:
 
             elif mode == "3":
                 await night_service.run_night_loop()
+
+            elif mode == "4":
+                screenshot_adapter = MssScreenCaptureAdapter()
+                await _agentic_control_mode(llm_service, llm_adapter, screenshot_adapter, notifications_str)
 
             elif mode.lower() == "exit":
                 print("Exiting program.")
@@ -157,6 +165,67 @@ async def _user_mode(
             model=model,
         )
 
+
+async def _agentic_control_mode(
+    llm_service: LLMInteractionService,
+    llm_adapter: LlamaCppAdapter,
+    screenshot_adapter: ScreenCapturePort,
+    notifications_str: str,
+) -> None:
+    """Agentic Control Mode: Captures screen and controls computer based on vision."""
+    model = llm_adapter.get_current_model()
+    system_prompt = (
+        "You are an agent that controls the computer using vision and tools. "
+        "You will be provided with a screenshot of the current screen for every turn. "
+        "Use the screenshot to understand the state of the system and use tools to achieve the user's goal."
+        "Explain your actions before making a tool call."
+        "Once clicked a text field do not click it again and again, assume it is selected and in next step start typing."
+        "ALWAYS USE open_global_search tool to search and open apps, type the name of app you want to open in the text field and then double click in global search results to open apps. DO NOT USE START BUTTON OR TASKBAR ICONS TO OPEN APPS. "
+        
+    )
+    i=0
+    while True:  # Limit iterations to prevent infinite loop during testing
+        print("\n--- Agentic Control Mode ---")
+        user_input = input("Target Goal (or 'exit' to quit)--> ")
+        if user_input.lower() == "exit":
+            break
+            
+        while i < 10:
+            if i==0:
+                logging.info("Waiting 10 seconds before first screenshot ...")
+                threading.Event().wait(10)  # Wait a moment before first screenshot to allow user to prepare
+            print("Capturing screen...")
+            screenshot_path = screenshot_adapter.capture_screenshot()
+            print(f"Screenshot captured: {screenshot_path}")
+            
+            # The agent will continue until it decides it's done or reached a limit.
+            # Currently LLMInteractionService has its own MAX_ITERATIONS loop for tool calls.
+            # But here we want a fresh screenshot for every 'turn' of interaction.
+            # However, run_interaction ALREADY has a loop.
+            # To get a NEW screenshot for every TOOL CALL iteration, we might need 
+            # to modify run_interaction or handle it here.
+            
+            # The user request said: "after every turn model will get new screenshot"
+            # In run_interaction, a 'turn' usually refers to one LLM call + tool calls.
+            
+            assistant_response = await llm_service.run_interaction(
+                user_input=f"Current Objective: {user_input}\n{notifications_str}",
+                system_prompt=system_prompt,
+                model=model,
+                image_path=screenshot_path
+            )
+            
+            print(f"\nAgent: {assistant_response}")
+            
+            # If the agent says it's done, we break to the next goal
+            if "DONE" in assistant_response.upper() or "TASK COMPLETE" in assistant_response.upper():
+                break
+            
+            logger.info("Waiting before next screenshot...")
+            threading.Event().wait(5)
+            # If we want it to be fully autonomous, we could just loop.
+            # But let's ask the user if they want to continue or if it should auto-continue.
+            i+=1
 
 async def _transcription_mode(
     llm_service: LLMInteractionService,
