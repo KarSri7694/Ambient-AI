@@ -25,3 +25,5 @@ models_preset.ini
 /qwen-2-5-3b-vl-instruct
 /qwen-2-5b-vl-instruct
 /Qwen2.5-7B-VL-int4-ov
+OPENVINO_TOOL_CALLING.md
+todoist.json
