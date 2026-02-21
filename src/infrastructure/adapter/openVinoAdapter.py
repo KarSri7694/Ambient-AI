@@ -1,8 +1,9 @@
 """
 OpenVINO GenAI adapter — implements both LLMProvider and ModelManager ports.
 
-Wraps the module-level helpers in `openvino_backend.py` so they can be used
-interchangeably with the llama.cpp adapter through the hexagonal architecture.
+Supports both text-only (LLMPipeline) and vision-language (VLMPipeline) models.
+Image paths are forwarded to openvino_backend which handles PIL loading and
+numpy conversion before the OpenVINO pipeline.
 """
 
 import logging
@@ -12,8 +13,6 @@ from typing import Optional, List, Dict, Any, Iterator
 from application.ports.LLMProvider import LLMProvider
 from application.ports.modelManager import ModelManager
 
-# Lazy-import the backend so the rest of the app can still be loaded even when
-# openvino_genai is not installed.
 import openvino_backend as _ov
 
 
@@ -63,14 +62,12 @@ class _ChunkShim:
 
 def _dict_to_chunk(d: Dict[str, Any]) -> _ChunkShim:
     """Convert a raw dict from openvino_backend into an attribute-access shim."""
-    choices_raw = d.get("choices", [])
     choices: List[_ChoiceShim] = []
-    for c in choices_raw:
+    for c in d.get("choices", []):
         delta_raw = c.get("delta", {})
 
-        # Build tool_calls shims if present
         tc_shims: Optional[List[_ToolCallDeltaShim]] = None
-        if "tool_calls" in delta_raw and delta_raw["tool_calls"]:
+        if delta_raw.get("tool_calls"):
             tc_shims = []
             for tc in delta_raw["tool_calls"]:
                 fn_raw = tc.get("function", {})
@@ -112,12 +109,25 @@ def _dict_to_chunk(d: Dict[str, Any]) -> _ChunkShim:
 
 
 class OpenVinoAdapter(LLMProvider, ModelManager):
-    """Adapter for OpenVINO GenAI — implements both LLMProvider and ModelManager."""
+    """Adapter for OpenVINO GenAI — implements both LLMProvider and ModelManager.
 
-    def __init__(self, model_path: str, device: str = "GPU"):
+    Supports text-only (LLMPipeline) and vision-language (VLMPipeline) models.
+    Pass a non-empty ``image`` path to ``generate_response`` or
+    ``chat_completion_stream`` to activate multimodal inference.
+    """
+
+    def __init__(self, model_path: str, device: str = "GPU", vlm: bool = False):
+        """
+        Args:
+            model_path: Path to the OpenVINO model directory.
+            device: Target device — ``"CPU"``, ``"GPU"``, or ``"NPU"``.
+            vlm: Force VLMPipeline. If *False*, the backend auto-detects from
+                 the model's ``config.json``.
+        """
         self.logger = logging.getLogger(self.__class__.__name__)
         self._model_path = model_path
         self._device = device
+        self._vlm = vlm
         self.currently_loaded_model: Optional[str] = None
 
     # ── ModelManager ──────────────────────────────────────────
@@ -127,17 +137,23 @@ class OpenVinoAdapter(LLMProvider, ModelManager):
             self.logger.info(f"Model {model_name} is already loaded.")
             return
 
-        self.logger.info(f"Loading OpenVINO model: {model_name} on {self._device}")
-        _ov.load_model(model_name, device=self._device)
+        pipeline_type = "VLM" if self._vlm else "LLM (auto-detect)"
+        self.logger.info(
+            f"Loading OpenVINO model: {model_name} | device={self._device} "
+            f"| pipeline={pipeline_type}"
+        )
+        _ov.load_model(model_name, device=self._device, vlm=self._vlm)
         self.currently_loaded_model = model_name
-        self.logger.info(f"Successfully loaded OpenVINO model: {model_name}")
+        self.logger.info(
+            f"Loaded as {'VLMPipeline' if _ov.IsVLM else 'LLMPipeline'}"
+        )
 
     async def unload_model(self) -> None:
         if self.currently_loaded_model is None:
             return
         self.logger.info(f"Unloading OpenVINO model: {self.currently_loaded_model}")
-        # Reset the global pipeline in the backend module
         _ov.Pipe = None
+        _ov.IsVLM = False
         _ov.Loaded_model = None
         _ov.Model_path = None
         self.currently_loaded_model = None
@@ -148,10 +164,14 @@ class OpenVinoAdapter(LLMProvider, ModelManager):
     # ── LLMProvider ───────────────────────────────────────────
 
     def generate_response(self, prompt: str, image: str = "") -> str:
-        """Simple non-streaming generation via the OpenVINO pipeline."""
+        """Non-streaming generation. Pass ``image`` (file path) for VLM inference."""
         messages = [{"role": "user", "content": prompt}]
         model = self.currently_loaded_model or self._model_path
-        resp = _ov.chat_completion(messages, model=model)
+        resp = _ov.chat_completion(
+            messages,
+            model=model,
+            image=image or None,
+        )
         return resp["choices"][0]["message"]["content"]
 
     def chat_completion_stream(
@@ -159,11 +179,12 @@ class OpenVinoAdapter(LLMProvider, ModelManager):
         model: str,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
+        image: str = "",
     ) -> Iterator[_ChunkShim]:
-        """
-        Create a streaming chat completion via the OpenVINO backend.
-        Yields shim objects compatible with OpenAI's streaming format so that
-        LLMInteractionService._consume_stream works without changes.
+        """Streaming chat completion.
+
+        Args:
+            image: Optional file path to an image for VLM inference.
         """
         raw_stream = _ov.stream_chat_completion_with_tools(
             messages=messages,
@@ -172,6 +193,7 @@ class OpenVinoAdapter(LLMProvider, ModelManager):
             temperature=0.7,
             top_p=0.95,
             max_tokens=32000,
+            image=image or None,
         )
         for chunk_dict in raw_stream:
             yield _dict_to_chunk(chunk_dict)

@@ -67,11 +67,31 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         model: str,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
+        image: str = "",
     ) -> Iterator:
         """
         Create a streaming chat completion against the llama.cpp OpenAI-compatible API.
         Returns the raw streaming iterator of chunk objects.
         """
+        # If an image is provided, we need to inject it into the content of the LAST message.
+        # This assumes the last message is from the 'user' and text-only.
+        if image and messages and messages[-1]["role"] == "user":
+            import base64
+            with open(image, "rb") as f:
+                base64_image = base64.b64encode(f.read()).decode("utf-8")
+            
+            last_message = messages[-1]
+            text_content = last_message["content"]
+            
+            # format content as list for multimodal
+            last_message["content"] = [
+                {"type": "text", "text": text_content},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{base64_image}"}
+                }
+            ]
+
         kwargs: Dict[str, Any] = {
             "model": model,
             "messages": messages,
