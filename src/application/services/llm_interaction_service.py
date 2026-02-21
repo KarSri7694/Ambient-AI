@@ -14,7 +14,7 @@ class LLMInteractionService:
     it only depends on the LLMProvider and ToolBridgePort abstractions.
     """
 
-    MAX_ITERATIONS = 10
+    MAX_ITERATIONS = 1
 
     def __init__(self, llm_provider: LLMProvider, tool_bridge: ToolBridgePort):
         self.llm = llm_provider
@@ -36,6 +36,7 @@ class LLMInteractionService:
         user_input: str,
         system_prompt: str,
         model: str,
+        image_path: str = "",
     ) -> str:
         """
         Run a full LLM interaction: send user input, stream response,
@@ -57,6 +58,7 @@ class LLMInteractionService:
                 model=model,
                 messages=self._messages,
                 tools=self._tools,
+                image=image_path if iteration == 1 else "",
             )
 
             assistant_text, tool_calls = self._consume_stream(completion)
