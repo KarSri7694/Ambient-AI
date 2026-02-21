@@ -21,3 +21,7 @@ mcp.json
 models_preset.ini
 /spkrec-ecapa-voxceleb
 /Qwen3-4B-int4-ov
+/outputs
+/qwen-2-5-3b-vl-instruct
+/qwen-2-5b-vl-instruct
+/Qwen2.5-7B-VL-int4-ov
