@@ -172,8 +172,7 @@ python src/app.py
    pip install openvino-genai
    ```
 
-2. **Prepare a model** — You need an OpenVINO-optimized model (IR format). You can convert GGUF/HuggingFace models using the [OpenVINO Model Conversion Guide](https://docs.openvino.ai/latest/openvino_docs_MO_DG_prepare_model_convert_model.html) or download pre-converted models from HuggingFace (look for repos with `-ov` or `-openvino` suffix).
-
+2. **Prepare a model** — You need an OpenVINO-optimized model (IR format).
 3. **Set environment variables and run:**
    ```bash
    # Windows (PowerShell)
