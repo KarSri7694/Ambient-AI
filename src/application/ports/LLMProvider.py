@@ -16,6 +16,7 @@ class LLMProvider(ABC):
         model: str,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
+        image: str = "",
     ) -> Iterator:
         """
         Create a streaming chat completion.
