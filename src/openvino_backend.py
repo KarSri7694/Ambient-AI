@@ -257,7 +257,7 @@ def chat_completion(
                 "An image was provided but the loaded pipeline is text-only. "
                 "Reload with vlm=True or use a VLM model."
             )
-        img_array = _load_image_as_array(image)
+        img_array = _load_image_as_tensor(image)
         result = Pipe.generate(prompt, image=img_array, generation_config=cfg)
     else:
         result = Pipe.generate(prompt, cfg)
