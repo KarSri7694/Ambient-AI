@@ -19,6 +19,7 @@ from infrastructure.adapter.MSSScreenCaptureAdapter import MssScreenCaptureAdapt
 from application.ports.screen_capture_port import ScreenCapturePort
 from application.services.llm_interaction_service import LLMInteractionService
 from application.services.night_mode_service import NightModeService
+from utils.model_swapper import ModelSwapper
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 # ── Configuration ─────────────────────────────────────────────
 API_BASE_URL = "http://localhost:8080"
-DEFAULT_MODEL = "Qwen3-VL-4b-Instruct-Q4_K_M"
+DEFAULT_MODEL = "Qwen-4b-Thinking-2507-Q4_K_M"
 MCP_CONFIG_PATH = "mcp.json"
 
 # Backend selection: "llamacpp" (default) or "openvino"
@@ -78,6 +79,7 @@ async def run_app() -> None:
         default_model = DEFAULT_MODEL
 
     tool_bridge = MCPToolAdapter()
+    vision_tool_bridge = MCPToolAdapter()  # Separate bridge for vision tools if needed
     notification_adapter = SQLiteNotificationAdapter()
     task_queue_adapter = SQLiteTaskQueueAdapter()
     todoist_adapter = TodoistTaskAdapter()
@@ -100,8 +102,7 @@ async def run_app() -> None:
         # ── Startup ───────────────────────────────────────────
         await llm_adapter.load_model(default_model)
         await tool_bridge.start_servers(MCP_CONFIG_PATH)
-        await llm_service.initialize_tools()
-
+        await llm_service.initialize_tools() 
         # ── Mode selection loop ───────────────────────────────
         while True:
             print("\n1. Enter User interaction mode")
@@ -123,8 +124,19 @@ async def run_app() -> None:
                 await night_service.run_night_loop()
 
             elif mode == "4":
-                screenshot_adapter = MssScreenCaptureAdapter()
-                await _agentic_control_mode(llm_service, llm_adapter, screenshot_adapter, notifications_str)
+                await vision_tool_bridge.start_servers("GUI_mcp.json")
+                try:
+                    gui_agent_service = LLMInteractionService(
+                        llm_provider=llm_adapter,
+                        tool_bridge=vision_tool_bridge,
+                    )
+                    await gui_agent_service.initialize_tools()
+
+                    screenshot_adapter = MssScreenCaptureAdapter()
+                    async with ModelSwapper("Qwen3-VL-4b-Instruct-Q4_K_M", llm_adapter, gui_agent_service) as model:
+                        await _agentic_control_mode(gui_agent_service, llm_adapter, screenshot_adapter, notifications_str, model)
+                finally:
+                    await vision_tool_bridge.cleanup()
 
             elif mode.lower() == "exit":
                 print("Exiting program.")
@@ -171,9 +183,9 @@ async def _agentic_control_mode(
     llm_adapter: LlamaCppAdapter,
     screenshot_adapter: ScreenCapturePort,
     notifications_str: str,
+    model: str
 ) -> None:
     """Agentic Control Mode: Captures screen and controls computer based on vision."""
-    model = llm_adapter.get_current_model()
     system_prompt = (
         "You are an agent that controls the computer using vision and tools. "
         "You will be provided with a screenshot of the current screen for every turn. "
