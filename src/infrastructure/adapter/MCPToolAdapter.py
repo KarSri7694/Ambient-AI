@@ -1,53 +1,96 @@
+import json
 import logging
-from typing import List, Dict, Any
+from contextlib import AsyncExitStack
+from typing import List, Dict, Any, Optional
 
-import llama_MCP_bridge
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
 from application.ports.tool_bridge_port import ToolBridgePort
 
 
 class MCPToolAdapter(ToolBridgePort):
-    """Adapter that wraps the llama_MCP_bridge module behind the ToolBridgePort interface."""
+    """
+    Self-contained MCP adapter
+    """
 
     def __init__(self):
         self.logger = logging.getLogger(self.__class__.__name__)
+        self._sessions: Dict[str, ClientSession] = {}
+        self._tool_server_map: Dict[str, str] = {}  # tool_name -> server_name
+        self._exit_stack: Optional[AsyncExitStack] = None
 
     async def start_servers(self, config_path: str) -> None:
-        try:
-            await llama_MCP_bridge.start_servers(config_path)
-        except Exception as e:
-            self.logger.error(f"Error starting MCP servers: {e}")
+        self._exit_stack = AsyncExitStack()
+
+        with open(config_path, "r") as f:
+            config = json.load(f)
+
+        for server_name, server_config in config.get("mcpServers", {}).items():
+            self.logger.info(f"Connecting to MCP server: {server_name}")
+            params = StdioServerParameters(
+                command=server_config["command"],
+                args=server_config.get("args", []),
+                env=server_config.get("env"),
+            )
+            try:
+                read, write = await self._exit_stack.enter_async_context(stdio_client(params))
+                session = await self._exit_stack.enter_async_context(ClientSession(read, write))
+                await session.initialize()
+                self._sessions[server_name] = session
+                self.logger.info(f"Connected to {server_name}")
+            except Exception as e:
+                self.logger.error(f"Failed to connect to {server_name}: {e}")
 
     async def get_all_tools(self) -> List[Dict[str, Any]]:
-        try:
-            tools = await llama_MCP_bridge.get_all_mcp_tools()
-            return tools
-        except Exception as e:
-            self.logger.error(f"Error retrieving MCP tools: {e}")
-            return []
+        all_tools: List[Dict[str, Any]] = []
+        for server_name, session in self._sessions.items():
+            try:
+                mcp_tools = await session.list_tools()
+                for tool in mcp_tools.tools:
+                    self._tool_server_map[tool.name] = server_name
+                    all_tools.append({
+                        "type": "function",
+                        "function": {
+                            "name": tool.name,
+                            "description": tool.description,
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    name: {k: v for k, v in vals.items() if k != "title"}
+                                    for name, vals in tool.inputSchema.get("properties", {}).items()
+                                },
+                                "required": tool.inputSchema.get("required", []),
+                            },
+                        },
+                    })
+            except Exception as e:
+                self.logger.error(f"Failed to fetch tools from {server_name}: {e}")
+        return all_tools
 
     async def execute_tool(self, tool_name: str, tool_args: Dict[str, Any]) -> str:
-        """Execute a tool and return the result as a plain string."""
+        server_name = self._tool_server_map.get(tool_name)
+        if not server_name:
+            raise ValueError(f"Tool '{tool_name}' not found in any connected server.")
         try:
-            tool_response = await llama_MCP_bridge.execute_tool(tool_name, tool_args)
-
-            # Convert MCP CallToolResult to string
-            if hasattr(tool_response, 'content'):
-                content_parts = []
-                for item in tool_response.content:
-                    if hasattr(item, 'text'):
-                        content_parts.append(item.text)
-                    else:
-                        content_parts.append(str(item))
-                return '\n'.join(content_parts)
-            else:
-                return str(tool_response)
+            response = await self._sessions[server_name].call_tool(tool_name, tool_args)
+            if hasattr(response, "content"):
+                return "\n".join(
+                    item.text if hasattr(item, "text") else str(item)
+                    for item in response.content
+                )
+            return str(response)
         except Exception as e:
             self.logger.error(f"Error executing tool {tool_name}: {e}")
             return f"Error: {str(e)}"
 
     async def cleanup(self) -> None:
-        try:
-            await llama_MCP_bridge.cleanup()
-            self.logger.info("MCP cleanup completed.")
-        except Exception as e:
-            self.logger.error(f"Error during MCP cleanup: {e}")
+        if self._exit_stack:
+            try:
+                await self._exit_stack.aclose()
+                self.logger.info("MCP cleanup completed.")
+            except Exception as e:
+                self.logger.error(f"Error during MCP cleanup: {e}")
+            finally:
+                self._exit_stack = None
+                self._sessions.clear()
+                self._tool_server_map.clear()
