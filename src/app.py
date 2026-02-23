@@ -180,7 +180,7 @@ async def _agentic_control_mode(
         "Use the screenshot to understand the state of the system and use tools to achieve the user's goal."
         "Explain your actions before making a tool call."
         "Once clicked a text field do not click it again and again, assume it is selected and in next step start typing."
-        "ALWAYS USE open_global_search tool to search and open apps, type the name of app you want to open in the text field and then double click in global search results to open apps. DO NOT USE START BUTTON OR TASKBAR ICONS TO OPEN APPS. "
+        "ALWAYS USE open_app tool open apps, DO NOT USE START BUTTON OR TASKBAR ICONS TO OPEN APPS. "
         
     )
     i=0
@@ -209,7 +209,7 @@ async def _agentic_control_mode(
             # In run_interaction, a 'turn' usually refers to one LLM call + tool calls.
             
             assistant_response = await llm_service.run_interaction(
-                user_input=f"Current Objective: {user_input}\n{notifications_str}",
+                user_input=f"Current Objective: {user_input}",
                 system_prompt=system_prompt,
                 model=model,
                 image_path=screenshot_path
