@@ -27,3 +27,4 @@ models_preset.ini
 /Qwen2.5-7B-VL-int4-ov
 OPENVINO_TOOL_CALLING.md
 todoist.json
+GUI_mcp.json

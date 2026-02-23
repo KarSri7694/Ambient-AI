@@ -31,6 +31,14 @@ class LLMInteractionService:
         """Clear the message history for a new conversation."""
         self._messages = []
 
+    def get_context(self) -> List[Dict[str, Any]]:
+        """Return a snapshot of the current message history."""
+        return list(self._messages)
+
+    def restore_context(self, messages: List[Dict[str, Any]]) -> None:
+        """Restore a previously saved message history."""
+        self._messages = list(messages)
+
     async def run_interaction(
         self,
         user_input: str,
