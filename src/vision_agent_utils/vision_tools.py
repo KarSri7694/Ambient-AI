@@ -2,6 +2,12 @@ import pyautogui
 from fastmcp import FastMCP
 from typing import Annotated
 import logging
+try:
+    from ..utils.OSController import OSController
+except ImportError:
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+    from utils.OSController import OSController
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -102,10 +108,14 @@ def keyboard_hotkey(keys: Annotated[str, "key to press eg. 'ctrl+c'"]):
     return f"Pressed hotkey combination: {keys}"
 
 @mcp.tool
-def open_global_search():
+def open_app(app_name: Annotated[str, "name of the application to open"]):
     """
-    Open the global search interface (e.g., by pressing 'Ctrl + F').
+    Open the specified application, if it is not already running it opens it, if it is already running it focuses it.
     """
-    pyautogui.hotkey('win', 'alt', 'space')
-    return "Opened global search interface."
-
+    controller = OSController()
+    controller._set_foreground_lock(0)
+    
+    if controller.focus_existing_window(app_name):
+        print(f"SUCCESS: Found existing window for '{app_name}' and focused it.")
+    else:
+        controller.open_and_verify_app(app_name)
