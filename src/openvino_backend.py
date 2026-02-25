@@ -50,7 +50,6 @@ def _find_model_path(model_name: str) -> Optional[str]:
 
 pipe_config = {
     "KV_CACHE_PRECISION": "u8",
-    # Optional: Group size for quantization (default is usually 32)
     "DYNAMIC_QUANTIZATION_GROUP_SIZE": "32" 
 }
 
