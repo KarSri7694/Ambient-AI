@@ -48,6 +48,11 @@ def _find_model_path(model_name: str) -> Optional[str]:
         return str(p)
     return None
 
+pipe_config = {
+    "KV_CACHE_PRECISION": "u8",
+    # Optional: Group size for quantization (default is usually 32)
+    "DYNAMIC_QUANTIZATION_GROUP_SIZE": "32" 
+}
 
 def load_model(model_name_or_path: str, device: str = "GPU", vlm: bool = False) -> None:
     """Load an LLMPipeline (text) or VLMPipeline (vision+text) into the global state.
@@ -75,10 +80,10 @@ def load_model(model_name_or_path: str, device: str = "GPU", vlm: bool = False) 
     use_vlm = vlm or _is_vlm_model(path)
 
     if use_vlm:
-        Pipe = ov_genai.VLMPipeline(path, device)
+        Pipe = ov_genai.VLMPipeline(path, device, **pipe_config)
         IsVLM = True
     else:
-        Pipe = ov_genai.LLMPipeline(path, device)
+        Pipe = ov_genai.LLMPipeline(path, device, **pipe_config)
         IsVLM = False
 
     Loaded_model = model_name_or_path
