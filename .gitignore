@@ -28,3 +28,6 @@ models_preset.ini
 OPENVINO_TOOL_CALLING.md
 todoist.json
 GUI_mcp.json
+/qwen-2_5_3b_vl
+/Qwen2.5-3B-VL-int4-ov
+/QWEN3_4B_VL_INT8
