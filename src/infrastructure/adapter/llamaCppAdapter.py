@@ -68,6 +68,9 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
         image: str = "",
+        temperature: float = 0.7,
+        top_p: float = 0.95,
+        top_k: int = 0,
     ) -> Iterator:
         """
         Create a streaming chat completion against the llama.cpp OpenAI-compatible API.
@@ -96,7 +99,11 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
             "model": model,
             "messages": messages,
             "stream": True,
+            "temperature": temperature,
+            "top_p": top_p,
         }
+        if top_k > 0:
+            kwargs["extra_body"] = {"top_k": top_k}
         if tools:
             kwargs["tools"] = tools
 
