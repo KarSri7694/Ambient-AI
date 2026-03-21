@@ -20,14 +20,9 @@ credentials.json
 mcp.json
 models_preset.ini
 /spkrec-ecapa-voxceleb
-/Qwen3-4B-int4-ov
 /outputs
-/qwen-2-5-3b-vl-instruct
-/qwen-2-5b-vl-instruct
-/Qwen2.5-7B-VL-int4-ov
-OPENVINO_TOOL_CALLING.md
 todoist.json
 GUI_mcp.json
-/qwen-2_5_3b_vl
-/Qwen2.5-3B-VL-int4-ov
-/QWEN3_4B_VL_INT8
+/models
+app_data.json
+/documentation
