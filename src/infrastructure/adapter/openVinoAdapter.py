@@ -132,34 +132,84 @@ class OpenVinoAdapter(LLMProvider, ModelManager):
 
     # ── ModelManager ──────────────────────────────────────────
 
-    async def load_model(self, model_name: str) -> None:
+    async def load_model(
+        self,
+        model_name: str,
+        stateful: bool = False,
+        pipeline_class: str = "qwen25",
+    ) -> None:
+        """Load a model.
+
+        Args:
+            model_name: Model path or name.
+            stateful: When *True*, loads the stateful KV-snapshot pipeline
+                      (``vlm_kv_stateful``) instead of ``openvino_genai``.
+                      Required for KV snapshot/restore and direct GPU KV control.
+            pipeline_class: Only used when ``stateful=True``.
+                            ``"qwen25"`` for Qwen2.5-VL, ``"qwen3"`` for Qwen3-VL.
+        """
         if self.currently_loaded_model == model_name:
             self.logger.info(f"Model {model_name} is already loaded.")
             return
 
-        pipeline_type = "VLM" if self._vlm else "LLM (auto-detect)"
-        self.logger.info(
-            f"Loading OpenVINO model: {model_name} | device={self._device} "
-            f"| pipeline={pipeline_type}"
-        )
-        _ov.load_model(model_name, device=self._device, vlm=self._vlm)
+        if stateful:
+            import asyncio
+            self.logger.info(
+                f"Loading stateful pipeline: {pipeline_class} on {self._device} "
+                f"from {model_name}"
+            )
+            await asyncio.to_thread(
+                _ov.load_stateful_model,
+                model_path=model_name,
+                pipeline_class=pipeline_class,
+                device=self._device,
+            )
+            self.logger.info("Stateful pipeline ready.")
+        else:
+            pipeline_type = "VLM" if self._vlm else "LLM (auto-detect)"
+            self.logger.info(
+                f"Loading OpenVINO model: {model_name} | device={self._device} "
+                f"| pipeline={pipeline_type}"
+            )
+            _ov.load_model(model_name, device=self._device, vlm=self._vlm)
+            self.logger.info(
+                f"Loaded as {'VLMPipeline' if _ov.IsVLM else 'LLMPipeline'}"
+            )
         self.currently_loaded_model = model_name
-        self.logger.info(
-            f"Loaded as {'VLMPipeline' if _ov.IsVLM else 'LLMPipeline'}"
-        )
 
     async def unload_model(self) -> None:
-        if self.currently_loaded_model is None:
+        if self.currently_loaded_model is None and _ov.StatefulPipe is None:
             return
         self.logger.info(f"Unloading OpenVINO model: {self.currently_loaded_model}")
         _ov.Pipe = None
         _ov.IsVLM = False
         _ov.Loaded_model = None
         _ov.Model_path = None
+        _ov.StatefulPipe = None
         self.currently_loaded_model = None
 
     def get_current_model(self) -> Optional[str]:
         return self.currently_loaded_model
+
+    def reset_kv(self) -> None:
+        """Reset KV cache — call at the start of every new conversation."""
+        _ov.reset_kv()
+
+    def snapshot_kv(self):
+        """Snapshot current KV state — zero forward passes.
+
+        Returns:
+            KVSnapshot that can be passed to restore_kv().
+        """
+        return _ov.snapshot_kv()
+
+    def restore_kv(self, snap) -> None:
+        """Restore a previously snapshotted KV state — zero forward passes.
+
+        Args:
+            snap: KVSnapshot returned by snapshot_kv().
+        """
+        _ov.restore_kv(snap)
 
     # ── LLMProvider ───────────────────────────────────────────
 
@@ -180,19 +230,27 @@ class OpenVinoAdapter(LLMProvider, ModelManager):
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
         image: str = "",
+        max_tokens: int = 32000,
+        temperature: float = 0.7,
+        top_p: float = 0.95,
+        top_k: int = 0,
     ) -> Iterator[_ChunkShim]:
         """Streaming chat completion.
 
         Args:
             image: Optional file path to an image for VLM inference.
+            max_tokens: Maximum new tokens to generate. Keeping this
+                reasonable (≤2048) avoids over-reserving GPU KV buffers.
+            top_k: Top-k sampling filter (0 = disabled).
         """
         raw_stream = _ov.stream_chat_completion_with_tools(
             messages=messages,
             tools=tools,
             model=model,
-            temperature=0.7,
-            top_p=0.95,
-            max_tokens=32000,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            max_tokens=max_tokens,
             image=image or None,
         )
         for chunk_dict in raw_stream:
