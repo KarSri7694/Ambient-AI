@@ -32,11 +32,33 @@ except Exception:
     np = None
     PILImage = None
 
-# ── Global pipeline state ─────────────────────────────────────
+try:
+    import sys as _sys
+    import os as _os
+    # Add project root so vlm_kv_stateful is importable regardless of cwd
+    _proj_root = str(Path(__file__).resolve().parent.parent)
+    if _proj_root not in _sys.path:
+        _sys.path.insert(0, _proj_root)
+    from vlm_kv_stateful import (
+        VLMStatefulBase,
+        Qwen25VLStatefulPipeline,
+        Qwen3VLStatefulPipeline,
+        KVSnapshot,
+    )
+    _STATEFUL_AVAILABLE = True
+except Exception:
+    VLMStatefulBase = None
+    Qwen25VLStatefulPipeline = None
+    Qwen3VLStatefulPipeline = None
+    KVSnapshot = None
+    _STATEFUL_AVAILABLE = False
+
+# ── Global pipeline state ────────────────────────────────
 Pipe = None          # Active pipeline (LLMPipeline or VLMPipeline)
 IsVLM = False        # True when a VLMPipeline is loaded
 Loaded_model = None  # Currently loaded model path / name
 Model_path = None    # Resolved filesystem path
+StatefulPipe = None  # VLMStatefulBase instance; set by load_stateful_model()
 
 
 # ── Model loading ─────────────────────────────────────────────
@@ -103,6 +125,80 @@ def _is_vlm_model(path: str) -> bool:
         return False
 
 
+def load_stateful_model(
+    model_path: str,
+    pipeline_class: str = "qwen25",
+    device: str = "CPU",
+) -> None:
+    """Load a stateful VLM pipeline (zero-recompute KV snapshot support).
+
+    This is an *alternative* to ``load_model``.  Use when you need
+    ``snapshot_kv`` / ``restore_kv`` / ``reset_kv`` (e.g. multi-turn
+    rollback without recomputation).  Does not touch ``Pipe`` or ``Loaded_model``.
+
+    Args:
+        model_path:      Path to the OpenVINO model directory containing the
+                         sub-model XML files.
+        pipeline_class:  Which pipeline to instantiate.
+                         ``"qwen25"`` → Qwen25VLStatefulPipeline (Qwen2.5-VL)
+                         ``"qwen3"``  → Qwen3VLStatefulPipeline  (Qwen3-VL)
+        device:          OpenVINO device string — ``"CPU"``, ``"GPU"``, ``"NPU"``.
+                         Defaults to ``"CPU"`` (stateful pipeline is
+                         CPU-optimal; Qwen3-VL may not run on GPU yet).
+    """
+    global StatefulPipe
+    if not _STATEFUL_AVAILABLE:
+        raise RuntimeError(
+            "vlm_kv_stateful could not be imported.  "
+            "Ensure vlm_kv_stateful.py is on the Python path."
+        )
+    classes = {
+        "qwen25": Qwen25VLStatefulPipeline,
+        "qwen3":  Qwen3VLStatefulPipeline,
+    }
+    if pipeline_class not in classes:
+        raise ValueError(
+            f"Unknown pipeline_class '{pipeline_class}'. "
+            f"Choose from: {list(classes)}"
+        )
+    StatefulPipe = classes[pipeline_class](model_path, device=device)
+
+
+def snapshot_kv():
+    """Deep-copy all KV VariableState tensors.  Returns a ``KVSnapshot``.
+
+    Zero forward passes.  Call before any turn you may want to roll back.
+    Raises ``RuntimeError`` if no stateful pipeline is loaded.
+    """
+    if StatefulPipe is None:
+        raise RuntimeError("No stateful pipeline loaded. Call load_stateful_model() first.")
+    return StatefulPipe.snapshot_kv()
+
+
+def restore_kv(snap) -> None:
+    """Restore KV state from a ``KVSnapshot``.  Zero forward passes.
+
+    After this call the model's effective context is exactly the set of
+    tokens present when ``snapshot_kv()`` was called.
+    Raises ``RuntimeError`` if no stateful pipeline is loaded.
+    """
+    if StatefulPipe is None:
+        raise RuntimeError("No stateful pipeline loaded. Call load_stateful_model() first.")
+    StatefulPipe.restore_kv(snap)
+
+
+def reset_kv() -> None:
+    """Reset KV state to empty — start of a new conversation.
+
+    Call explicitly at the beginning of every new conversation when
+    using the stateful pipeline.  Never called automatically.
+    Raises ``RuntimeError`` if no stateful pipeline is loaded.
+    """
+    if StatefulPipe is None:
+        raise RuntimeError("No stateful pipeline loaded. Call load_stateful_model() first.")
+    StatefulPipe.reset_kv()
+
+
 # ── Image helpers ─────────────────────────────────────────────
 
 def _load_image_as_tensor(image_path: str):
@@ -125,6 +221,19 @@ def _load_image_as_tensor(image_path: str):
     img = PILImage.open(image_path).convert("RGB")
     arr = np.array(img, dtype=np.uint8)   # shape: (H, W, 3)
     return ov.Tensor(arr)
+
+
+def _pil_image_from_path(image_path: str):
+    """Load an image file and return a ``PIL.Image.Image`` in RGB.
+
+    VLMStatefulBase.generate() requires a PIL Image, not an ov.Tensor.
+    """
+    if PILImage is None:
+        raise RuntimeError(
+            "Pillow is required for image input. "
+            "Install with: pip install Pillow"
+        )
+    return PILImage.open(image_path).convert("RGB")
 
 
 # ── Prompt formatting ─────────────────────────────────────────
@@ -232,6 +341,7 @@ def chat_completion(
     max_tokens: int = -1,
     stop: Optional[List[str]] = None,
     image: Optional[str] = None,
+    tools: Optional[List[Dict]] = None,
 ) -> Dict[str, Any]:
     """Synchronous chat completion — returns an OpenAI-compatible response dict.
 
@@ -245,24 +355,42 @@ def chat_completion(
         image: Optional path to an image file (activates VLM inference).
     """
     global Pipe, Loaded_model
-    if Pipe is None or Loaded_model != model:
-        load_model(model, vlm=bool(image))
 
-    prompt = _messages_to_prompt(messages)
-    cfg = _make_config(temperature, top_p, max_tokens, stop)
-
-    if image:
-        if not IsVLM:
-            raise RuntimeError(
-                "An image was provided but the loaded pipeline is text-only. "
-                "Reload with vlm=True or use a VLM model."
-            )
-        img_array = _load_image_as_tensor(image)
-        result = Pipe.generate(prompt, image=img_array, generation_config=cfg)
+    # ── Stateful pipeline path ───────────────────────────────────────────
+    if StatefulPipe is not None:
+        pil_img = _pil_image_from_path(image) if image else None
+        result_text = StatefulPipe.generate(
+            prompt_text=messages[-1].get("content", "") if messages else "",
+            image=pil_img,
+            max_new_tokens=max_tokens if max_tokens > 0 else 512,
+            messages=messages,
+            temperature=temperature,
+            top_p=top_p,
+            tools=tools,
+        )
+        prompt_for_count = " ".join(
+            m.get("content", "") for m in messages if isinstance(m.get("content"), str)
+        )
     else:
-        result = Pipe.generate(prompt, cfg)
+        # ── ov_genai pipeline path ─────────────────────────────────────
+        if Pipe is None or Loaded_model != model:
+            load_model(model, vlm=bool(image))
 
-    result_text = "".join(result) if isinstance(result, (list, tuple)) else str(result)
+        prompt_for_count = _messages_to_prompt(messages)
+        cfg = _make_config(temperature, top_p, max_tokens, stop)
+
+        if image:
+            if not IsVLM:
+                raise RuntimeError(
+                    "An image was provided but the loaded pipeline is text-only. "
+                    "Reload with vlm=True or use a VLM model."
+                )
+            img_array = _load_image_as_tensor(image)
+            result = Pipe.generate(prompt_for_count, image=img_array, generation_config=cfg)
+        else:
+            result = Pipe.generate(prompt_for_count, cfg)
+
+        result_text = "".join(result) if isinstance(result, (list, tuple)) else str(result)
 
     now = int(time.time())
     return {
@@ -278,9 +406,9 @@ def chat_completion(
             }
         ],
         "usage": {
-            "prompt_tokens": len(prompt.split()),
+            "prompt_tokens": len(prompt_for_count.split()),
             "completion_tokens": len(result_text.split()),
-            "total_tokens": len(prompt.split()) + len(result_text.split()),
+            "total_tokens": len(prompt_for_count.split()) + len(result_text.split()),
         },
     }
 
@@ -300,29 +428,50 @@ def stream_chat_completion(
         image: Optional path to an image file (activates VLM inference).
     """
     global Pipe, Loaded_model
-    if Pipe is None or Loaded_model != model:
-        load_model(model, vlm=bool(image))
-
-    prompt = _messages_to_prompt(messages)
-    cfg = _make_config(temperature, top_p, max_tokens, stop)
 
     token_queue: queue.Queue = queue.Queue()
     generation_done = threading.Event()
 
-    def streamer_callback(token_str: str) -> bool:
-        token_queue.put(token_str)
-        return False  # continue generation
+    if StatefulPipe is not None:
+        # ── Stateful path: run full generation then emit word-by-word ──────
+        def generate_thread():
+            try:
+                pil_img  = _pil_image_from_path(image) if image else None
+                response = StatefulPipe.generate(
+                    prompt_text=messages[-1].get("content", "") if messages else "",
+                    image=pil_img,
+                    max_new_tokens=max_tokens if max_tokens > 0 else 512,
+                    messages=messages,
+                    temperature=temperature,
+                    top_p=top_p,
+                )
+                words = response.split(" ")
+                for i, word in enumerate(words):
+                    token_queue.put(word if i == len(words) - 1 else word + " ")
+            finally:
+                generation_done.set()
+    else:
+        # ── ov_genai path: true per-token streaming ────────────────────
+        if Pipe is None or Loaded_model != model:
+            load_model(model, vlm=bool(image))
 
-    def generate_thread():
-        try:
-            if image:
-                img_array = _load_image_as_tensor(image)
-                Pipe.generate(prompt, image=img_array,
-                              generation_config=cfg, streamer=streamer_callback)
-            else:
-                Pipe.generate(prompt, cfg, streamer_callback)
-        finally:
-            generation_done.set()
+        prompt = _messages_to_prompt(messages)
+        cfg = _make_config(temperature, top_p, max_tokens, stop)
+
+        def streamer_callback(token_str: str) -> bool:
+            token_queue.put(token_str)
+            return False
+
+        def generate_thread():
+            try:
+                if image:
+                    img_array = _load_image_as_tensor(image)
+                    Pipe.generate(prompt, image=img_array,
+                                  generation_config=cfg, streamer=streamer_callback)
+                else:
+                    Pipe.generate(prompt, cfg, streamer_callback)
+            finally:
+                generation_done.set()
 
     threading.Thread(target=generate_thread, daemon=True).start()
 
@@ -339,6 +488,7 @@ def stream_chat_completion_with_tools(
     model: str = "openvino-model",
     temperature: float = 0.7,
     top_p: float = 0.95,
+    top_k: int = 0,
     max_tokens: int = 512,
     stop: Optional[List[str]] = None,
     image: Optional[str] = None,
@@ -347,16 +497,22 @@ def stream_chat_completion_with_tools(
 
     Args:
         image: Optional path to an image file (activates VLM inference).
+        top_k: Top-k sampling filter (0 = disabled).
     """
     global Pipe, Loaded_model
-    if Pipe is None or Loaded_model != model:
-        load_model(model, vlm=bool(image))
-
-    prompt = _format_messages_with_tools(messages, tools)
-    cfg = _make_config(temperature, top_p, max_tokens, stop)
 
     completion_id = f"chatcmpl-{int(time.time())}"
     created = int(time.time())
+
+    # Build prompt + config only for the ov_genai path
+    if StatefulPipe is None:
+        if Pipe is None or Loaded_model != model:
+            load_model(model, vlm=bool(image))
+        prompt = _format_messages_with_tools(messages, tools)
+        cfg = _make_config(temperature, top_p, max_tokens, stop)
+    else:
+        prompt = None  # unused in stateful path
+        cfg = None
 
     # ── Role chunk ────────────────────────────────────────────
     yield {
@@ -373,22 +529,44 @@ def stream_chat_completion_with_tools(
     token_queue: queue.Queue = queue.Queue()
     generation_done = threading.Event()
 
-    def streamer_callback(token_str: str) -> bool:
-        nonlocal accumulated_text
-        accumulated_text += token_str
-        token_queue.put(token_str)
-        return False
+    if StatefulPipe is not None:
+        # ── Stateful path: true per-token streaming via streamer callback ──
+        def generate_thread():
+            nonlocal accumulated_text
+            try:
+                pil_img  = _pil_image_from_path(image) if image else None
+                response = StatefulPipe.generate(
+                    prompt_text=messages[-1].get("content", "") if messages else "",
+                    image=pil_img,
+                    max_new_tokens=max_tokens if max_tokens > 0 else 512,
+                    messages=messages,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    tools=tools,
+                    streamer=token_queue.put,
+                )
+                accumulated_text = response
+            finally:
+                generation_done.set()
+    else:
+        # ── ov_genai path: true per-token streaming ────────────────────
+        def streamer_callback(token_str: str) -> bool:
+            nonlocal accumulated_text
+            accumulated_text += token_str
+            token_queue.put(token_str)
+            return False
 
-    def generate_thread():
-        try:
-            if image:
-                img_array = _load_image_as_tensor(image)
-                Pipe.generate(prompt, image=img_array,
-                              generation_config=cfg, streamer=streamer_callback)
-            else:
-                Pipe.generate(prompt, cfg, streamer_callback)
-        finally:
-            generation_done.set()
+        def generate_thread():
+            try:
+                if image:
+                    img_array = _load_image_as_tensor(image)
+                    Pipe.generate(prompt, image=img_array,
+                                  generation_config=cfg, streamer=streamer_callback)
+                else:
+                    Pipe.generate(prompt, cfg, streamer_callback)
+            finally:
+                generation_done.set()
 
     threading.Thread(target=generate_thread, daemon=True).start()
 
