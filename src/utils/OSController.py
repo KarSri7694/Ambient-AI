@@ -52,13 +52,14 @@ class OSController:
                 logging.info(f"SYSTEM LOG: Opening application '{app_name}' using custom alias.")
             except Exception as e:
                 logging.error(f"SYSTEM ERROR: Failed to open application '{app_name}' using custom alias. Error: {e}")
-                return
+                return 
         else:
             try:
-                AppOpener.open(app_name, match_closest=True)
+                AppOpener.open(app_name, match_closest=True, throw_error=True)
                 logging.info(f"SYSTEM LOG: Opening application '{app_name}'.")
             except Exception as e:
                 logging.error(f"SYSTEM ERROR: Failed to open application '{app_name}'. Error: {e}")
+                return "FAILURE: Could not open application. Application name may be incorrect."
                 
         start_time = time.time()
     
