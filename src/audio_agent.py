@@ -4,6 +4,7 @@ import time
 from pathlib import Path
 import os
 import torch
+import gc
 import torchaudio
 import logging
 from collections import defaultdict
@@ -22,9 +23,12 @@ project_root = current_dir.parent
 os.chdir(project_root)
 
 UPLOAD_DIR = "uploads/"
-cleaned_audio = "cleaned_audio/"
 VOICE_DB = "database/voice_database.db"
 TRANSCRIPTIONS_DIR = "transcriptions/"
+HIN2HINGLISH = "Hin2Hinglish-ct2/"
+CLEANED_AUDIO_DIR = "cleaned_audio/"
+
+
 
 HF_TOKEN = os.getenv("HF_TOKEN", None)
 MIN_TIME_THRESHOLD = 0.2 #seconds
@@ -38,40 +42,52 @@ class AudioAgent:
 
     def preprocess_audio(self, audio_file_path):
         self.preprocessor = AudioPreprocessor()
-        self.preprocessor.run(audio_file_path)
+        return self.preprocessor.run(audio_file_path)
     
     def transcribe_audio(self, audio_file_path: str, vad_filter: bool, word_timestamps: bool, batch_size: int = 8)-> list[TranscriptionResult]:
-        self.asr = WhisperAdapter(model_size="HIN2HINGLISH", device="cuda")
+        self.asr = WhisperAdapter(model_size=HIN2HINGLISH, device="cuda")
         segments = self.asr.transcribe_audio(audio_file_path, vad_filter, word_timestamps, batch_size)
-        self.asr.unload_model()
+        self.unload_model(self.asr)
         return segments
     
 
     def diarize_audio(self,audio_file_path: str) -> list[DiarizationResult]:
         self.diarization = PyannoteAdapter(HF_TOKEN)
         diarization_result = self.diarization.diarize_audio(audio_file_path)
-        self.asr.unload_model()
+        self.unload_model(self.diarization)
         return diarization_result
     
-    def connect_db(self):
-        db = SQLiteVoiceAdapter(VOICE_DB)
+    def connect_db(self, voice_database_path: str):
+        db = SQLiteVoiceAdapter(voice_database_path)
         return db
     
     def compare_embeddings(self, db, diarization_result: list[DiarizationResult]):
         self.encoder = EcapaVoxcelebAdapter(db)
         waveform, samplerate= torchaudio.load(diarization_result[0].audio_file)
         speaker_audio_tensor = defaultdict(list)
-        speaker_probabilities_list = []
         for i in diarization_result:
-            if (i.start_time-i.end_time > MIN_TIME_THRESHOLD):
-                sample_start = i.start_time * samplerate
-                sample_end = i.end_time * samplerate
-                cropped_tensor = waveform[:, sample_start:sample_end]
-                speaker_audio_tensor[i.speaker_label].append(cropped_tensor)
-                mapping = self.encoder.identify_speaker(cropped_tensor, threshold=0.3)
-                i.speaker_label = mapping.identified_label
+            segment_duration = i.end_time - i.start_time
+            if segment_duration <= MIN_TIME_THRESHOLD:
+                continue
 
-        self.encoder.unload_model()
+            sample_start = int(i.start_time * samplerate)
+            sample_end = int(i.end_time * samplerate)
+            if sample_end <= sample_start:
+                continue
+
+            cropped_tensor = waveform[:, sample_start:sample_end]
+            if cropped_tensor.shape[0] > 1:
+                cropped_tensor = cropped_tensor.mean(dim=0, keepdim=True)
+
+            speaker_audio_tensor[i.speaker_label].append(cropped_tensor)
+            mapping = self.encoder.identify_speaker(
+                cropped_tensor,
+                original_label=i.speaker_label,
+                threshold=0.3,
+            )
+            i.speaker_label = f"{mapping.identified_label}- [{mapping.score*100:.3f}]"
+
+        self.unload_model(self.encoder)
         return diarization_result
         
     def merge_transciptions_and_diarizations(self, transcription: list[TranscriptionResult], diarization_result: list[DiarizationResult]):
@@ -114,18 +130,31 @@ class AudioAgent:
         
         with open(os.path.join(TRANSCRIPTIONS_DIR, f"final_transcript_{str(file_counter)}.txt"), "w", encoding="utf-8") as f:
             for entry in final_transcript:
-                f.write(f"[{entry[0]:.4f} - {entry[1]:.4f}] -> {entry[2]}:{entry[3]}\n")
+                f.write(f"[{entry[0]:.4f} - {entry[1]:.4f}] -> {entry[2]}: {entry[3]}\n")
 
         logging.info(f"Final transcript for-{diarization_result[0].audio_file} saved to final_transcript_{str(file_counter)}.txt")
         file_counter += 1
     
+    def unload_model(self, model_object):
+        '''
+        Unloads the given model from memory
+        Args:
+            model_object: Model to be unloaded
+        '''
+        model_object = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+        
+        
     def run(self, audio_file: str):
+        db = self.connect_db(VOICE_DB)
         processed_file = self.preprocess_audio(audio_file)
         logging.info(f"Processed file: {processed_file}")
         diarization_result = self.diarize_audio(processed_file)
-        transcription_result = self.transcribe_audio(processed_file)
-        diarization_result = self.compare_embeddings(VOICE_DB, diarization_result)
-        self.merge_transciptions_and_diarizations(transcription=transcription_result, diarization_result=self.diarization)
+        transcription_result = self.transcribe_audio(processed_file, vad_filter=True, word_timestamps= True)
+        diarization_result = self.compare_embeddings(db, diarization_result)
+        self.merge_transciptions_and_diarizations(transcription=transcription_result, diarization_result=diarization_result)
         
 
 agent = AudioAgent()
@@ -134,9 +163,9 @@ class Handler(FileSystemEventHandler):
         if not event.is_directory:
             print("New file:", event.src_path)
             base_name= os.path.splitext(os.path.basename(event.src_path))[0]
-            file_path = os.path.join(cleaned_audio, f"{base_name}_final.wav")
+            file_path = os.path.join(CLEANED_AUDIO_DIR, f"{base_name}_final.wav")
             agent.run(file_path)
-            
+
 class AudioAgentService:
     def __init__(self):
         pass
@@ -155,5 +184,5 @@ class AudioAgentService:
         observer.join()
 
 if __name__ == "__main__":
-    service = AudioAgentService()
-    service.start_service()
+    agent_service = AudioAgentService()
+    agent_service.start_service()
