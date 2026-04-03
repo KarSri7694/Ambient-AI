@@ -160,6 +160,21 @@ def _format_notifications(notification_adapter: SQLiteNotificationAdapter) -> st
     return "\n".join(lines)
 
 
+def _extract_tool_steps(llm_service: LLMInteractionService) -> list[str]:
+    """Extract tool execution summaries from the latest interaction context."""
+    steps: list[str] = []
+    for message in llm_service.get_context():
+        if message.get("role") != "tool":
+            continue
+        tool_name = message.get("name", "tool")
+        tool_result = (message.get("content") or "").strip()
+        if tool_result:
+            steps.append(f"- {tool_name}: {tool_result}")
+        else:
+            steps.append(f"- {tool_name}: (no output)")
+    return steps
+
+
 async def _user_mode(
     llm_service: LLMInteractionService,
     llm_adapter: LlamaCppAdapter,
@@ -191,8 +206,12 @@ async def _agentic_control_mode(
         "You will be provided with a screenshot of the current screen for every turn. "
         "Use the screenshot to understand the state of the system and use tools to achieve the user's goal."
         "Explain your actions before making a tool call."
+        "For short deterministic UI sequences (2-4 steps) where the screen is expected to remain stable, prefer the tool_chain tool instead of separate tool calls. "
+        "Examples: click field -> type -> press enter, or move -> click -> type. "
         "Once clicked a text field do not click it again and again, assume it is selected and in next step start typing."
+        "ALWAYS ANALYSE THE SCREEN FIRST. Estimate the bounding boxes of buttons and text fields based on the screenshot and use the click tool with coordinates to interact with them. "
         "ALWAYS USE open_app tool open apps, DO NOT USE START BUTTON OR TASKBAR ICONS TO OPEN APPS. "
+        "If action is completed and you have no next steps, first verify the new screenshot that it is correct the task commanded is completed or running, say 'DONE: NO FURTHER ACTION REQUIRED' to end the interaction."
         
     )
     i=0
@@ -201,14 +220,23 @@ async def _agentic_control_mode(
         user_input = input("Target Goal (or 'exit' to quit)--> ")
         if user_input.lower() == "exit":
             break
-            
-        while i < 10:
+
+        i = 0
+        step_history: list[str] = []
+
+        while i < 20:
             if i==0:
-                logging.info("Waiting 10 seconds before first screenshot ...")
-                threading.Event().wait(10)  # Wait a moment before first screenshot to allow user to prepare
+                logging.info("Waiting 3 seconds before first screenshot ...")
+                threading.Event().wait(3)  # Wait a moment before first screenshot to allow user to prepare
             print("Capturing screen...")
             screenshot_path = screenshot_adapter.capture_screenshot()
             print(f"Screenshot captured: {screenshot_path}")
+
+            steps_text = "\n".join(step_history) if step_history else "No tool actions recorded yet."
+            objective_for_turn = (
+                f"Current Objective: {user_input}\n"
+                f"Steps taken so far:\n{steps_text}"
+            )
             
             # The agent will continue until it decides it's done or reached a limit.
             # Currently LLMInteractionService has its own MAX_ITERATIONS loop for tool calls.
@@ -219,22 +247,30 @@ async def _agentic_control_mode(
             
             # The user request said: "after every turn model will get new screenshot"
             # In run_interaction, a 'turn' usually refers to one LLM call + tool calls.
-            
+            llm_service.reset_conversation()
             assistant_response = await llm_service.run_interaction(
-                user_input=f"Current Objective: {user_input}",
+                user_input=objective_for_turn,
                 system_prompt=system_prompt,
                 model=model,
                 image_path=screenshot_path
             )
             
-            print(f"\nAgent: {assistant_response}")
             
             # If the agent says it's done, we break to the next goal
-            if "DONE" in assistant_response.upper() or "TASK COMPLETE" in assistant_response.upper():
+            if "DONE" in assistant_response.upper() and "NO FURTHER ACTION REQUIRED" in assistant_response.upper():
                 break
-            
+
+            latest_tool_steps = _extract_tool_steps(llm_service)
+            if latest_tool_steps:
+                step_history.extend(latest_tool_steps)
+
+            updated_steps_text = "\n".join(step_history) if step_history else "No tool actions recorded yet."
+            logging.info(
+                f"User_input for next iteration: {user_input}\n"
+                f"Steps taken so far:\n{updated_steps_text}"
+            )
             logger.info("Waiting before next screenshot...")
-            threading.Event().wait(5)
+            threading.Event().wait(2)
             # If we want it to be fully autonomous, we could just loop.
             # But let's ask the user if they want to continue or if it should auto-continue.
             i+=1
