@@ -1,6 +1,8 @@
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import time
+import threading
+import queue
 from pathlib import Path
 import os
 import torch
@@ -150,6 +152,8 @@ class AudioAgent:
     def run(self, audio_file: str):
         db = self.connect_db(VOICE_DB)
         processed_file = self.preprocess_audio(audio_file)
+        if not os.path.exists(processed_file):
+            raise FileNotFoundError(f"Processed audio not found: {processed_file}")
         logging.info(f"Processed file: {processed_file}")
         diarization_result = self.diarize_audio(processed_file)
         transcription_result = self.transcribe_audio(processed_file, vad_filter=True, word_timestamps= True)
@@ -159,20 +163,40 @@ class AudioAgent:
 
 agent = AudioAgent()
 class Handler(FileSystemEventHandler):
+    def __init__(self, processing_queue: queue.Queue):
+        super().__init__()
+        self.processing_queue = processing_queue
+
     def on_created(self, event):
-        if not event.is_directory:
-            print("New file:", event.src_path)
-            base_name= os.path.splitext(os.path.basename(event.src_path))[0]
-            file_path = os.path.join(CLEANED_AUDIO_DIR, f"{base_name}_final.wav")
-            agent.run(file_path)
+        if event.is_directory:
+            return
+
+        print("New file:", event.src_path)
+        self.processing_queue.put(event.src_path)
 
 class AudioAgentService:
     def __init__(self):
-        pass
+        self.processing_queue = queue.Queue()
+        self.worker_thread = threading.Thread(target=self._process_uploads, daemon=True)
+
+    def _process_uploads(self):
+        while True:
+            file_path = self.processing_queue.get()
+            if file_path is None:
+                self.processing_queue.task_done()
+                break
+
+            try:
+                agent.run(file_path)
+            except Exception:
+                logging.exception(f"Failed to process file: {file_path}")
+            finally:
+                self.processing_queue.task_done()
     
     def start_service(self):
         observer = Observer()
-        observer.schedule(Handler(), UPLOAD_DIR, recursive=False)
+        observer.schedule(Handler(self.processing_queue), UPLOAD_DIR, recursive=False)
+        self.worker_thread.start()
         observer.start()
 
         try:
@@ -180,8 +204,10 @@ class AudioAgentService:
                 time.sleep(1)
         except KeyboardInterrupt:
             observer.stop()
-
-        observer.join()
+        finally:
+            observer.join()
+            self.processing_queue.put(None)
+            self.worker_thread.join()
 
 if __name__ == "__main__":
     agent_service = AudioAgentService()
