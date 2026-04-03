@@ -45,7 +45,7 @@ class AudioPreprocessor:
     
     def run(self, input_file=None): 
         """
-        Runs the audio preprocessing pipeline for each file in the input queue.
+        Runs the audio preprocessing pipeline for the given audio file.
         """
         #loop through the audio queue and process each file
         base_name= os.path.splitext(os.path.basename(input_file))[0]
