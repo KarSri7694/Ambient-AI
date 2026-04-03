@@ -13,13 +13,13 @@ class EcapaVoxcelebAdapter(SpeakerIdentityPort):
         self.voice_repo = voice_repo
         self.classifier = EncoderClassifier.from_hparams(source=model_name_or_path, savedir="pretrained_models/spkrec-ecapa-voxceleb", run_opts={"device": "cuda" if torch.cuda.is_available() else "cpu"})
 
-    def identify_speaker(self, audio_tensor: torch.Tensor, original_label: str, threshold: float = 0.7) -> str:
+    def identify_speaker(self, audio_tensor: torch.Tensor, original_label: str, threshold: float = 0.7) -> SpeakerMapping:
         """
         Identify the speaker from the given audio metadata using ECAPA-TDNN model.
         Args:
             audio_metadata (SpeakerEmbedding): Audio metadata containing the embedding tensor.
         Returns:
-            SpeakerMapping: object containg identified label, original label and score
+            SpeakerMapping: object containing identified label, original label and score
         """
         # Perform speaker identification
         embedding = self.classifier.encode_batch(audio_tensor)
@@ -34,6 +34,9 @@ class EcapaVoxcelebAdapter(SpeakerIdentityPort):
             if score > highest_score:
                 highest_score = score
                 best_match = speaker_label
+            else:
+                highest_score = score
+                best_match = original_label
         return SpeakerMapping(
             original_label=original_label,
             identified_label=best_match,
