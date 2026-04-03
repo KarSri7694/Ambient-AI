@@ -45,7 +45,11 @@ class AudioPreprocessor:
     
     def run(self, input_file=None): 
         """
-        Runs the audio preprocessing pipeline for each file in the input queue.
+        Runs the audio preprocessing pipeline for the given audio file.
+        Args:
+            input_file (str): Path to the input audio file to be processed.
+        Returns:
+            str: Path to the final processed audio file.
         """
         #loop through the audio queue and process each file
         base_name= os.path.splitext(os.path.basename(input_file))[0]
@@ -74,7 +78,7 @@ class AudioPreprocessor:
         else:
             print(f"File does not exist: {input_file}")    
     
-        # return final_file # Return the last processed file path
+        return final_file # Return the last processed file path
         
     def convert_audio_to_wav(self,input_file, output_file):
         '''
