@@ -22,6 +22,9 @@ class MCPToolAdapter(ToolBridgePort):
     async def start_servers(self, config_path: str) -> None:
         self._exit_stack = AsyncExitStack()
 
+        if config_path == "":
+                self.logger.info("No MCP config path provided, skipping server startup.")
+                return
         with open(config_path, "r") as f:
             config = json.load(f)
 
