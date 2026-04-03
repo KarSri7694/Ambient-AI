@@ -17,9 +17,7 @@ DIARIZATION_MODEL = "pyannote/speaker-diarization-3.1"
 HF_TOKEN_FILE = "D:\\Projects\\ambient_ai\\HFToken.txt"
 
 class PyannoteAdapter(DiarizationPort):
-    def __init__(self, hf_token_file: str = HF_TOKEN_FILE):
-        with open(hf_token_file, 'r') as file:
-            hf_token = file.read().strip()
+    def __init__(self, hf_token: str):
         self.diarization_model = Pipeline.from_pretrained(DIARIZATION_MODEL, token=hf_token)
 
     def diarize_audio(self, audio_file_path: str) -> List[DiarizationResult]:
