@@ -14,7 +14,7 @@ class LLMInteractionService:
     it only depends on the LLMProvider and ToolBridgePort abstractions.
     """
 
-    MAX_ITERATIONS = 1
+    MAX_ITERATIONS = 10
 
     def __init__(self, llm_provider: LLMProvider, tool_bridge: ToolBridgePort):
         self.llm = llm_provider
@@ -52,7 +52,6 @@ class LLMInteractionService:
 
         Returns the final assistant text response.
         """
-        self._messages = []
         self._messages.append({"role": "system", "content": system_prompt})
         self._messages.append({"role": "user", "content": user_input})
 
@@ -88,7 +87,7 @@ class LLMInteractionService:
             await self._execute_tool_calls(tool_calls)
 
         self.logger.warning(
-            f"⚠️  Reached maximum iterations ({self.MAX_ITERATIONS}). Stopping."
+            f"Reached maximum iterations: ({self.MAX_ITERATIONS}). Stopping."
         )
         return assistant_text
 
@@ -140,8 +139,8 @@ class LLMInteractionService:
             tool_args_str = tool_call["function"]["arguments"]
             tool_id = tool_call["id"]
 
-            self.logger.info(f"🔧 Calling tool: {tool_name}")
-            self.logger.info(f"   Arguments: {tool_args_str}")
+            self.logger.info(f"Calling tool: {tool_name}")
+            self.logger.info(f"Arguments: {tool_args_str}")
 
             try:
                 tool_args = json.loads(tool_args_str) if tool_args_str else {}
