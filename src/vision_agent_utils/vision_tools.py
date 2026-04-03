@@ -70,6 +70,7 @@ def mouse_click(x: Annotated[int, "mouse position X coordinate"],
     '''
     x_new,y_new = convert_to_original_coordinates(x, y, RELATIVE_WIDTH, RELATIVE_HEIGHT, pyautogui.size().width, pyautogui.size().height)
     pyautogui.click(x_new, y_new)
+    logging.info(f"Clicked at ({x}, {y}) in area: {area_clicked}, original coordinates: ({x_new}, {y_new})")
     tree.add_step(f"Clicked at ({x}, {y}) in area: {area_clicked}")
     return f"Clicked at ({x}, {y}) in area: {area_clicked}"
     
