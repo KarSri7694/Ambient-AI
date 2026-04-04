@@ -30,17 +30,16 @@ TRANSCRIPTIONS_DIR = "transcriptions/"
 HIN2HINGLISH = "Hin2Hinglish-ct2/"
 CLEANED_AUDIO_DIR = "cleaned_audio/"
 
-
-
 HF_TOKEN = os.getenv("HF_TOKEN", None)
 MIN_TIME_THRESHOLD = 0.2 #seconds
 file_counter = 1
 class AudioAgent:
-    def __init__(self):
+    def __init__(self, transcription_queue: queue.Queue):
         self.preprocessor = None
         self.asr = None
         self.diarization = None
         self.encoder = None
+        self.transcription_queue = transcription_queue
 
     def preprocess_audio(self, audio_file_path):
         self.preprocessor = AudioPreprocessor()
@@ -87,7 +86,7 @@ class AudioAgent:
                 original_label=i.speaker_label,
                 threshold=0.3,
             )
-            i.speaker_label = f"{mapping.identified_label}- [{mapping.score*100:.3f}]"
+            i.speaker_label = f"{mapping.identified_label}- [{mapping.score*100:.3f}%]"
 
         self.unload_model(self.encoder)
         return diarization_result
@@ -130,11 +129,13 @@ class AudioAgent:
             logging.warning("No words matched diarization turns; transcript not written.")
             return
         
-        with open(os.path.join(TRANSCRIPTIONS_DIR, f"final_transcript_{str(file_counter)}.txt"), "w", encoding="utf-8") as f:
+        transcript_path = os.path.join(TRANSCRIPTIONS_DIR, f"final_transcript_{str(file_counter)}.txt")
+        with open(transcript_path, "w", encoding="utf-8") as f:
             for entry in final_transcript:
                 f.write(f"[{entry[0]:.4f} - {entry[1]:.4f}] -> {entry[2]}: {entry[3]}\n")
 
         logging.info(f"Final transcript for-{diarization_result[0].audio_file} saved to final_transcript_{str(file_counter)}.txt")
+        self.transcription_queue.put(transcript_path)
         file_counter += 1
     
     def unload_model(self, model_object):
@@ -160,8 +161,6 @@ class AudioAgent:
         diarization_result = self.compare_embeddings(db, diarization_result)
         self.merge_transciptions_and_diarizations(transcription=transcription_result, diarization_result=diarization_result)
         
-
-agent = AudioAgent()
 class Handler(FileSystemEventHandler):
     def __init__(self, processing_queue: queue.Queue):
         super().__init__()
@@ -175,10 +174,17 @@ class Handler(FileSystemEventHandler):
         self.processing_queue.put(event.src_path)
 
 class AudioAgentService:
-    def __init__(self):
+    def __init__(self, upload_dir: str = UPLOAD_DIR, voice_db: str = VOICE_DB):
+        self.upload_dir = upload_dir
+        self.voice_db = voice_db
+        self.transcription_queue = queue.Queue()
+        self.audio_agent = AudioAgent(transcription_queue=self.transcription_queue)
         self.processing_queue = queue.Queue()
         self.worker_thread = threading.Thread(target=self._process_uploads, daemon=True)
 
+    def get_transcription_queue(self) -> queue.Queue:
+        return self.transcription_queue
+    
     def _process_uploads(self):
         while True:
             file_path = self.processing_queue.get()
@@ -187,7 +193,7 @@ class AudioAgentService:
                 break
 
             try:
-                agent.run(file_path)
+                self.audio_agent.run(file_path)
             except Exception:
                 logging.exception(f"Failed to process file: {file_path}")
             finally:
