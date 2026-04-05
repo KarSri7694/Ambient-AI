@@ -48,14 +48,14 @@ class AudioAgent:
     def transcribe_audio(self, audio_file_path: str, vad_filter: bool, word_timestamps: bool, batch_size: int = 8)-> list[TranscriptionResult]:
         self.asr = WhisperAdapter(model_size=HIN2HINGLISH, device="cuda")
         segments = self.asr.transcribe_audio(audio_file_path, vad_filter, word_timestamps, batch_size)
-        self.unload_model(self.asr)
+        self.unload_model("asr")
         return segments
     
 
     def diarize_audio(self,audio_file_path: str) -> list[DiarizationResult]:
         self.diarization = PyannoteAdapter(HF_TOKEN)
         diarization_result = self.diarization.diarize_audio(audio_file_path)
-        self.unload_model(self.diarization)
+        self.unload_model("diarization")
         return diarization_result
     
     def connect_db(self, voice_database_path: str):
@@ -88,7 +88,7 @@ class AudioAgent:
             )
             i.speaker_label = f"{mapping.identified_label}- [{mapping.score*100:.3f}%]"
 
-        self.unload_model(self.encoder)
+        self.unload_model("encoder")
         return diarization_result
         
     def merge_transciptions_and_diarizations(self, transcription: list[TranscriptionResult], diarization_result: list[DiarizationResult]):
@@ -138,13 +138,13 @@ class AudioAgent:
         self.transcription_queue.put(transcript_path)
         file_counter += 1
     
-    def unload_model(self, model_object):
+    def unload_model(self, attr_name: str):
         '''
         Unloads the given model from memory
         Args:
             model_object: Model to be unloaded
         '''
-        model_object = None
+        setattr(self, attr_name, None)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
@@ -197,20 +197,25 @@ class AudioAgentService:
         idle_elapsed = 0
         CHECK_INTERVAL = 5
         self.audio_active_event.set()
+        self.llm_active_event.clear()
         logging.info("Audio pipeline is active")
         while True:
             if self.llm_active_event.is_set():
                 if self.audio_active_event.is_set():
                     self.audio_active_event.clear()
                     logging.info("LLM pipeline active, audio pipeline waiting...")
+                idle_elapsed = 0
                 while self.llm_active_event.is_set():
                     time.sleep(CHECK_INTERVAL)
+                idle_elapsed = 0
+                continue
 
             try:
                 file_path = self.processing_queue.get(timeout=CHECK_INTERVAL)
+                idle_elapsed = 0
             except queue.Empty:
-                idle_elapsed += CHECK_INTERVAL
                 if self.audio_active_event.is_set():
+                    idle_elapsed += CHECK_INTERVAL
                     logging.warning(
                         f"No files received. "
                         f"Idle for {idle_elapsed}s / {IDLE_TIMEOUT}s before audio agent shutdown."
@@ -219,6 +224,8 @@ class AudioAgentService:
                         logging.info(f"Audio pipeline idle for {IDLE_TIMEOUT}s. Shutting down audio agent.")
                         idle_elapsed = 0
                         self.audio_active_event.clear()
+                else:
+                    idle_elapsed = 0
                 continue
 
             if file_path is None:
@@ -228,6 +235,7 @@ class AudioAgentService:
             if not self.audio_active_event.is_set():
                 self.audio_active_event.set()
                 logging.info("Audio Pipeline is active, Ambient Agent will Wait")
+            idle_elapsed = 0
 
             try:
                 with self.gpu_lock:
