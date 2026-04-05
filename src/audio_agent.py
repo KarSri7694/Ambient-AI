@@ -170,41 +170,82 @@ class Handler(FileSystemEventHandler):
         if event.is_directory:
             return
 
-        print("New file:", event.src_path)
+        logging.info(f"New file: {event.src_path}")
         self.processing_queue.put(event.src_path)
 
 class AudioAgentService:
-    def __init__(self, upload_dir: str = UPLOAD_DIR, voice_db: str = VOICE_DB):
+    def __init__(self, upload_dir: str = UPLOAD_DIR, voice_db: str = VOICE_DB, gpu_lock: threading.Lock = None, audio_active_event: threading.Event = None, llm_active_event: threading.Event= None):
         self.upload_dir = upload_dir
         self.voice_db = voice_db
         self.transcription_queue = queue.Queue()
-        self.audio_agent = AudioAgent(transcription_queue=self.transcription_queue)
+        self.gpu_lock = gpu_lock or threading.Lock()
+        self.audio_active_event = audio_active_event or threading.Event()
+        self.llm_active_event = llm_active_event or threading.Event()
+        self.audio_agent = AudioAgent(
+            transcription_queue=self.transcription_queue
+            )
         self.processing_queue = queue.Queue()
         self.worker_thread = threading.Thread(target=self._process_uploads, daemon=True)
-
+    def get_audio_active_event(self) -> threading.Event:
+        return self.audio_active_event
+    
     def get_transcription_queue(self) -> queue.Queue:
         return self.transcription_queue
     
     def _process_uploads(self):
+        IDLE_TIMEOUT = 20
+        idle_elapsed = 0
+        CHECK_INTERVAL = 5
+        self.audio_active_event.set()
+        logging.info("Audio pipeline is active")
         while True:
-            file_path = self.processing_queue.get()
+            if self.llm_active_event.is_set():
+                if self.audio_active_event.is_set():
+                    self.audio_active_event.clear()
+                    logging.info("LLM pipeline active, audio pipeline waiting...")
+                while self.llm_active_event.is_set():
+                    time.sleep(CHECK_INTERVAL)
+
+            try:
+                file_path = self.processing_queue.get(timeout=CHECK_INTERVAL)
+            except queue.Empty:
+                idle_elapsed += CHECK_INTERVAL
+                if self.audio_active_event.is_set():
+                    logging.warning(
+                        f"No files received. "
+                        f"Idle for {idle_elapsed}s / {IDLE_TIMEOUT}s before audio agent shutdown."
+                    )
+                    if idle_elapsed >= IDLE_TIMEOUT:
+                        logging.info(f"Audio pipeline idle for {IDLE_TIMEOUT}s. Shutting down audio agent.")
+                        idle_elapsed = 0
+                        self.audio_active_event.clear()
+                continue
+
             if file_path is None:
                 self.processing_queue.task_done()
                 break
 
+            if not self.audio_active_event.is_set():
+                self.audio_active_event.set()
+                logging.info("Audio Pipeline is active, Ambient Agent will Wait")
+
             try:
-                self.audio_agent.run(file_path)
+                with self.gpu_lock:
+                    self.audio_agent.run(file_path)
+            except KeyboardInterrupt:
+                logging.info("Terminating")
             except Exception:
                 logging.exception(f"Failed to process file: {file_path}")
             finally:
                 self.processing_queue.task_done()
+        self.audio_active_event.clear()
     
     def start_service(self):
         observer = Observer()
         observer.schedule(Handler(self.processing_queue), UPLOAD_DIR, recursive=False)
         self.worker_thread.start()
         observer.start()
-
+        
         try:
             while True:
                 time.sleep(1)
