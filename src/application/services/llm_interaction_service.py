@@ -61,14 +61,14 @@ class LLMInteractionService:
             iteration += 1
             self.logger.info(f"--- Iteration {iteration} ---")
 
-            completion = self.llm.chat_completion_stream(
+            completion = await self.llm.chat_completion_stream(
                 model=model,
                 messages=self._messages,
                 tools=self._tools,
                 image=image_path if iteration == 1 else "",
             )
 
-            assistant_text, tool_calls = self._consume_stream(completion)
+            assistant_text, tool_calls = await self._consume_stream(completion)
 
             # If NO tool calls were made, the model is done
             if not tool_calls:
@@ -91,7 +91,7 @@ class LLMInteractionService:
         )
         return assistant_text
 
-    def _consume_stream(self, completion) -> tuple[str, List[Dict]]:
+    async def _consume_stream(self, completion) -> tuple[str, List[Dict]]:
         """
         Consume a streaming completion iterator.
         Returns (assistant_text, tool_calls_list).
@@ -99,7 +99,7 @@ class LLMInteractionService:
         assistant_text = ""
         tool_calls: List[Dict] = []
 
-        for chunk in completion:
+        async for chunk in completion:
             delta = chunk.choices[0].delta
 
             # Standard content (the final answer text)

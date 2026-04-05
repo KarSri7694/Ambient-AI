@@ -14,7 +14,7 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         self.logger = logging.getLogger(self.__class__.__name__)
         self.base_url = base_url
         self.api_uri_v1 = f"{base_url}/v1"
-        self.client = openai.OpenAI(
+        self.client = openai.AsyncOpenAI(
             base_url=self.api_uri_v1,
             api_key="testkey"
         )
@@ -62,7 +62,7 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         )
         return completion.choices[0].message.content or ""
 
-    def chat_completion_stream(
+    async def chat_completion_stream(
         self,
         model: str,
         messages: List[Dict[str, Any]],
@@ -107,4 +107,4 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         if tools:
             kwargs["tools"] = tools
 
-        return self.client.chat.completions.create(**kwargs)
+        return await self.client.chat.completions.create(**kwargs)
