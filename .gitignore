@@ -2,13 +2,11 @@
 **__pycache__**
 /uploads
 /transcriptions
-audio_queue.txt
 *.wav
 *.opus
 *.m4a
 *.mp3
 /pretrained_models
-HFToken.txt
 voice_database.db
 /model_cache
 token.pickle
@@ -26,3 +24,4 @@ GUI_mcp.json
 /models
 app_data.json
 /documentation
+DEVLOG.md
