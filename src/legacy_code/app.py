@@ -118,7 +118,7 @@ async def run_app() -> None:
                 await _user_mode(llm_service, llm_adapter, notifications_str)
 
             elif mode == "2":
-                await _transcription_mode(llm_service, llm_adapter, notifications_str)
+                await _transcription_mode(llm_service, llm_adapter)
 
             elif mode == "3":
                 await night_service.run_night_loop()
@@ -278,7 +278,6 @@ async def _agentic_control_mode(
 async def _transcription_mode(
     llm_service: LLMInteractionService,
     llm_adapter: LlamaCppAdapter,
-    notifications_str: str,
 ) -> None:
     """Process transcription files through the LLM."""
     model = llm_adapter.get_current_model()
