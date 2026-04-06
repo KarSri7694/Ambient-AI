@@ -17,6 +17,10 @@ from infrastructure.adapter.ecapaVoxcelebAdapter import EcapaVoxcelebAdapter
 from infrastructure.adapter.SQLiteVoiceAdapter import SQLiteVoiceAdapter
 from core.models import DiarizationResult, TranscriptionResult
 
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True  # helps cuDNN find kernels
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -47,16 +51,18 @@ class AudioAgent:
     
     def transcribe_audio(self, audio_file_path: str, vad_filter: bool, word_timestamps: bool, batch_size: int = 8)-> list[TranscriptionResult]:
         self.asr = WhisperAdapter(model_size=HIN2HINGLISH, device="cuda")
-        segments = self.asr.transcribe_audio(audio_file_path, vad_filter, word_timestamps, batch_size)
-        self.unload_model("asr")
-        return segments
+        try:
+            return self.asr.transcribe_audio(audio_file_path, vad_filter, word_timestamps, batch_size)
+        finally:
+            self.unload_model("asr")
     
 
     def diarize_audio(self,audio_file_path: str) -> list[DiarizationResult]:
         self.diarization = PyannoteAdapter(HF_TOKEN)
-        diarization_result = self.diarization.diarize_audio(audio_file_path)
-        self.unload_model("diarization")
-        return diarization_result
+        try:
+            return self.diarization.diarize_audio(audio_file_path)
+        finally:
+            self.unload_model("diarization")
     
     def connect_db(self, voice_database_path: str):
         db = SQLiteVoiceAdapter(voice_database_path)
@@ -64,32 +70,44 @@ class AudioAgent:
     
     def compare_embeddings(self, db, diarization_result: list[DiarizationResult]):
         self.encoder = EcapaVoxcelebAdapter(db)
-        waveform, samplerate= torchaudio.load(diarization_result[0].audio_file)
-        speaker_audio_tensor = defaultdict(list)
-        for i in diarization_result:
-            segment_duration = i.end_time - i.start_time
-            if segment_duration <= MIN_TIME_THRESHOLD:
-                continue
+        try:
+            waveform, samplerate= torchaudio.load(diarization_result[0].audio_file)
+            speaker_audio_tensor = defaultdict(list)
+            for i in diarization_result:
+                segment_duration = i.end_time - i.start_time
+                if segment_duration <= MIN_TIME_THRESHOLD:
+                    continue
 
-            sample_start = int(i.start_time * samplerate)
-            sample_end = int(i.end_time * samplerate)
-            if sample_end <= sample_start:
-                continue
+                sample_start = int(i.start_time * samplerate)
+                sample_end = int(i.end_time * samplerate)
+                if sample_end <= sample_start:
+                    continue
 
-            cropped_tensor = waveform[:, sample_start:sample_end]
-            if cropped_tensor.shape[0] > 1:
-                cropped_tensor = cropped_tensor.mean(dim=0, keepdim=True)
+                cropped_tensor = waveform[:, sample_start:sample_end]
+                if cropped_tensor.shape[0] > 1:
+                    cropped_tensor = cropped_tensor.mean(dim=0, keepdim=True)
 
-            speaker_audio_tensor[i.speaker_label].append(cropped_tensor)
-            mapping = self.encoder.identify_speaker(
-                cropped_tensor,
-                original_label=i.speaker_label,
-                threshold=0.3,
-            )
-            i.speaker_label = f"{mapping.identified_label}- [{mapping.score*100:.3f}%]"
+                speaker_audio_tensor[i.speaker_label].append(cropped_tensor)
+                mapping = self.encoder.identify_speaker(
+                    cropped_tensor,
+                    original_label=i.speaker_label,
+                    threshold=0.3,
+                )
+                i.speaker_label = f"{mapping.identified_label}- [{mapping.score*100:.3f}%]"
 
-        self.unload_model("encoder")
-        return diarization_result
+            return diarization_result
+        finally:
+            self.unload_model("encoder")
+
+    def release_all_models(self):
+        """Best-effort cleanup for all model handles after each file."""
+        self.preprocessor = None
+        self.asr = None
+        self.diarization = None
+        self.encoder = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
         
     def merge_transciptions_and_diarizations(self, transcription: list[TranscriptionResult], diarization_result: list[DiarizationResult]):
         global file_counter
@@ -245,6 +263,7 @@ class AudioAgentService:
             except Exception:
                 logging.exception(f"Failed to process file: {file_path}")
             finally:
+                self.audio_agent.release_all_models()
                 self.processing_queue.task_done()
         self.audio_active_event.clear()
     
