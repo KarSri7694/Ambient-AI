@@ -19,7 +19,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 API_BASE_URL = "http://localhost:8080"
-DEFAULT_MODEL = "Qwen-3.5-4B-Q6_K-Opus-Distilled-v3"
+DEFAULT_MODEL = "Qwen-4b-Thinking-2507-Q4_K_M"
 MCP_CONFIG_PATH = "mcp.json"
 USERNAME = ""
 
@@ -56,8 +56,6 @@ class TranscriptionService:
 
     async def _process_one(
         self,
-        llm_adapter: LlamaCppAdapter,
-        tool_bridge: MCPToolAdapter,
         llm_service: LLMInteractionService,
         content: str,
     ):
@@ -148,7 +146,10 @@ class TranscriptionService:
                     # It will block this thread (not the event loop coroutine) until
                     # the audio pipeline releases the lock.
                     with self.gpu_lock:
-                        await self._process_one(llm_adapter, tool_bridge, llm_service, content)
+                        await self._process_one(
+                            llm_service=llm_service, 
+                            content=content
+                            )
                         await llm_adapter.unload_model()
                         await tool_bridge.cleanup()
                 except KeyboardInterrupt:
