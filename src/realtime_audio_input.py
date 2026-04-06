@@ -283,8 +283,8 @@ class RealTimeAudioInput:
 
 def main():
     """Instantiate RealTimeAudioInput and start live audio recording."""
-    audio_input = RealTimeAudioInput()
-    audio_input._get_mic_info()
+    audio_input = RealTimeAudioInput(min_silence_duration_ms=5000)
+    audio_input.start_recording()
 
 
 if __name__ == "__main__":
