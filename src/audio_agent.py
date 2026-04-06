@@ -157,7 +157,7 @@ class AudioAgent:
             raise FileNotFoundError(f"Processed audio not found: {processed_file}")
         logging.info(f"Processed file: {processed_file}")
         diarization_result = self.diarize_audio(processed_file)
-        transcription_result = self.transcribe_audio(processed_file, vad_filter=True, word_timestamps= True)
+        transcription_result = self.transcribe_audio(processed_file, vad_filter=False, word_timestamps= True)
         diarization_result = self.compare_embeddings(db, diarization_result)
         self.merge_transciptions_and_diarizations(transcription=transcription_result, diarization_result=diarization_result)
         
