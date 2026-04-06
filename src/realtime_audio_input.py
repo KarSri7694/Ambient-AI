@@ -8,6 +8,7 @@ import silero_vad
 from silero_vad import VADIterator
 import numpy as np
 import torch
+from collections import deque
 
 model = silero_vad.load_silero_vad()
 vad = VADIterator(
@@ -29,7 +30,8 @@ frames = []
 confidence_list = []
 PRE_ROLL_MS = 400
 NUM_PREVIOUS_SAMPLES = int(SAMPLE_RATE * PRE_ROLL_MS / 1000)
-previous_frame = None
+PRE_ROLL_CHUNKS = (NUM_PREVIOUS_SAMPLES + CHUNK - 1) // CHUNK
+pre_roll_buffer = deque(maxlen=PRE_ROLL_CHUNKS)
 voice_started = False
 
 
@@ -44,7 +46,7 @@ def int2float(sound):
 def callback(in_data: bytes, frame_count, time_info, status_flags):
     # Only append data. Keep this function extremely fast.
     # print(type(in_data))
-    global previous_frame, voice_started
+    global voice_started
     audio_int16 = np.frombuffer(in_data, np.int16)
     audio_float32 = int2float(sound=audio_int16)
     confidence = vad.__call__(torch.from_numpy(audio_float32))
@@ -58,16 +60,18 @@ def callback(in_data: bytes, frame_count, time_info, status_flags):
             if confidence.get('start'):
                 voice_started = True
                 # Add pre-roll audio before start was detected by VAD.
-                starting_frame_in_chunk = confidence.get('start')%CHUNK
-                if starting_frame_in_chunk < NUM_PREVIOUS_SAMPLES:
-                    chunks_from_previous_frame = NUM_PREVIOUS_SAMPLES - starting_frame_in_chunk
-                    if previous_frame is not None:
-                        frames.append(previous_frame[chunks_from_previous_frame*2:len(previous_frame)])
-                    else:
-                        frames.append(in_data[:starting_frame_in_chunk*2])
-                    frames.append(in_data[:starting_frame_in_chunk*2])
-                else:
-                    frames.append(in_data[(starting_frame_in_chunk-NUM_PREVIOUS_SAMPLES)*2:starting_frame_in_chunk*2])
+                starting_frame_in_chunk = confidence.get('start') % CHUNK
+                samples_needed_from_history = max(0, NUM_PREVIOUS_SAMPLES - starting_frame_in_chunk)
+                bytes_needed_from_history = samples_needed_from_history * 2
+
+                if bytes_needed_from_history > 0 and pre_roll_buffer:
+                    history_bytes = b''.join(pre_roll_buffer)
+                    history_slice_size = min(bytes_needed_from_history, len(history_bytes))
+                    if history_slice_size > 0:
+                        frames.append(history_bytes[-history_slice_size:])
+
+                if starting_frame_in_chunk > 0:
+                    frames.append(in_data[:starting_frame_in_chunk * 2])
                 #add live audio
                 #continue adding until 'end' is not encountered
                 return (None, pyaudio.paContinue)
@@ -77,7 +81,10 @@ def callback(in_data: bytes, frame_count, time_info, status_flags):
                 return (None,pyaudio.paComplete)
     except KeyError:
         pass
-    previous_frame= in_data
+
+    if not voice_started:
+        pre_roll_buffer.append(in_data)
+
     return (None, pyaudio.paContinue)
 
 # Open stream
@@ -113,6 +120,7 @@ while True:
 
         print(f"Saved to {FILENAME}")
         frames = []
+        pre_roll_buffer.clear()
         vad.reset_states()
     except KeyboardInterrupt:
         print("Interrupt received, terminating")
