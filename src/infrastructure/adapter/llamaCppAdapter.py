@@ -35,6 +35,9 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         if response.status_code == 200:
             self.logger.info(f"Successfully loaded model: {model_name}")
             self.currently_loaded_model = model_name
+        elif response.status_code == 400 and "model is already running" in response.text.lower():
+            self.logger.info(f"Specified model: {model_name} is already running.")
+            self.currently_loaded_model = model_name
         else:
             self.logger.error(f"Failed to load model: {model_name}. Response: {response.text}")
 
