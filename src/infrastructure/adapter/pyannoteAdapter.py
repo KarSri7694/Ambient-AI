@@ -19,6 +19,18 @@ HF_TOKEN_FILE = "D:\\Projects\\ambient_ai\\HFToken.txt"
 class PyannoteAdapter(DiarizationPort):
     def __init__(self, hf_token: str):
         self.diarization_model = Pipeline.from_pretrained(DIARIZATION_MODEL, token=hf_token)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        try:
+            self.diarization_model.to(self.device)
+        except RuntimeError as exc:
+            # Recover from low-VRAM startup by running diarization on CPU.
+            if self.device.type == "cuda" and "out of memory" in str(exc).lower():
+                logging.warning("CUDA OOM while loading diarization model. Falling back to CPU.")
+                torch.cuda.empty_cache()
+                self.device = torch.device("cpu")
+                self.diarization_model.to(self.device)
+            else:
+                raise
 
     def diarize_audio(self, audio_file_path: str) -> List[DiarizationResult]:
         # Convert to absolute path to avoid working directory issues
@@ -36,8 +48,19 @@ class PyannoteAdapter(DiarizationPort):
             "sample_rate": sample_rate
         }
         
-        self.diarization_model.to(torch.device("cuda"))
-        diarized_segments = self.diarization_model(audio_data)
+        try:
+            diarized_segments = self.diarization_model(audio_data)
+        except RuntimeError as exc:
+            error_text = str(exc).lower()
+            recoverable_cuda_error = "out of memory" in error_text or "unable to find an engine" in error_text
+            if self.device.type == "cuda" and recoverable_cuda_error:
+                logging.warning("Diarization failed on CUDA (%s). Retrying on CPU.", exc)
+                torch.cuda.empty_cache()
+                self.device = torch.device("cpu")
+                self.diarization_model.to(self.device)
+                diarized_segments = self.diarization_model(audio_data)
+            else:
+                raise
         diarization_result = []
         for segment, _, speaker in diarized_segments.speaker_diarization.itertracks(yield_label=True):
             diarization_result.append(
