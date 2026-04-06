@@ -153,7 +153,7 @@ class RealTimeAudioInput:
 
             usable_count += 1
             logger.info(
-                "Usable mic %s: %s (channels=%s, default_rate=%s)",
+                "Usable mic: device_index=%s, name=%s, channels=%s, default_rate=%s",
                 i,
                 info.get("name", "Unknown"),
                 max_input_channels,
