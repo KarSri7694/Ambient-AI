@@ -32,22 +32,7 @@ class PyannoteAdapter(DiarizationPort):
             else:
                 raise
 
-    def diarize_audio(self, audio_file_path: str) -> List[DiarizationResult]:
-        # Convert to absolute path to avoid working directory issues
-        audio_path = Path(audio_file_path)
-        if not audio_path.is_absolute():
-            audio_path = project_root / audio_file_path
-        
-        if not audio_path.exists():
-            raise FileNotFoundError(f"Audio file not found: {audio_path}")
-        
-        waveform, sample_rate = torchaudio.load(str(audio_path))
-        
-        audio_data = {
-            "waveform": waveform,
-            "sample_rate": sample_rate
-        }
-        
+    def _diarize_audio_data(self, audio_data: dict, audio_label: str, sample_rate: int) -> List[DiarizationResult]:
         try:
             diarized_segments = self.diarization_model(audio_data)
         except RuntimeError as exc:
@@ -61,19 +46,41 @@ class PyannoteAdapter(DiarizationPort):
                 diarized_segments = self.diarization_model(audio_data)
             else:
                 raise
-        diarization_result = []
+        diarization_result: List[DiarizationResult] = []
         for segment, _, speaker in diarized_segments.speaker_diarization.itertracks(yield_label=True):
             diarization_result.append(
                 DiarizationResult(
                     start_time=segment.start,
                     end_time=segment.end,
                     speaker_label=speaker,
-                    audio_file=audio_file_path,
+                    audio_file=audio_label,
                     sample_rate=sample_rate,
                 )
             )
-            
         return diarization_result
+
+    def diarize_audio(self, audio_file_path: str) -> List[DiarizationResult]:
+        # Convert to absolute path to avoid working directory issues
+        audio_path = Path(audio_file_path)
+        if not audio_path.is_absolute():
+            audio_path = project_root / audio_file_path
+        
+        if not audio_path.exists():
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+        
+        waveform, sample_rate = torchaudio.load(str(audio_path))
+        audio_data = {
+            "waveform": waveform,
+            "sample_rate": sample_rate
+        }
+        return self._diarize_audio_data(audio_data, audio_file_path, sample_rate)
+    
+    def diarize_waveform(self, waveform: torch.Tensor, sample_rate: int, audio_label: str = "in_memory_audio") -> List[DiarizationResult]:
+        audio_data = {
+            "waveform": waveform,
+            "sample_rate": sample_rate,
+        }
+        return self._diarize_audio_data(audio_data, audio_label, sample_rate)
     
     def unload_model(self):
         """

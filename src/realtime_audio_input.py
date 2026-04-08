@@ -29,6 +29,8 @@ class RealTimeAudioInput:
         threshold: float = 0.7,
         min_silence_duration_ms: int = 2000,
         input_device_index: int | None = None,
+        audio_agent_service: Any | None = None,
+        save_to_file: bool = True,
     ):
         """Initialize audio, VAD, and buffering state for real-time capture.
 
@@ -41,6 +43,8 @@ class RealTimeAudioInput:
             threshold: VAD confidence threshold used to detect speech.
             min_silence_duration_ms: Silence duration needed to mark speech end.
             input_device_index: Optional explicit PyAudio input device index.
+            audio_agent_service: Optional audio agent service for direct in-memory handoff.
+            save_to_file: Whether to persist captured audio segments as WAV files.
         """
         self.sample_rate = sample_rate
         self.channels = channels
@@ -49,6 +53,8 @@ class RealTimeAudioInput:
         self.uploads_dir = uploads_dir
         self.threshold = threshold
         self.min_silence_duration_ms = min_silence_duration_ms
+        self.audio_agent_service = audio_agent_service
+        self.save_to_file = save_to_file
 
         self.num_previous_samples = int(self.sample_rate * pre_roll_ms / 1000)
         pre_roll_chunks = (self.num_previous_samples + self.chunk - 1) // self.chunk
@@ -105,6 +111,29 @@ class RealTimeAudioInput:
             self.uploads_dir,
             f"audio_record_{datetime.now().strftime('%d%m%Y_%H%M%S')}_{uuid.uuid4()}.wav",
         )
+    
+    def set_audio_agent_service(self, audio_agent_service: Any):
+        """Attach an AudioAgentService-compatible object for direct raw-audio handoff."""
+        self.audio_agent_service = audio_agent_service
+    
+    def get_segment_audio_bytes(self) -> bytes:
+        """Return the current in-memory segment as raw PCM16 bytes."""
+        return b"".join(self.frames)
+    
+    def transfer_segment_to_audio_agent(self, skip_preprocessing: bool = True) -> bool:
+        """Send current in-memory segment directly to audio agent without writing a file first."""
+        if self.audio_agent_service is None or not hasattr(self.audio_agent_service, "enqueue_raw_audio"):
+            return False
+        audio_bytes = self.get_segment_audio_bytes()
+        if not audio_bytes:
+            return False
+        self.audio_agent_service.enqueue_raw_audio(
+            audio_bytes=audio_bytes,
+            sample_rate=self.sample_rate,
+            channels=self.channels,
+            skip_preprocessing=skip_preprocessing,
+        )
+        return True
 
     def _reset_segment_state(self):
         """Clear current segment buffers and reset VAD state for next capture."""
@@ -267,8 +296,13 @@ class RealTimeAudioInput:
                 stream.close()
                 logger.info("Recording finished, cleaning up")
 
-                self.save_recording(filename)
-                logger.info("Saved to %s", filename)
+                transferred = self.transfer_segment_to_audio_agent(skip_preprocessing=True)
+                if transferred:
+                    logger.info("Transferred audio segment directly to audio agent")
+
+                if self.save_to_file:
+                    self.save_recording(filename)
+                    logger.info("Saved to %s", filename)
 
                 self._reset_segment_state()
             except KeyboardInterrupt:
