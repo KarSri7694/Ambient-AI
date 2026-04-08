@@ -76,6 +76,13 @@ class PyannoteAdapter(DiarizationPort):
         return self._diarize_audio_data(audio_data, audio_file_path, sample_rate)
     
     def diarize_waveform(self, waveform: torch.Tensor, sample_rate: int, audio_label: str = "in_memory_audio") -> List[DiarizationResult]:
+        """
+        Run diarization directly on an in-memory waveform tensor.
+        Args:
+            waveform: Audio tensor shaped [channels, samples].
+            sample_rate: Sample rate of the waveform.
+            audio_label: Label recorded in DiarizationResult.audio_file.
+        """
         audio_data = {
             "waveform": waveform,
             "sample_rate": sample_rate,

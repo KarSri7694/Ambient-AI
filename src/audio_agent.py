@@ -39,6 +39,7 @@ CLEANED_AUDIO_DIR = "cleaned_audio/"
 
 HF_TOKEN = os.getenv("HF_TOKEN", None)
 MIN_TIME_THRESHOLD = 0.2 #seconds
+INT16_NORMALIZATION_FACTOR = 32768.0
 file_counter = 1
 class AudioAgent:
     def __init__(self, transcription_queue: queue.Queue):
@@ -183,7 +184,7 @@ class AudioAgent:
         diarization_result = self.compare_embeddings(db, diarization_result)
         self.merge_transciptions_and_diarizations(transcription=transcription_result, diarization_result=diarization_result)
     
-    def run_raw_audio(self, audio_bytes: bytes, sample_rate: int = 16000, channels: int = 1, skip_preprocessing: bool = True):
+    def run_raw_audio(self, audio_bytes: bytes, sample_rate: int = 16000, channels: int = 1, skip_preprocessing: bool = False):
         """Process signed 16-bit little-endian PCM bytes from memory.
 
         Args:
@@ -201,7 +202,7 @@ class AudioAgent:
         if audio_int16.size % channels != 0:
             raise ValueError("audio_bytes sample count is not divisible by channel count")
 
-        waveform = torch.from_numpy(audio_int16.astype(np.float32) / 32768.0)
+        waveform = torch.from_numpy(audio_int16.astype(np.float32) / INT16_NORMALIZATION_FACTOR)
         waveform = waveform.reshape(-1, channels).transpose(0, 1).contiguous()
 
         if channels > 1:
@@ -279,7 +280,7 @@ class AudioAgentService:
         """Queue a file path for the existing file-based audio pipeline."""
         self.processing_queue.put(file_path)
     
-    def enqueue_raw_audio(self, audio_bytes: bytes, sample_rate: int = 16000, channels: int = 1, skip_preprocessing: bool = True):
+    def enqueue_raw_audio(self, audio_bytes: bytes, sample_rate: int = 16000, channels: int = 1, skip_preprocessing: bool = False):
         """Queue signed 16-bit little-endian PCM bytes for in-memory processing.
 
         Args:
@@ -350,14 +351,14 @@ class AudioAgentService:
                             audio_bytes=item["audio_bytes"],
                             sample_rate=item.get("sample_rate", 16000),
                             channels=item.get("channels", 1),
-                            skip_preprocessing=item.get("skip_preprocessing", True),
+                            skip_preprocessing=item.get("skip_preprocessing", False),
                         )
                     else:
                         self.audio_agent.run(item)
             except KeyboardInterrupt:
                 logging.info("Terminating")
             except Exception:
-                item_desc = item.get("type", "file") if isinstance(item, dict) else os.path.basename(str(item))
+                item_desc = item.get("type", "unknown") if isinstance(item, dict) else os.path.basename(str(item))
                 logging.exception(f"Failed to process item: {item_desc}")
             finally:
                 self.audio_agent.release_all_models()
