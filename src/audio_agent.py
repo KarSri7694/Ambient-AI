@@ -5,6 +5,8 @@ import threading
 import queue
 from pathlib import Path
 import os
+import tempfile
+import wave
 import torch
 import gc
 import torchaudio
@@ -182,14 +184,20 @@ class AudioAgent:
         self.merge_transciptions_and_diarizations(transcription=transcription_result, diarization_result=diarization_result)
     
     def run_raw_audio(self, audio_bytes: bytes, sample_rate: int = 16000, channels: int = 1, skip_preprocessing: bool = True):
+        """Process signed 16-bit little-endian PCM bytes from memory.
+
+        Args:
+            audio_bytes: Raw PCM16 little-endian bytes.
+            sample_rate: Sample rate of the incoming audio.
+            channels: Channel count encoded in audio_bytes.
+            skip_preprocessing: Whether to bypass preprocessing for already-ready audio.
+        """
         if not audio_bytes:
             raise ValueError("audio_bytes cannot be empty")
         if channels <= 0:
-            raise ValueError("channels must be greater than 0")
+            raise ValueError(f"channels must be a positive integer, got {channels}")
 
         audio_int16 = np.frombuffer(audio_bytes, dtype=np.int16)
-        if audio_int16.size == 0:
-            raise ValueError("audio_bytes does not contain valid PCM samples")
         if audio_int16.size % channels != 0:
             raise ValueError("audio_bytes sample count is not divisible by channel count")
 
@@ -199,8 +207,8 @@ class AudioAgent:
         if channels > 1:
             waveform = waveform.mean(dim=0, keepdim=True)
 
-        db = self.connect_db(VOICE_DB)
         if skip_preprocessing:
+            db = self.connect_db(VOICE_DB)
             self.diarization = PyannoteAdapter(HF_TOKEN)
             try:
                 diarization_result = self.diarization.diarize_waveform(
@@ -222,7 +230,19 @@ class AudioAgent:
             )
             return
 
-        raise ValueError("Raw-audio processing currently requires skip_preprocessing=True")
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+                temp_path = temp_file.name
+            with wave.open(temp_path, "wb") as wf:
+                wf.setnchannels(channels)
+                wf.setsampwidth(2)
+                wf.setframerate(sample_rate)
+                wf.writeframes(audio_bytes)
+            self.run(temp_path, skip_preprocessing=False)
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.remove(temp_path)
         
 class Handler(FileSystemEventHandler):
     def __init__(self, processing_queue: queue.Queue):
@@ -256,9 +276,18 @@ class AudioAgentService:
         return self.transcription_queue
     
     def enqueue_audio_file(self, file_path: str):
+        """Queue a file path for the existing file-based audio pipeline."""
         self.processing_queue.put(file_path)
     
     def enqueue_raw_audio(self, audio_bytes: bytes, sample_rate: int = 16000, channels: int = 1, skip_preprocessing: bool = True):
+        """Queue signed 16-bit little-endian PCM bytes for in-memory processing.
+
+        Args:
+            audio_bytes: Raw PCM16 little-endian bytes.
+            sample_rate: Sample rate of incoming audio.
+            channels: Number of channels in audio_bytes.
+            skip_preprocessing: Whether audio preprocessing should be skipped.
+        """
         self.processing_queue.put(
             {
                 "type": "raw_audio",
@@ -328,7 +357,8 @@ class AudioAgentService:
             except KeyboardInterrupt:
                 logging.info("Terminating")
             except Exception:
-                logging.exception(f"Failed to process item: {item}")
+                item_desc = item.get("type", "file") if isinstance(item, dict) else os.path.basename(str(item))
+                logging.exception(f"Failed to process item: {item_desc}")
             finally:
                 self.audio_agent.release_all_models()
                 self.processing_queue.task_done()

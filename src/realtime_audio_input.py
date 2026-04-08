@@ -113,15 +113,29 @@ class RealTimeAudioInput:
         )
     
     def set_audio_agent_service(self, audio_agent_service: Any):
-        """Attach an AudioAgentService-compatible object for direct raw-audio handoff."""
+        """Attach an AudioAgentService-compatible object for direct raw-audio handoff.
+
+        Args:
+            audio_agent_service: Service object that exposes enqueue_raw_audio.
+
+        Notes:
+            Replaces any previously attached service and performs no runtime validation.
+        """
         self.audio_agent_service = audio_agent_service
     
     def get_segment_audio_bytes(self) -> bytes:
         """Return the current in-memory segment as raw PCM16 bytes."""
         return b"".join(self.frames)
     
-    def transfer_segment_to_audio_agent(self, skip_preprocessing: bool = True) -> bool:
-        """Send current in-memory segment directly to audio agent without writing a file first."""
+    def transfer_segment_to_audio_agent(self, skip_preprocessing: bool) -> bool:
+        """Send current in-memory segment directly to audio agent without writing a file first.
+
+        Args:
+            skip_preprocessing: When True, audio agent skips preprocessing for this segment.
+
+        Returns:
+            True if transfer succeeded, otherwise False.
+        """
         if self.audio_agent_service is None or not hasattr(self.audio_agent_service, "enqueue_raw_audio"):
             return False
         audio_bytes = self.get_segment_audio_bytes()
