@@ -2,6 +2,9 @@ from core.models import TranscriptionResult
 from application.ports.asr_port import TranscriptionPort
 from faster_whisper import WhisperModel, BatchedInferencePipeline
 from typing import Any
+import logging
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class WhisperAdapter(TranscriptionPort):
     def __init__(self, model_size: str = "HIN2HINGLISH", device: str = "cpu"):
@@ -17,6 +20,7 @@ class WhisperAdapter(TranscriptionPort):
             word_timestamps (bool): Whether to include word-level timestamps.
             batch_size (int): The number of audio files to process in a single batch.
         """
+        logging.info("Transcribing audio file: %s", audio_input)
         segments, _ = self.batched_model.transcribe(audio_input, vad_filter=vad_filter, word_timestamps=word_timestamps, batch_size=batch_size)
         return [TranscriptionResult(
             start_time=segment.start,
