@@ -72,6 +72,7 @@ class TranscriptionService:
         finally:
             # always unload even if inference threw an exception
             llm_service.reset_conversation()
+            return
 
     async def run_loop(self):
         """
