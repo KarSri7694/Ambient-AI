@@ -14,7 +14,6 @@ current_dir = Path(__file__).parent
 project_root = current_dir.parent.parent.parent  # Go up to ambient_ai root
 
 DIARIZATION_MODEL = "pyannote/speaker-diarization-3.1"
-HF_TOKEN_FILE = "D:\\Projects\\ambient_ai\\HFToken.txt"
 
 class PyannoteAdapter(DiarizationPort):
     def __init__(self, hf_token: str):
