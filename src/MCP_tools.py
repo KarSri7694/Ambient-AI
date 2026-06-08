@@ -1,3 +1,4 @@
+import requests
 from fastmcp import FastMCP
 from todoist_api_python.api import TodoistAPI
 import os
@@ -14,6 +15,7 @@ import serpapi
 import night_mode
 from utils.threading_util import run_async
 import yt_dlp
+from infrastructure.adapter.llamaCppAdapter import LlamaCppAdapter
 
 mcp = FastMCP("My MCP Server")
 
@@ -245,6 +247,25 @@ def download_youtube_video(
         completion_msg = f"BACKGROUND TASK FAILED: Downloading {video_url} failed with error: {e}"
         night_mode.add_notification(completion_msg)
         return f"❌ Download error: {e}"
+
+@mcp.tool(enabled=True)
+def save_state():
+    """
+    Save the current state of the LLM (e.g., KV cache) for later restoration.
+    """
+    try:
+        llm_adapter = LlamaCppAdapter(base_url="http://localhost:8080")
+        models = requests.get(llm_adapter.api_uri_v1 + "/models").json()
+        for model in models.get("data", []):
+            if model.get("status", {}).get("value") == "loaded":
+                LlamaCppAdapter.currently_loaded_model = model.get("id")
+                break
+        save_path = llm_adapter.save_current_kv_state()
+        if save_path is None:
+            return "Error saving state: llama.cpp rejected the slot save request."
+        return f"State save requested successfully: {save_path.name}"
+    except Exception as e:
+        return f"Error saving state: {e}"
 
 if __name__ == "__main__":
     mcp.run()
