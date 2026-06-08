@@ -2,6 +2,8 @@ import openai
 from typing import Optional, List, Dict, Any, Iterator
 import requests
 import logging
+import base64
+import re
 from datetime import datetime
 from application.ports.LLMProvider import LLMProvider
 from application.ports.modelManager import ModelManager
@@ -12,6 +14,7 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
     """Adapter for llama.cpp server — implements both LLMProvider and ModelManager."""
     
     def __init__(self, base_url: str):
+        """Create an adapter for a llama.cpp-compatible OpenAI API server."""
         self.logger = logging.getLogger(self.__class__.__name__)
         self.base_url = base_url
         self.api_uri_v1 = f"{base_url}/v1"
@@ -24,6 +27,7 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
     # ── ModelManager ──────────────────────────────────────────
 
     async def load_model(self, model_name: str, unload_previous: bool = True) -> None:
+        """Load a model through the llama.cpp server model-management endpoint."""
         if self.currently_loaded_model == model_name:
             self.logger.info(f"Model {model_name} is already loaded.")
             return
@@ -43,6 +47,7 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
             self.logger.error(f"Failed to load model: {model_name}. Response: {response.text}")
 
     async def unload_model(self) -> None:
+        """Unload the currently tracked model from the llama.cpp server."""
         if self.currently_loaded_model is None:
             return
         model = {"model": self.currently_loaded_model}
@@ -54,23 +59,59 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
             self.logger.error(f"Failed to unload model: {self.currently_loaded_model}. Response: {response.text}")
 
     def get_current_model(self) -> Optional[str]:
+        """Return the model name this adapter currently tracks as loaded."""
         return self.currently_loaded_model
 
     def _kv_state_dir(self) -> Path:
+        """Return the local directory used for llama.cpp KV state files."""
         parent_dir = Path(__file__).parent.parent.parent.parent
         kv_state_dir = parent_dir / "model_kv_states"
         kv_state_dir.mkdir(exist_ok=True)
         return kv_state_dir
 
     def _safe_kv_state_filename(self) -> str:
+        """Build a timestamped KV state filename containing a reversible model name."""
         model_name = self.currently_loaded_model or "current_model"
-        for char in '<>:"/\\|?* ':
-            model_name = model_name.replace(char, "_")
+        encoded_model_name = self._encode_model_name_for_filename(model_name)
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        return f"{model_name}_{timestamp}_kv_state.bin"
+        return f"{encoded_model_name}_{timestamp}_kv_state.bin"
+
+    @staticmethod
+    def _encode_model_name_for_filename(model_name: str) -> str:
+        """Encode a model name into a filesystem-safe filename component."""
+        encoded = base64.urlsafe_b64encode(model_name.encode("utf-8")).decode("ascii")
+        return f"model_b64_{encoded.rstrip('=')}"
+
+    @staticmethod
+    def _decode_model_name_from_filename(value: str) -> Optional[str]:
+        """Decode a filename component created by `_encode_model_name_for_filename`."""
+        prefix = "model_b64_"
+        if not value.startswith(prefix):
+            return None
+
+        encoded = value[len(prefix):]
+        encoded += "=" * (-len(encoded) % 4)
+        return base64.urlsafe_b64decode(encoded.encode("ascii")).decode("utf-8")
+
+    @classmethod
+    def _extract_model_name_from_kv_state_file(cls, kv_state_file: str) -> str:
+        """Extract the saved model name from a timestamped KV state filename."""
+        kv_state_name = Path(kv_state_file).name
+        match = re.fullmatch(
+            r"(?P<model>.+)_\d{8}_\d{6}_kv_state\.bin",
+            kv_state_name,
+        )
+        if not match:
+            raise ValueError(
+                "KV state filename must match '<model>_YYYYMMDD_HHMMSS_kv_state.bin'."
+            )
+
+        encoded_or_legacy_name = match.group("model")
+        return cls._decode_model_name_from_filename(encoded_or_legacy_name) or encoded_or_legacy_name
 
     def _slot_base_url(self) -> str:
+        """Resolve the server URL that exposes llama.cpp slot save/restore endpoints."""
         try:
             response = requests.get(f"{self.base_url}/slots", timeout=5)
             if response.status_code == 200:
@@ -115,6 +156,7 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         return slot_base_url
 
     def save_current_kv_state(self) -> Path | None:
+        """Request a KV state save for slot 0 and return the expected local file path."""
         kv_state_dir = self._kv_state_dir()
         save_file_name = self._safe_kv_state_filename()
         slot_base_url = self._slot_base_url()
@@ -143,7 +185,8 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
             )
             return None
     
-    def restore_kv_state(self, kv_state_file: str) -> None:
+    async def restore_kv_state(self, kv_state_file: str) -> None:
+        """Restore slot 0 KV state from the given saved state filename or path."""
         kv_state_path = Path(kv_state_file)
         slot_base_url = self._slot_base_url()
         payload = {'filename': kv_state_path.name}
@@ -160,10 +203,25 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
             self.logger.info(f"Successfully restored KV state from {kv_state_file}")
         else:
             self.logger.error(f"Failed to restore KV state from {kv_state_file}. Response: {response.text}")
+    
+    async def save_and_unload(self) -> Optional[Path]:
+        """Save the current KV state, then unload the model if the save succeeds."""
+        save_path = self.save_current_kv_state()
+        if save_path is not None:
+            await self.unload_model()
+        return save_path
+    
+    async def load_and_restore(self, kv_state_file: str) -> None:
+        """Load the model named by a KV state file, then restore that KV state."""
+        model_name = self._extract_model_name_from_kv_state_file(kv_state_file)
+        if self.currently_loaded_model != model_name:
+            await self.load_model(model_name)
+        await self.restore_kv_state(kv_state_file)
+
     # ── LLMProvider ───────────────────────────────────────────
 
     def generate_response(self, prompt: str, image: str = "") -> str:
-        """Simple non-streaming generation."""
+        """Create a non-streaming chat completion for a single prompt."""
         completion = self.client.chat.completions.create(
             model=self.currently_loaded_model,
             messages=[{"role": "user", "content": prompt}],
@@ -181,8 +239,10 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         top_k: int = 0,
     ) -> Iterator:
         """
-        Create a streaming chat completion against the llama.cpp OpenAI-compatible API.
-        Returns the raw streaming iterator of chunk objects.
+        Create a streaming chat completion through the OpenAI-compatible API.
+
+        If `image` is provided, it is attached to the final user message as a
+        base64 data URL for multimodal models.
         """
         # If an image is provided, we need to inject it into the content of the LAST message.
         # This assumes the last message is from the 'user' and text-only.
