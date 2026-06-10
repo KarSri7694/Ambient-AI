@@ -204,6 +204,7 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         if self.currently_loaded_model != model_name:
             await self.load_model(model_name)
         await self.restore_kv_state(kv_state_file)
+        return kv_state_file
 
     # ── LLMProvider ───────────────────────────────────────────
 
