@@ -1,10 +1,12 @@
 import json
 import logging
 from typing import List, Dict, Any, Optional
+from pathlib import Path
+from datetime import datetime
 
 from application.ports.LLMProvider import LLMProvider
 from application.ports.tool_bridge_port import ToolBridgePort
-
+from utils.kv_state_handling import KVStateControl
 
 class LLMInteractionService:
     """
@@ -15,7 +17,10 @@ class LLMInteractionService:
     """
 
     MAX_ITERATIONS = 10
-
+    TERMINAL_TOOL_NAMES = {"save_state", "restore_state"}
+    PARENT_DIR = Path(__file__).parent.parent.parent.parent
+    kv_state_dir = PARENT_DIR / "model_kv_states"
+    kv_control = KVStateControl(kv_state_dir)
     def __init__(self, llm_provider: LLMProvider, tool_bridge: ToolBridgePort):
         self.llm = llm_provider
         self.tool_bridge = tool_bridge
@@ -27,7 +32,7 @@ class LLMInteractionService:
         """Fetch available tools from the tool bridge."""
         self._tools = await self.tool_bridge.get_all_tools()
 
-    def reset_conversation(self) -> None:
+    def reset_context(self) -> None:
         """Clear the message history for a new conversation."""
         self._messages = []
 
@@ -84,7 +89,25 @@ class LLMInteractionService:
             })
 
             # Execute each tool call
-            await self._execute_tool_calls(tool_calls)
+            tool_results = await self._execute_tool_calls(tool_calls)
+            if any(name in self.TERMINAL_TOOL_NAMES for name, _ in tool_results):
+                self.logger.info("Terminal tool executed; ending interaction loop.")
+                if tool_results[0][0] == "save_state":
+                    result = tool_results[0][1]
+                    filename = result.split("State save requested successfully: ")[-1].strip().split(".bin")[0]+".json"
+                    with open((self.kv_state_dir / filename).absolute(), "w") as f:
+                        json.dump(self._messages, f)
+                    self.logger.info(f"Conversation state saved to {filename}")
+                if tool_results[0][0] == "restore_state":
+                    result = tool_results[0][1]
+                    filename = result.split("State restoration requested successfully: ")[-1].strip().split(".bin")[0]+".json"
+                    with open((self.kv_state_dir / filename).absolute(), "r") as f:
+                        messages = json.load(f)
+                    self.reset_context()
+                    self.restore_context(messages)
+                    self.logger.info(f"Conversation state restored from {filename}")
+                
+                return "\n".join(result for _, result in tool_results)
 
         self.logger.warning(
             f"Reached maximum iterations: ({self.MAX_ITERATIONS}). Stopping."
@@ -111,6 +134,7 @@ class LLMInteractionService:
             reasoning = getattr(delta, "reasoning_content", None)
             if reasoning:
                 print(f"\033[93m{reasoning}\033[0m", end="", flush=True)
+                assistant_text += reasoning
 
             # Tool calls
             if delta.tool_calls:
@@ -132,8 +156,13 @@ class LLMInteractionService:
         print()  # newline after stream
         return assistant_text, tool_calls
 
-    async def _execute_tool_calls(self, tool_calls: List[Dict]) -> None:
-        """Execute tool calls and append results to the message history."""
+    async def _execute_tool_calls(self, tool_calls: List[Dict]) -> List[tuple[str, str]]:
+        """
+        Execute tool calls, append results to history, and return the tool outputs.
+        Returns: 
+            Tuple of (tool_name, tool_result) for each executed tool.
+        """
+        tool_results: List[tuple[str, str]] = []
         for tool_call in tool_calls:
             tool_name = tool_call["function"]["name"]
             tool_args_str = tool_call["function"]["arguments"]
@@ -149,6 +178,7 @@ class LLMInteractionService:
             except Exception as e:
                 self.logger.error(f"   Error: {e}")
                 response_content = f"Error: {str(e)}"
+            tool_results.append((tool_name, response_content))
 
             self._messages.append({
                 "role": "tool",
@@ -156,3 +186,4 @@ class LLMInteractionService:
                 "name": tool_name,
                 "content": response_content,
             })
+        return tool_results
