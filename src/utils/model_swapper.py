@@ -30,7 +30,7 @@ class ModelSwapper:
     async def __aenter__(self):
         if self.llm_service is not None:
             self._saved_context = self.llm_service.get_context()
-            self.llm_service.reset_conversation()
+            self.llm_service.reset_context()
         await self.model_adapter.unload_model()
         await self.model_adapter.load_model(self.new_model)
         logging.info(f"Successfully swapped model from {self.previous_model} to {self.new_model}")
