@@ -18,7 +18,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class RealTimeAudioInput:
+class RealTimeAudioInputService:
     def __init__(
         self,
         sample_rate: int = 16000,
@@ -282,8 +282,8 @@ class RealTimeAudioInput:
 
 
 def main():
-    """Instantiate RealTimeAudioInput and start live audio recording."""
-    audio_input = RealTimeAudioInput(min_silence_duration_ms=5000)
+    """Instantiate RealTimeAudioInputService and start live audio recording."""
+    audio_input = RealTimeAudioInputService(min_silence_duration_ms=5000)
     audio_input.start_recording()
 
 
