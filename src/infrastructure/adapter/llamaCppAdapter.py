@@ -2,6 +2,9 @@ import openai
 from typing import Optional, List, Dict, Any, Iterator
 import requests
 import logging
+import copy
+import json
+import time
 
 from application.ports.LLMProvider import LLMProvider
 from application.ports.modelManager import ModelManager
@@ -135,7 +138,7 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         response.raise_for_status()
         return slot_base_url
 
-    def save_current_kv_state(self) -> Optional[Path]:
+    def save_current_kv_state(self, messages) -> Optional[Path]:
         """Request a KV state save for slot 0 and return the expected local file path."""
         if self.currently_loaded_model is None:
             self.currently_loaded_model = self.get_current_model() or self._discover_loaded_model()
@@ -152,6 +155,9 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
             json=payload,
             timeout=30,
         )
+        json_path = save_path.with_suffix(".json")
+        with open(json_path, "w") as f:
+            json.dump(messages, f)
 
         if response.status_code == 200:
             self.kv_state.update_shared_state(currently_loaded_model=self.currently_loaded_model)
@@ -168,7 +174,7 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         )
         return None
 
-    async def restore_kv_state(self, kv_state_file: str) -> None:
+    def restore_kv_state(self, kv_state_file: str) -> None:
         """Restore slot 0 KV state from the given saved state filename or path."""
         kv_state_path = Path(kv_state_file)
         slot_base_url = self._slot_base_url()
@@ -186,25 +192,50 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
             self.logger.info(f"Successfully restored KV state from {kv_state_file}")
             return
 
-        self.logger.error(
+        raise RuntimeError(
             f"Failed to restore KV state from {kv_state_file}. Response: {response.text}"
         )
+        
+    def _wait_for_model_restore_ready(self, model_name: str, timeout_seconds: float = 15.0) -> None:
+        """Wait until the loaded model exposes a slot endpoint suitable for KV restore."""
+        deadline = time.time() + timeout_seconds
+        last_error: Optional[Exception] = None
+
+        while time.time() < deadline:
+            try:
+                discovered_model = self.get_current_model() or self._discover_loaded_model()
+                if discovered_model == model_name:
+                    self._slot_base_url()
+                    return
+            except Exception as exc:
+                last_error = exc
+            time.sleep(0.25)
+
+        if last_error is not None:
+            raise RuntimeError(
+                f"Timed out waiting for model {model_name} to become restore-ready."
+            ) from last_error
+        raise RuntimeError(
+            f"Timed out waiting for model {model_name} to become restore-ready."
+        )
     
-    async def save_and_unload(self) -> Optional[Path]:
+    async def save_and_unload(self, messages) -> Optional[Path]:
         """Save the current KV state, then unload the model if the save succeeds."""
-        save_path = self.save_current_kv_state()
+        save_path = self.save_current_kv_state(messages)
         if save_path is not None:
             await self.unload_model()
         return save_path
     
-    async def load_and_restore(self) -> None:
+    async def load_and_restore(self) -> Path:
         """Load the model named by a KV state file, then restore that KV state."""
-        kv_state_file = self.kv_state.pop_kv_state()
+        kv_state_file = self.kv_state.peek_kv_state()
         model_name = self.kv_state.extract_model_name_from_kv_state_file(kv_state_file)
         if self.currently_loaded_model != model_name:
             await self.load_model(model_name)
-        await self.restore_kv_state(kv_state_file)
-        return kv_state_file
+        self._wait_for_model_restore_ready(model_name)
+        self.restore_kv_state(kv_state_file)
+        self.kv_state.pop_kv_state()
+        return Path(kv_state_file)
 
     # ── LLMProvider ───────────────────────────────────────────
 
@@ -234,12 +265,13 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         """
         # If an image is provided, we need to inject it into the content of the LAST message.
         # This assumes the last message is from the 'user' and text-only.
-        if image and messages and messages[-1]["role"] == "user":
+        copy_messages = copy.deepcopy(messages)
+        if image and copy_messages and copy_messages[-1]["role"] == "user":
             import base64
             with open(image, "rb") as f:
                 base64_image = base64.b64encode(f.read()).decode("utf-8")
             
-            last_message = messages[-1]
+            last_message = copy_messages[-1]
             text_content = last_message["content"]
             
             # format content as list for multimodal
@@ -253,13 +285,15 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
 
         kwargs: Dict[str, Any] = {
             "model": model,
-            "messages": messages,
+            "messages": copy_messages,
             "stream": True,
             "temperature": temperature,
             "top_p": top_p,
         }
+        extra_body: Dict[str, Any] = {"enable_thinking": False}
         if top_k > 0:
-            kwargs["extra_body"] = {"top_k": top_k}
+            extra_body["top_k"] = top_k
+        kwargs["extra_body"] = extra_body
         if tools:
             kwargs["tools"] = tools
 
