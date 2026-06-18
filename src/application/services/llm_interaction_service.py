@@ -16,11 +16,15 @@ class LLMInteractionService:
     it only depends on the LLMProvider and ToolBridgePort abstractions.
     """
 
+    AGENT_DEPTH = 0
     MAX_ITERATIONS = 10
     TERMINAL_TOOL_NAMES = {"save_state", "restore_state"}
     PARENT_DIR = Path(__file__).parent.parent.parent.parent
     kv_state_dir = PARENT_DIR / "model_kv_states"
     kv_control = KVStateControl(kv_state_dir)
+    
+    AGENT_PROMPT = f'Your goal is to just complete the given user task and after the task is completed, call the restore_agent tool'
+    
     def __init__(self, llm_provider: LLMProvider, tool_bridge: ToolBridgePort):
         self.llm = llm_provider
         self.tool_bridge = tool_bridge
@@ -92,20 +96,20 @@ class LLMInteractionService:
             tool_results = await self._execute_tool_calls(tool_calls)
             if any(name in self.TERMINAL_TOOL_NAMES for name, _ in tool_results):
                 self.logger.info("Terminal tool executed; ending interaction loop.")
-                if tool_results[0][0] == "save_state":
-                    result = tool_results[0][1]
-                    filename = result.split("State save requested successfully: ")[-1].strip().split(".bin")[0]+".json"
-                    with open((self.kv_state_dir / filename).absolute(), "w") as f:
-                        json.dump(self._messages, f)
-                    self.logger.info(f"Conversation state saved to {filename}")
-                if tool_results[0][0] == "restore_state":
-                    result = tool_results[0][1]
-                    filename = result.split("State restoration requested successfully: ")[-1].strip().split(".bin")[0]+".json"
-                    with open((self.kv_state_dir / filename).absolute(), "r") as f:
-                        messages = json.load(f)
-                    self.reset_context()
-                    self.restore_context(messages)
-                    self.logger.info(f"Conversation state restored from {filename}")
+                # if tool_results[0][0] == "save_state":
+                #     result = tool_results[0][1]
+                #     filename = result.split("State save requested successfully: ")[-1].strip().split(".bin")[0]+".json"
+                #     with open((self.kv_state_dir / filename).absolute(), "w") as f:
+                #         json.dump(self._messages, f)
+                #     self.logger.info(f"Conversation state saved to {filename}")
+                # if tool_results[0][0] == "restore_state":
+                #     result = tool_results[0][1]
+                #     filename = result.split("State restoration requested successfully: ")[-1].strip().split(".bin")[0]+".json"
+                #     with open((self.kv_state_dir / filename).absolute(), "r") as f:
+                #         messages = json.load(f)
+                #     self.reset_context()
+                #     self.restore_context(messages)
+                #     self.logger.info(f"Conversation state restored from {filename}")
                 
                 return "\n".join(result for _, result in tool_results)
 
@@ -173,7 +177,30 @@ class LLMInteractionService:
 
             try:
                 tool_args = json.loads(tool_args_str) if tool_args_str else {}
-                response_content = await self.tool_bridge.execute_tool(tool_name, tool_args)
+                if tool_name == "load_agent":
+                    model_name = tool_args.get("model")
+                    await self.llm.save_and_unload(self._messages)
+                    await self.llm.load_model(model_name)
+                    response_content = f"Model switched to {model_name}."
+                    self.run_interaction(user_input= "You have been given a task: "+tool_args.get("message", ""),system_prompt= self.AGENT_PROMPT, model=model_name) 
+                if tool_name == "restore_agent":
+                    response_content = f"Agent task completed. Restoring previous agent."
+                    kv_state_file = self.llm.load_and_restore()
+                    messages_path = kv_state_file.with_suffix(".json")
+                    if messages_path.exists():
+                        with open(messages_path, "r") as f:
+                            messages = json.load(f)
+                        self.reset_context()
+                        self.restore_context(messages)
+                        self._messages.append({
+                            "role": "deployed sub agent",
+                            "content": f"Deployed sub-agent has worked on the given task and returned the following result: {tool_args.get('message_to_agent', '')}."
+                        })
+                        self.logger.info(f"Conversation state restored from {messages_path.name}")
+                    else:
+                        self.logger.warning(f"No conversation state file found at {messages_path}. Context not restored.")
+                else:
+                    response_content = await self.tool_bridge.execute_tool(tool_name, tool_args)
                 self.logger.info(f"   Result: {response_content}")
             except Exception as e:
                 self.logger.error(f"   Error: {e}")
