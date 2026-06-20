@@ -5,11 +5,14 @@ import threading
 import queue
 from pathlib import Path
 import os
+import tempfile
+import wave
 import torch
 import gc
 import torchaudio
 import logging
 from collections import defaultdict
+import numpy as np
 from audio_preprocessor import AudioPreprocessor
 from infrastructure.adapter.ASR_Adapter import WhisperAdapter
 from infrastructure.adapter.pyannoteAdapter import PyannoteAdapter
@@ -36,6 +39,7 @@ CLEANED_AUDIO_DIR = "cleaned_audio/"
 
 HF_TOKEN = os.getenv("HF_TOKEN", None)
 MIN_TIME_THRESHOLD = 0.2 #seconds
+INT16_NORMALIZATION_FACTOR = 32768.0
 file_counter = 1
 class AudioAgent:
     def __init__(self, transcription_queue: queue.Queue):
@@ -68,10 +72,11 @@ class AudioAgent:
         db = SQLiteVoiceAdapter(voice_database_path)
         return db
     
-    def compare_embeddings(self, db, diarization_result: list[DiarizationResult]):
+    def compare_embeddings(self, db, diarization_result: list[DiarizationResult], waveform: torch.Tensor | None = None, samplerate: int | None = None):
         self.encoder = EcapaVoxcelebAdapter(db)
         try:
-            waveform, samplerate= torchaudio.load(diarization_result[0].audio_file)
+            if waveform is None or samplerate is None:
+                waveform, samplerate = torchaudio.load(diarization_result[0].audio_file)
             speaker_audio_tensor = defaultdict(list)
             for i in diarization_result:
                 segment_duration = i.end_time - i.start_time
@@ -168,9 +173,9 @@ class AudioAgent:
         gc.collect()
         
         
-    def run(self, audio_file: str):
+    def run(self, audio_file: str, skip_preprocessing: bool = False):
         db = self.connect_db(VOICE_DB)
-        processed_file = self.preprocess_audio(audio_file)
+        processed_file = audio_file if skip_preprocessing else self.preprocess_audio(audio_file)
         if not os.path.exists(processed_file):
             raise FileNotFoundError(f"Processed audio not found: {processed_file}")
         logging.info(f"Processed file: {processed_file}")
@@ -178,6 +183,67 @@ class AudioAgent:
         transcription_result = self.transcribe_audio(processed_file, vad_filter=False, word_timestamps= True)
         diarization_result = self.compare_embeddings(db, diarization_result)
         self.merge_transciptions_and_diarizations(transcription=transcription_result, diarization_result=diarization_result)
+    
+    def run_raw_audio(self, audio_bytes: bytes, sample_rate: int = 16000, channels: int = 1, skip_preprocessing: bool = False):
+        """Process signed 16-bit little-endian PCM bytes from memory.
+
+        Args:
+            audio_bytes: Raw PCM16 little-endian bytes.
+            sample_rate: Sample rate of the incoming audio.
+            channels: Channel count encoded in audio_bytes.
+            skip_preprocessing: Whether to bypass preprocessing for already-ready audio.
+        """
+        if not audio_bytes:
+            raise ValueError("audio_bytes cannot be empty")
+        if channels <= 0:
+            raise ValueError(f"channels must be a positive integer, got {channels}")
+
+        audio_int16 = np.frombuffer(audio_bytes, dtype=np.int16)
+        if audio_int16.size % channels != 0:
+            raise ValueError("audio_bytes sample count is not divisible by channel count")
+
+        waveform = torch.from_numpy(audio_int16.astype(np.float32) / INT16_NORMALIZATION_FACTOR)
+        waveform = waveform.reshape(-1, channels).transpose(0, 1).contiguous()
+
+        if channels > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+
+        if skip_preprocessing:
+            db = self.connect_db(VOICE_DB)
+            self.diarization = PyannoteAdapter(HF_TOKEN)
+            try:
+                diarization_result = self.diarization.diarize_waveform(
+                    waveform=waveform,
+                    sample_rate=sample_rate,
+                    audio_label="in_memory_audio",
+                )
+            finally:
+                self.unload_model("diarization")
+            transcription_result = self.transcribe_audio(
+                waveform.squeeze(0).cpu().numpy(),
+                vad_filter=False,
+                word_timestamps=True,
+            )
+            diarization_result = self.compare_embeddings(db, diarization_result, waveform=waveform, samplerate=sample_rate)
+            self.merge_transciptions_and_diarizations(
+                transcription=transcription_result,
+                diarization_result=diarization_result,
+            )
+            return
+
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+                temp_path = temp_file.name
+            with wave.open(temp_path, "wb") as wf:
+                wf.setnchannels(channels)
+                wf.setsampwidth(2)
+                wf.setframerate(sample_rate)
+                wf.writeframes(audio_bytes)
+            self.run(temp_path, skip_preprocessing=False)
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.remove(temp_path)
         
 class Handler(FileSystemEventHandler):
     def __init__(self, processing_queue: queue.Queue):
@@ -210,6 +276,29 @@ class AudioAgentService:
     def get_transcription_queue(self) -> queue.Queue:
         return self.transcription_queue
     
+    def enqueue_audio_file(self, file_path: str):
+        """Queue a file path for the existing file-based audio pipeline."""
+        self.processing_queue.put(file_path)
+    
+    def enqueue_raw_audio(self, audio_bytes: bytes, sample_rate: int = 16000, channels: int = 1, skip_preprocessing: bool = False):
+        """Queue signed 16-bit little-endian PCM bytes for in-memory processing.
+
+        Args:
+            audio_bytes: Raw PCM16 little-endian bytes.
+            sample_rate: Sample rate of incoming audio.
+            channels: Number of channels in audio_bytes.
+            skip_preprocessing: Whether audio preprocessing should be skipped.
+        """
+        self.processing_queue.put(
+            {
+                "type": "raw_audio",
+                "audio_bytes": audio_bytes,
+                "sample_rate": sample_rate,
+                "channels": channels,
+                "skip_preprocessing": skip_preprocessing,
+            }
+        )
+    
     def _process_uploads(self):
         IDLE_TIMEOUT = 20
         idle_elapsed = 0
@@ -229,7 +318,7 @@ class AudioAgentService:
                 continue
 
             try:
-                file_path = self.processing_queue.get(timeout=CHECK_INTERVAL)
+                item = self.processing_queue.get(timeout=CHECK_INTERVAL)
                 idle_elapsed = 0
             except queue.Empty:
                 if self.audio_active_event.is_set():
@@ -246,7 +335,7 @@ class AudioAgentService:
                     idle_elapsed = 0
                 continue
 
-            if file_path is None:
+            if item is None:
                 self.processing_queue.task_done()
                 break
 
@@ -257,11 +346,20 @@ class AudioAgentService:
 
             try:
                 with self.gpu_lock:
-                    self.audio_agent.run(file_path)
+                    if isinstance(item, dict) and item.get("type") == "raw_audio":
+                        self.audio_agent.run_raw_audio(
+                            audio_bytes=item["audio_bytes"],
+                            sample_rate=item.get("sample_rate", 16000),
+                            channels=item.get("channels", 1),
+                            skip_preprocessing=item.get("skip_preprocessing", False),
+                        )
+                    else:
+                        self.audio_agent.run(item)
             except KeyboardInterrupt:
                 logging.info("Terminating")
             except Exception:
-                logging.exception(f"Failed to process file: {file_path}")
+                item_desc = item.get("type", "unknown") if isinstance(item, dict) else os.path.basename(str(item))
+                logging.exception(f"Failed to process item: {item_desc}")
             finally:
                 self.audio_agent.release_all_models()
                 self.processing_queue.task_done()
