@@ -70,6 +70,13 @@ class KVStateControl:
         self.update_shared_state(kv_state_stack=stack)
         return kv_state_file
 
+    def peek_kv_state(self) -> str:
+        """Return the most recently saved KV-state path without removing it."""
+        stack = self.kv_state_stack()
+        if not stack:
+            raise RuntimeError("No saved KV state is recorded in shared_state.json.")
+        return stack[-1]
+
     def safe_kv_state_filename(self) -> str:
         """Build a timestamped KV state filename containing a reversible model name."""
         model_name = self.owner.currently_loaded_model or "current_model"

@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Iterator, List, Dict, Any, Optional
 
 
@@ -26,3 +27,28 @@ class LLMProvider(ABC):
         Yields chunk objects compatible with OpenAI's streaming format.
         """
         pass
+    
+    # @abstractmethod
+    # def get_context(self) -> List[Dict[str, Any]]:
+    #     """Return the current message history."""
+    #     pass
+    
+    @abstractmethod
+    def load_model(self, model_name: str) -> None:
+        """Load a model into the LLM provider."""
+        pass
+    
+    @abstractmethod
+    def save_and_unload(self, messages: List[Dict[str, Any]]) -> Optional[Path]:
+        """Save the current KV state to disk and unload the model."""
+        pass
+    
+    @abstractmethod
+    def load_and_restore(self) -> Path:
+        """Load the model and restore the KV state from a given file."""
+        pass
+    
+    # @abstractmethod
+    # def restore_kv_state(self, kv_state_file: str) -> None:
+    #     """Restore the KV state from a given file."""
+    #     pass
