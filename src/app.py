@@ -19,22 +19,61 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 API_BASE_URL = "http://localhost:8080"
-DEFAULT_MODEL = "Qwen-4b-Thinking-2507-Q4_K_M"
+DEFAULT_MODEL = "Qwen-3.5-9B-Q4_K_M"
 MCP_CONFIG_PATH = "mcp.json"
 USERNAME = ""
 
-TRANSCRIPTION_SYSTEM_PROMPT = f"""
-You are assistant of {USERNAME}, you have to help him in his daily tasks.
-You have access to various tools to help you accomplish tasks. The user will pass a conversation to you, you have to interpret it and decide which tools to use to best assist the user.
-When you need to perform a task, use the appropriate tool from the available tools list.
-If possible convert text to english before passing to tools.
-Any task that requires extensive time or resources should be queued for night-time execution using the queue_night_task tool.
-If a task is SLOW (Deep Research, Downloading huge files), use the queue_night_task tool.
-For all else, use standard tools.
-You will also be provided with notifications from the system about important events that were started.
-If you have no new notifications, ignore the notification section.
-"""
 
+def build_available_skills_summary() -> str:
+    base_dir = Path(__file__).parent.parent
+    skills_dir = base_dir / "skills"
+    if not skills_dir.exists():
+        skills_dir = base_dir / "Skills"
+
+    skill_entries = []
+    for skill_file in sorted(skills_dir.glob("*.md")):
+        try:
+            content = skill_file.read_text(encoding="utf-8")
+        except OSError:
+            continue
+
+        if not content.startswith("---"):
+            continue
+
+        parts = content.split("---", 2)
+        if len(parts) < 3:
+            continue
+
+        name = ""
+        description = ""
+        for line in parts[1].splitlines():
+            stripped_line = line.strip()
+            if stripped_line.startswith("name:"):
+                name = stripped_line.partition(":")[2].strip()
+            elif stripped_line.startswith("description:"):
+                description = stripped_line.partition(":")[2].strip()
+
+        if name and description:
+            skill_entries.append(f"Name: {name}\nDescription: {description}")
+
+    return "Available Skills:\n\n" + "\n\n".join(skill_entries)
+
+
+def build_prompt():
+    #Agent prompt
+    path = Path(__file__).parent.parent / "prompts" / "AGENT.md"
+    prompt = ""
+    with open(path, "r") as f:
+        prompt = f.read() + "\n\n"
+    
+    #details about user
+    user_path = Path(__file__).parent.parent / "prompts" / "USER.md"
+    with open(user_path, "r") as f:
+        prompt += f.read() + "\n\n"
+    
+    #add available skills
+    prompt += build_available_skills_summary()
+    return prompt
 
 class TranscriptionService:
 
@@ -66,12 +105,12 @@ class TranscriptionService:
         try:
             await llm_service.run_interaction(
                 user_input=f"Current date and time: {datetime.now()}     Transcript Content: {content}",
-                system_prompt=TRANSCRIPTION_SYSTEM_PROMPT,
+                system_prompt=build_prompt(),
                 model=DEFAULT_MODEL,
             )
         finally:
             # always unload even if inference threw an exception
-            llm_service.reset_conversation()
+            llm_service.reset_context()
             return
 
     async def run_loop(self):
