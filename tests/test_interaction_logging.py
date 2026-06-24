@@ -1,0 +1,87 @@
+import asyncio
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+SRC_ROOT = REPO_ROOT / "src"
+sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(0, str(SRC_ROOT))
+
+from application.services.interaction_trace import interaction_trace
+from infrastructure.adapter.LoggingLLMProvider import LoggingLLMProvider
+from infrastructure.adapter.SQLiteInteractionLogAdapter import SQLiteInteractionLogAdapter
+
+
+class _FakeDelta:
+    def __init__(self, content=None, reasoning_content=None, tool_calls=None):
+        self.content = content
+        self.reasoning_content = reasoning_content
+        self.tool_calls = tool_calls
+
+
+class _FakeChoice:
+    def __init__(self, delta):
+        self.delta = delta
+
+
+class _FakeChunk:
+    def __init__(self, content=None, reasoning_content=None, tool_calls=None):
+        self.choices = [_FakeChoice(_FakeDelta(content=content, reasoning_content=reasoning_content, tool_calls=tool_calls))]
+
+
+class FakeLLMProvider:
+    def generate_response(self, prompt: str, image: str = "") -> str:
+        return "generated-response"
+
+    async def chat_completion_stream(self, model, messages, tools=None, image="", temperature=0.7, top_p=0.95, top_k=0):
+        async def _gen():
+            yield _FakeChunk(content="hello ")
+            yield _FakeChunk(content="world")
+        return _gen()
+
+    async def load_model(self, model_name: str):
+        return None
+
+    async def save_and_unload(self, messages):
+        return None
+
+    async def load_and_restore(self):
+        return None
+
+
+class InteractionLoggingTests(unittest.TestCase):
+    def test_streamed_interaction_is_persisted(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "interaction_logs.db"
+            store = SQLiteInteractionLogAdapter(str(db_path))
+            provider = LoggingLLMProvider(FakeLLMProvider(), store)
+
+            async def _run():
+                with interaction_trace("unit_test_source", {"kind": "test"}):
+                    stream = await provider.chat_completion_stream(
+                        model="test-model",
+                        messages=[{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}],
+                        tools=None,
+                    )
+                    text = []
+                    async for chunk in stream:
+                        text.append(chunk.choices[0].delta.content or "")
+                    return "".join(text)
+
+            result = asyncio.run(_run())
+            self.assertEqual(result, "hello world")
+
+            rows = store.list_recent(limit=5)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0].source, "unit_test_source")
+            self.assertEqual(rows[0].model, "test-model")
+            self.assertIn('"role": "user"', rows[0].messages_json)
+            self.assertEqual(rows[0].response_text, "hello world")
+            self.assertEqual(json.loads(rows[0].metadata_json)["kind"], "test")
+
+
+if __name__ == "__main__":
+    unittest.main()
