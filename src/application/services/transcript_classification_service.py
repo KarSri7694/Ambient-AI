@@ -4,6 +4,7 @@ import re
 from typing import Dict, List
 
 from application.ports.LLMProvider import LLMProvider
+from application.services.interaction_trace import interaction_trace
 from core.models import TranscriptClassificationResult, TranscriptParticipant, TranscriptTurn
 
 
@@ -66,16 +67,17 @@ class TranscriptClassificationService:
         model: str,
     ) -> TranscriptClassificationResult | None:
         try:
-            completion = await self.llm.chat_completion_stream(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": transcript_text},
-                ],
-                tools=None,
-                temperature=0.1,
-                top_p=0.9,
-            )
+            with interaction_trace("transcript_classifier"):
+                completion = await self.llm.chat_completion_stream(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": transcript_text},
+                    ],
+                    tools=None,
+                    temperature=0.1,
+                    top_p=0.9,
+                )
             response_text = await self._consume_stream_text(completion)
             return self._parse_llm_response(response_text)
         except Exception as exc:

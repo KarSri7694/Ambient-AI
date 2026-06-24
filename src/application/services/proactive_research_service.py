@@ -5,6 +5,7 @@ from typing import List
 
 from application.ports.notification_port import NotificationPort
 from application.ports.proactive_topic_queue_port import ProactiveTopicQueuePort
+from application.services.interaction_trace import interaction_trace
 from application.services.llm_interaction_service import LLMInteractionService
 from application.services.research_vault_service import ResearchVaultService
 from core.models import ProactiveTopicCandidate, ResearchPackageResult
@@ -87,12 +88,13 @@ class ProactiveResearchService:
             "Return JSON only with keys summary, notes, and links. "
             "links must be a JSON array of objects with title and url."
         )
-        response = await self.llm_service.run_interaction(
-            user_input=user_input,
-            system_prompt=system_prompt,
-            model=model,
-            allowed_tool_names=self.ALLOWED_TOOL_NAMES,
-        )
+        with interaction_trace("proactive_research"):
+            response = await self.llm_service.run_interaction(
+                user_input=user_input,
+                system_prompt=system_prompt,
+                model=model,
+                allowed_tool_names=self.ALLOWED_TOOL_NAMES,
+            )
         parsed = self._parse_response(response, topic)
         return self.vault.save_package(
             normalized_topic=topic.normalized_topic,

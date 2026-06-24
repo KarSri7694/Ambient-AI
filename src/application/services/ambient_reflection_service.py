@@ -11,6 +11,7 @@ from application.ports.notification_port import NotificationPort
 from application.ports.proactive_topic_queue_port import ProactiveTopicQueuePort
 from application.ports.task_queue_port import TaskQueuePort
 from application.services.agenda_scoring_service import AgendaScoringService, ReflectionCandidate
+from application.services.interaction_trace import interaction_trace
 from application.services.llm_interaction_service import LLMInteractionService
 from core.models import AmbientAgendaItem, AmbientReflectionAction
 
@@ -122,12 +123,13 @@ Rules:
             },
             indent=2,
         )
-        response = await self.llm_service.run_interaction(
-            user_input=user_input,
-            system_prompt=self.REFLECTION_PROMPT,
-            model=model,
-            allowed_tool_names=set(),
-        )
+        with interaction_trace("ambient_reflection"):
+            response = await self.llm_service.run_interaction(
+                user_input=user_input,
+                system_prompt=self.REFLECTION_PROMPT,
+                model=model,
+                allowed_tool_names=set(),
+            )
         return self.parse_actions(response)
 
     def parse_actions(self, response: str) -> List[AmbientReflectionAction]:

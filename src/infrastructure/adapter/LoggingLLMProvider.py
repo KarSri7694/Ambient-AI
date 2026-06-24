@@ -1,0 +1,302 @@
+import copy
+import json
+import uuid
+from datetime import datetime
+from pathlib import Path
+from time import perf_counter
+from typing import Any, Dict, List, Optional
+
+from application.ports.LLMProvider import LLMProvider
+from application.services.interaction_trace import current_interaction_metadata, current_interaction_source
+from core.models import InteractionLogEntry
+from infrastructure.adapter.SQLiteInteractionLogAdapter import SQLiteInteractionLogAdapter
+
+
+class LoggingLLMProvider(LLMProvider):
+    """Wrap an LLM provider and persist every request/response pair."""
+
+    def __init__(
+        self,
+        provider: LLMProvider,
+        log_store: SQLiteInteractionLogAdapter,
+        current_response_path: str | None = None,
+    ):
+        self.provider = provider
+        self.log_store = log_store
+        self.current_response_path = Path(current_response_path) if current_response_path else None
+        if self.current_response_path is not None:
+            self.current_response_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def __getattr__(self, name: str):
+        return getattr(self.provider, name)
+
+    async def load_model(self, model_name: str) -> None:
+        return await self.provider.load_model(model_name)
+
+    async def save_and_unload(self, messages: List[Dict[str, Any]]):
+        return await self.provider.save_and_unload(messages)
+
+    async def load_and_restore(self):
+        return await self.provider.load_and_restore()
+
+    def generate_response(self, prompt: str, image: str = "") -> str:
+        started_at = datetime.now().isoformat()
+        started = perf_counter()
+        interaction_id = uuid.uuid4().hex
+        source = current_interaction_source()
+        metadata = current_interaction_metadata()
+        self._write_current_response(
+            source=source,
+            model=getattr(self.provider, "currently_loaded_model", "") or "unknown",
+            created_at=started_at,
+            response_text="",
+            reasoning_text="",
+            status="streaming",
+            metadata=metadata,
+        )
+        try:
+            response = self.provider.generate_response(prompt, image=image)
+            self._write_current_response(
+                source=source,
+                model=getattr(self.provider, "currently_loaded_model", "") or "unknown",
+                created_at=started_at,
+                response_text=response,
+                reasoning_text="",
+                status="completed",
+                metadata=metadata,
+            )
+            self._log(
+                InteractionLogEntry(
+                    interaction_id=interaction_id,
+                    created_at=started_at,
+                    completed_at=datetime.now().isoformat(),
+                    source=source,
+                    model=getattr(self.provider, "currently_loaded_model", "") or "unknown",
+                    messages_json=json.dumps([{"role": "user", "content": prompt}], ensure_ascii=False, indent=2),
+                    image_path=image or None,
+                    response_text=response,
+                    duration_ms=int((perf_counter() - started) * 1000),
+                    metadata_json=json.dumps(metadata, ensure_ascii=False, indent=2) if metadata else None,
+                )
+            )
+            return response
+        except Exception as exc:
+            self._write_current_response(
+                source=source,
+                model=getattr(self.provider, "currently_loaded_model", "") or "unknown",
+                created_at=started_at,
+                response_text="",
+                reasoning_text="",
+                status="error",
+                metadata=metadata,
+                error_text=str(exc),
+            )
+            self._log(
+                InteractionLogEntry(
+                    interaction_id=interaction_id,
+                    created_at=started_at,
+                    completed_at=datetime.now().isoformat(),
+                    source=source,
+                    model=getattr(self.provider, "currently_loaded_model", "") or "unknown",
+                    messages_json=json.dumps([{"role": "user", "content": prompt}], ensure_ascii=False, indent=2),
+                    image_path=image or None,
+                    error_text=str(exc),
+                    duration_ms=int((perf_counter() - started) * 1000),
+                    metadata_json=json.dumps(metadata, ensure_ascii=False, indent=2) if metadata else None,
+                )
+            )
+            raise
+
+    async def chat_completion_stream(
+        self,
+        model: str,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        image: str = "",
+        temperature: float = 0.7,
+        top_p: float = 0.95,
+        top_k: int = 0,
+    ):
+        started_at = datetime.now().isoformat()
+        started = perf_counter()
+        interaction_id = uuid.uuid4().hex
+        source = current_interaction_source()
+        metadata = current_interaction_metadata()
+        response_text_parts: List[str] = []
+        reasoning_text_parts: List[str] = []
+        streamed_tool_calls: Dict[int, Dict[str, Any]] = {}
+
+        try:
+            completion = await self.provider.chat_completion_stream(
+                model=model,
+                messages=messages,
+                tools=tools,
+                image=image,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+            )
+            self._write_current_response(
+                source=source,
+                model=model,
+                created_at=started_at,
+                response_text="",
+                reasoning_text="",
+                status="streaming",
+                metadata=metadata,
+            )
+
+            async def _wrapped_stream():
+                try:
+                    async for chunk in completion:
+                        delta = chunk.choices[0].delta
+                        if getattr(delta, "content", None):
+                            response_text_parts.append(delta.content)
+                        reasoning = getattr(delta, "reasoning_content", None)
+                        if reasoning:
+                            reasoning_text_parts.append(reasoning)
+                        if getattr(delta, "tool_calls", None):
+                            for tc_delta in delta.tool_calls:
+                                idx = tc_delta.index
+                                existing = streamed_tool_calls.setdefault(
+                                    idx,
+                                    {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+                                )
+                                if tc_delta.id:
+                                    existing["id"] = tc_delta.id
+                                if tc_delta.function.name:
+                                    existing["function"]["name"] += tc_delta.function.name
+                                if tc_delta.function.arguments:
+                                    existing["function"]["arguments"] += tc_delta.function.arguments
+                        self._write_current_response(
+                            source=source,
+                            model=model,
+                            created_at=started_at,
+                            response_text="".join(response_text_parts),
+                            reasoning_text="".join(reasoning_text_parts),
+                            status="streaming",
+                            metadata=metadata,
+                        )
+                        yield chunk
+                except Exception as exc:
+                    self._write_current_response(
+                        source=source,
+                        model=model,
+                        created_at=started_at,
+                        response_text="".join(response_text_parts),
+                        reasoning_text="".join(reasoning_text_parts),
+                        status="error",
+                        metadata=metadata,
+                        error_text=str(exc),
+                    )
+                    self._log(
+                        InteractionLogEntry(
+                            interaction_id=interaction_id,
+                            created_at=started_at,
+                            completed_at=datetime.now().isoformat(),
+                            source=source,
+                            model=model,
+                            messages_json=json.dumps(copy.deepcopy(messages), ensure_ascii=False, indent=2),
+                            tools_json=json.dumps(tools, ensure_ascii=False, indent=2) if tools is not None else None,
+                            image_path=image or None,
+                            response_text="".join(response_text_parts) or None,
+                            reasoning_text="".join(reasoning_text_parts) or None,
+                            tool_calls_json=json.dumps(list(streamed_tool_calls.values()), ensure_ascii=False, indent=2)
+                            if streamed_tool_calls
+                            else None,
+                            error_text=str(exc),
+                            duration_ms=int((perf_counter() - started) * 1000),
+                            metadata_json=json.dumps(metadata, ensure_ascii=False, indent=2) if metadata else None,
+                        )
+                    )
+                    raise
+                else:
+                    self._write_current_response(
+                        source=source,
+                        model=model,
+                        created_at=started_at,
+                        response_text="".join(response_text_parts),
+                        reasoning_text="".join(reasoning_text_parts),
+                        status="completed",
+                        metadata=metadata,
+                    )
+                    self._log(
+                        InteractionLogEntry(
+                            interaction_id=interaction_id,
+                            created_at=started_at,
+                            completed_at=datetime.now().isoformat(),
+                            source=source,
+                            model=model,
+                            messages_json=json.dumps(copy.deepcopy(messages), ensure_ascii=False, indent=2),
+                            tools_json=json.dumps(tools, ensure_ascii=False, indent=2) if tools is not None else None,
+                            image_path=image or None,
+                            response_text="".join(response_text_parts) or None,
+                            reasoning_text="".join(reasoning_text_parts) or None,
+                            tool_calls_json=json.dumps(list(streamed_tool_calls.values()), ensure_ascii=False, indent=2)
+                            if streamed_tool_calls
+                            else None,
+                            duration_ms=int((perf_counter() - started) * 1000),
+                            metadata_json=json.dumps(metadata, ensure_ascii=False, indent=2) if metadata else None,
+                        )
+                    )
+
+            return _wrapped_stream()
+        except Exception as exc:
+            self._write_current_response(
+                source=source,
+                model=model,
+                created_at=started_at,
+                response_text="".join(response_text_parts),
+                reasoning_text="".join(reasoning_text_parts),
+                status="error",
+                metadata=metadata,
+                error_text=str(exc),
+            )
+            self._log(
+                InteractionLogEntry(
+                    interaction_id=interaction_id,
+                    created_at=started_at,
+                    completed_at=datetime.now().isoformat(),
+                    source=source,
+                    model=model,
+                    messages_json=json.dumps(copy.deepcopy(messages), ensure_ascii=False, indent=2),
+                    tools_json=json.dumps(tools, ensure_ascii=False, indent=2) if tools is not None else None,
+                    image_path=image or None,
+                    error_text=str(exc),
+                    duration_ms=int((perf_counter() - started) * 1000),
+                    metadata_json=json.dumps(metadata, ensure_ascii=False, indent=2) if metadata else None,
+                )
+            )
+            raise
+
+    def _log(self, entry: InteractionLogEntry) -> None:
+        self.log_store.insert(entry)
+
+    def _write_current_response(
+        self,
+        *,
+        source: str,
+        model: str,
+        created_at: str,
+        response_text: str,
+        reasoning_text: str,
+        status: str,
+        metadata: Dict[str, Any],
+        error_text: str | None = None,
+    ) -> None:
+        if self.current_response_path is None:
+            return
+        lines = [
+            f"status: {status}",
+            f"created_at: {created_at}",
+            f"source: {source}",
+            f"model: {model}",
+        ]
+        if metadata:
+            lines.append(f"metadata: {json.dumps(metadata, ensure_ascii=False)}")
+        if error_text:
+            lines.extend(["", "## Error", error_text])
+        if reasoning_text:
+            lines.extend(["", "## Reasoning", reasoning_text])
+        lines.extend(["", "## Response", response_text or ""])
+        self.current_response_path.write_text("\n".join(lines), encoding="utf-8")

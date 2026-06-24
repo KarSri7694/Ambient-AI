@@ -1,6 +1,7 @@
 import logging
 from datetime import datetime, timedelta
 
+from application.services.interaction_trace import interaction_trace
 from application.services.llm_interaction_service import LLMInteractionService
 from core.models import TranscriptClassificationResult
 
@@ -50,9 +51,10 @@ class SimpleTaskExecutionService:
                 "If it is not safely doable as a simple task, use queue_night_task."
             )
 
-        return await self.llm_service.run_interaction(
-            user_input=user_input,
-            system_prompt=system_prompt,
-            model=model,
-            allowed_tool_names=self.ALLOWED_TOOL_NAMES,
-        )
+        with interaction_trace("simple_task_execution"):
+            return await self.llm_service.run_interaction(
+                user_input=user_input,
+                system_prompt=system_prompt,
+                model=model,
+                allowed_tool_names=self.ALLOWED_TOOL_NAMES,
+            )

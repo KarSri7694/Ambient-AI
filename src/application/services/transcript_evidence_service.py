@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Dict, List
 
 from application.ports.LLMProvider import LLMProvider
+from application.services.interaction_trace import interaction_trace
 from core.models import TranscriptEvidence, TranscriptParticipant, TranscriptTurn
 
 
@@ -108,22 +109,23 @@ Rules:
                 f"- {participant.speaker_label} => {participant.display_name}"
                 for participant in participants.values()
             ]
-            completion = await self.llm.chat_completion_stream(
-                model=model,
-                messages=[
-                    {"role": "system", "content": self.EXTRACTION_PROMPT},
-                    {
-                        "role": "user",
-                        "content": "Participants:\n"
-                        + "\n".join(participant_lines)
-                        + "\n\nTranscript turns:\n"
-                        + "\n".join(transcript_lines),
-                    },
-                ],
-                tools=None,
-                temperature=0.1,
-                top_p=0.9,
-            )
+            with interaction_trace("transcript_evidence"):
+                completion = await self.llm.chat_completion_stream(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": self.EXTRACTION_PROMPT},
+                        {
+                            "role": "user",
+                            "content": "Participants:\n"
+                            + "\n".join(participant_lines)
+                            + "\n\nTranscript turns:\n"
+                            + "\n".join(transcript_lines),
+                        },
+                    ],
+                    tools=None,
+                    temperature=0.1,
+                    top_p=0.9,
+                )
             response_text = await self._consume_stream_text(completion)
             parsed = self._parse_json_object(response_text)
             raw_items = parsed.get("evidence", [])

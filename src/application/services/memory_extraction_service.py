@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Dict, Iterable, List
 
 from application.ports.LLMProvider import LLMProvider
+from application.services.interaction_trace import interaction_trace
 from core.models import MemoryEvent, TranscriptParticipant, TranscriptTurn
 
 
@@ -102,16 +103,17 @@ Rules:
 
     async def _extract_with_llm(self, transcript_text: str, model: str) -> List[dict]:
         try:
-            completion = await self.llm.chat_completion_stream(
-                model=model,
-                messages=[
-                    {"role": "system", "content": self.EXTRACTION_PROMPT},
-                    {"role": "user", "content": transcript_text},
-                ],
-                tools=None,
-                temperature=0.1,
-                top_p=0.9,
-            )
+            with interaction_trace("memory_extraction"):
+                completion = await self.llm.chat_completion_stream(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": self.EXTRACTION_PROMPT},
+                        {"role": "user", "content": transcript_text},
+                    ],
+                    tools=None,
+                    temperature=0.1,
+                    top_p=0.9,
+                )
             response_text = await self._consume_stream_text(completion)
             return self._parse_json_array(response_text)
         except Exception as exc:

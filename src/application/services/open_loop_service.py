@@ -7,6 +7,7 @@ from typing import List, Optional
 
 from application.ports.LLMProvider import LLMProvider
 from application.ports.memory_port import MemoryPort
+from application.services.interaction_trace import interaction_trace
 from core.models import ConversationSession, OpenLoop, TranscriptEvidence
 
 
@@ -154,16 +155,17 @@ Rules:
                     for item in evidence_items
                 ],
             }
-            completion = await self.llm.chat_completion_stream(
-                model=model,
-                messages=[
-                    {"role": "system", "content": self.DECISION_PROMPT},
-                    {"role": "user", "content": json.dumps(payload, indent=2)},
-                ],
-                tools=None,
-                temperature=0.1,
-                top_p=0.9,
-            )
+            with interaction_trace("open_loop_decision"):
+                completion = await self.llm.chat_completion_stream(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": self.DECISION_PROMPT},
+                        {"role": "user", "content": json.dumps(payload, indent=2)},
+                    ],
+                    tools=None,
+                    temperature=0.1,
+                    top_p=0.9,
+                )
             text = await self._consume_stream_text(completion)
             parsed = self._parse_json_object(text)
             actions = parsed.get("actions", [])
