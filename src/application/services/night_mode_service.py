@@ -1,20 +1,15 @@
 import asyncio
 import logging
-from typing import Optional
 
-from application.ports.task_queue_port import TaskQueuePort
-from application.ports.task_provider_port import TaskProviderPort
 from application.ports.notification_port import NotificationPort
+from application.ports.task_provider_port import TaskProviderPort
+from application.ports.task_queue_port import TaskQueuePort
 from application.services.llm_interaction_service import LLMInteractionService
+from application.services.memory_consolidation_service import MemoryConsolidationService
 
 
 class NightModeService:
-    """
-    Orchestrates autonomous night-time task processing.
-
-    Processes queued night tasks, external provider tasks, and
-    monitors notifications — all through injected port abstractions.
-    """
+    """Orchestrate night tasks, notifications, and memory consolidation."""
 
     DEFAULT_NIGHT_PROMPT = (
         "You are an autonomous agent working through a list of night-time tasks. "
@@ -22,8 +17,8 @@ class NightModeService:
         "DO NOT use the `queue_night_task` tool here."
     )
 
-    SLEEP_INTERVAL = 30  # seconds between notification checks
-    MAX_IDLE_CYCLES = 3  # exit after this many consecutive empty notification checks
+    SLEEP_INTERVAL = 30
+    MAX_IDLE_CYCLES = 3
 
     def __init__(
         self,
@@ -31,6 +26,7 @@ class NightModeService:
         task_provider: TaskProviderPort,
         notification_port: NotificationPort,
         llm_service: LLMInteractionService,
+        memory_consolidator: MemoryConsolidationService | None = None,
         model: str = "",
         username: str = "",
     ):
@@ -38,6 +34,7 @@ class NightModeService:
         self.task_provider = task_provider
         self.notifications = notification_port
         self.llm_service = llm_service
+        self.memory_consolidator = memory_consolidator
         self.model = model
         self.logger = logging.getLogger(self.__class__.__name__)
 
@@ -51,7 +48,6 @@ class NightModeService:
             self.night_prompt = self.DEFAULT_NIGHT_PROMPT
 
     def _format_notifications(self) -> str:
-        """Fetch and format unread notifications into a string."""
         notifications = self.notifications.get_unread_notifications()
         if not notifications:
             return "No new notifications."
@@ -61,26 +57,18 @@ class NightModeService:
         return "\n".join(lines)
 
     async def run_night_loop(self) -> None:
-        """
-        Main night-mode loop:
-        1. Process queued night tasks
-        2. Process external provider tasks (Todoist)
-        3. Monitor for new notifications
-        4. Exit after MAX_IDLE_CYCLES with no new notifications
-        """
         self.logger.info("Late night execution mode started.")
         idle_count = 0
 
         while True:
             notifications_str = self._format_notifications()
 
-            # ── Process queued night tasks ────────────────────────
             pending = self.task_queue.get_pending_tasks()
             if not pending:
                 self.logger.info("No pending tasks found.")
             else:
                 for task in pending:
-                    self.logger.info(f"Processing night task ID {task.id}: {task.description}")
+                    self.logger.info("Processing night task ID %s: %s", task.id, task.description)
                     await self.llm_service.run_interaction(
                         user_input=f"{task.description}\n{notifications_str}",
                         system_prompt=self.night_prompt,
@@ -88,22 +76,32 @@ class NightModeService:
                     )
                     self.task_queue.mark_task_complete(task.id)
 
-            # ── Process external provider tasks ───────────────────
             try:
                 external_tasks = self.task_provider.get_tasks()
                 for ext_task in external_tasks:
                     task_desc = f"Task: {ext_task['content']}, ID: {ext_task['id']}"
-                    self.logger.info(f"Processing external task ID {ext_task['id']}: {ext_task['content']}")
+                    self.logger.info(
+                        "Processing external task ID %s: %s",
+                        ext_task["id"],
+                        ext_task["content"],
+                    )
                     await self.llm_service.run_interaction(
                         user_input=f"{task_desc}\n{notifications_str}",
                         system_prompt=self.night_prompt,
                         model=self.model,
                     )
                     self.task_provider.complete_task(ext_task["id"])
-            except Exception as e:
-                self.logger.error(f"Error processing external tasks: {e}")
+            except Exception as exc:
+                self.logger.error("Error processing external tasks: %s", exc)
 
-            # ── Monitor notifications ─────────────────────────────
+            if self.memory_consolidator is not None:
+                try:
+                    consolidated = self.memory_consolidator.consolidate()
+                    if consolidated:
+                        self.logger.info("Consolidated %s pending memory events.", consolidated)
+                except Exception as exc:
+                    self.logger.error("Error consolidating memory: %s", exc)
+
             notifications_str = self._format_notifications()
             if notifications_str == "No new notifications.":
                 idle_count += 1
@@ -117,10 +115,10 @@ class NightModeService:
 
             if idle_count >= self.MAX_IDLE_CYCLES:
                 self.logger.info(
-                    f"No new notifications for {self.MAX_IDLE_CYCLES} consecutive checks. "
-                    "Exiting night mode."
+                    "No new notifications for %s consecutive checks. Exiting night mode.",
+                    self.MAX_IDLE_CYCLES,
                 )
                 break
 
-            self.logger.info(f"Sleeping for {self.SLEEP_INTERVAL}s before next check...")
+            self.logger.info("Sleeping for %ss before next check...", self.SLEEP_INTERVAL)
             await asyncio.sleep(self.SLEEP_INTERVAL)

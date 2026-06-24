@@ -123,3 +123,72 @@ class Notification:
     id: int
     message: str
     source: str = "system"
+
+
+@dataclass(frozen=True)
+class SpeakerRecord:
+    """A durable speaker identity used by the memory system."""
+    speaker_id: str
+    display_name: str
+    source_label: str
+    voice_embedding_uid: Optional[int] = None
+    is_user: bool = False
+    created_at: str = ""
+    updated_at: str = ""
+
+
+@dataclass(frozen=True)
+class TranscriptTurn:
+    """A parsed speaker turn from a merged transcript file."""
+    speaker_label: str
+    text: str
+    start_time: Optional[float] = None
+    end_time: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class TranscriptParticipant:
+    """Resolved participant metadata for a transcript speaker label."""
+    speaker_label: str
+    speaker_id: str
+    display_name: str
+    confidence: float = 0.0
+
+
+@dataclass(frozen=True)
+class MemoryEvent:
+    """A candidate or consolidated memory event extracted from transcripts."""
+    event_id: str
+    speaker_id: str
+    source_type: str
+    source_ref: str
+    event_kind: str
+    content: str
+    confidence: float
+    status: str
+    created_at: str
+    consolidated_at: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class MemoryFact:
+    """A durable fact kept in long-term memory."""
+    fact_id: str
+    speaker_id: str
+    fact_text: str
+    topic: Optional[str] = None
+    valid_from: str = ""
+    valid_to: Optional[str] = None
+    superseded_by: Optional[str] = None
+    source_event_ids: List[str] = field(default_factory=list)
+    updated_at: str = ""
+
+
+@dataclass(frozen=True)
+class MemoryReflection:
+    """A stored summary generated during memory consolidation."""
+    reflection_id: str
+    speaker_id: Optional[str]
+    summary: str
+    created_at: str
+    source_event_ids: List[str] = field(default_factory=list)
