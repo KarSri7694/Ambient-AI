@@ -225,49 +225,20 @@ class AudioAgentService:
         return self.transcription_queue
     
     def _process_uploads(self):
-        IDLE_TIMEOUT = 20
-        idle_elapsed = 0
-        CHECK_INTERVAL = 5
-        self.audio_active_event.set()
-        self.llm_active_event.clear()
-        logging.info("Audio pipeline is active")
+        logging.info("Audio pipeline is idle, waiting for uploads.")
         while True:
-            if self.llm_active_event.is_set():
-                if self.audio_active_event.is_set():
-                    self.audio_active_event.clear()
-                    logging.info("LLM pipeline active, audio pipeline waiting...")
-                idle_elapsed = 0
-                while self.llm_active_event.is_set():
-                    time.sleep(CHECK_INTERVAL)
-                idle_elapsed = 0
-                continue
-
             try:
-                file_path = self.processing_queue.get(timeout=CHECK_INTERVAL)
-                idle_elapsed = 0
+                file_path = self.processing_queue.get(timeout=1)
             except queue.Empty:
-                if self.audio_active_event.is_set():
-                    idle_elapsed += CHECK_INTERVAL
-                    logging.warning(
-                        f"No files received. "
-                        f"Idle for {idle_elapsed}s / {IDLE_TIMEOUT}s before audio agent shutdown."
-                    )
-                    if idle_elapsed >= IDLE_TIMEOUT:
-                        logging.info(f"Audio pipeline idle for {IDLE_TIMEOUT}s. Shutting down audio agent.")
-                        idle_elapsed = 0
-                        self.audio_active_event.clear()
-                else:
-                    idle_elapsed = 0
                 continue
 
             if file_path is None:
                 self.processing_queue.task_done()
                 break
 
-            if not self.audio_active_event.is_set():
-                self.audio_active_event.set()
-                logging.info("Audio Pipeline is active, Ambient Agent will Wait")
-            idle_elapsed = 0
+            self.audio_active_event.set()
+            self.llm_active_event.clear()
+            logging.info("Audio file received. ASR pipeline is active.")
 
             try:
                 with self.gpu_lock:
@@ -278,7 +249,9 @@ class AudioAgentService:
                 logging.exception(f"Failed to process file: {file_path}")
             finally:
                 self.audio_agent.release_all_models()
+                self.audio_active_event.clear()
                 self.processing_queue.task_done()
+                logging.info("ASR pipeline finished. Returning to idle wait.")
         self.audio_active_event.clear()
     
     def start_service(self):
