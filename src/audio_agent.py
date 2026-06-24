@@ -35,6 +35,7 @@ VOICE_DB = "database/voice_database.db"
 TRANSCRIPTIONS_DIR = USER_DATA_DIR / "transcriptions"
 HIN2HINGLISH = "Hin2Hinglish-ct2/"
 CLEANED_AUDIO_DIR = USER_DATA_DIR / "cleaned_audio"
+TEMP_AUDIO_DIR = USER_DATA_DIR / "temp_audio"
 
 HF_TOKEN = os.getenv("HF_TOKEN", None)
 MIN_TIME_THRESHOLD = 0.2 #seconds
@@ -48,6 +49,9 @@ if not TRANSCRIPTIONS_DIR.exists():
 if not CLEANED_AUDIO_DIR.exists():
     CLEANED_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
+if not TEMP_AUDIO_DIR.exists():
+    TEMP_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+
 class AudioAgent:
     def __init__(self, transcription_queue: queue.Queue):
         self.preprocessor = None
@@ -57,7 +61,7 @@ class AudioAgent:
         self.transcription_queue = transcription_queue
 
     def preprocess_audio(self, audio_file_path):
-        self.preprocessor = AudioPreprocessor()
+        self.preprocessor = AudioPreprocessor(temp_audio_dir=str(TEMP_AUDIO_DIR), cleaned_audio_dir=str(CLEANED_AUDIO_DIR))
         return self.preprocessor.run(audio_file_path)
     
     def transcribe_audio(self, audio_file_path: str, vad_filter: bool, word_timestamps: bool, batch_size: int = 8)-> list[TranscriptionResult]:

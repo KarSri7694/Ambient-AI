@@ -17,7 +17,7 @@ class AudioPreprocessor:
     """
     A class to preprocess audio files by converting them to WAV, reducing noise, and normalizing loudness.
     """
-    def __init__(self, temp_audio_dir="temp_audio",isSample=False):
+    def __init__(self, temp_audio_dir="temp_audio",isSample=False, cleaned_audio_dir="cleaned_audio"):
         """
         Initializes the AudioPreprocessor with specified directories and model.
 
@@ -31,7 +31,7 @@ class AudioPreprocessor:
         self.TEMP_AUDIO_DIR = temp_audio_dir
         self.isSample = isSample
         self.VOICE_SAMPLES_DIR = "voice_samples"
-        self.OUTPUT_DIR = "cleaned_audio"
+        self.OUTPUT_DIR = cleaned_audio_dir
         self.CONVERTED_SUFFIX = "_converted"
         self.NOISE_REDUCED_SUFFIX = "_cleaned"
         self.NORMALIZED_SUFFIX = "_final"
