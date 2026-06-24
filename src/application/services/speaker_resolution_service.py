@@ -23,26 +23,37 @@ class SpeakerResolutionService:
         for raw_label in speaker_labels:
             normalized_label, confidence = self._normalize_label(raw_label)
             speaker = None
+            durable = True
 
             if not self._is_raw_diarization_label(normalized_label):
                 speaker = self.memory.find_speaker_by_display_name(normalized_label)
 
             if speaker is None:
-                display_name = normalized_label
-                if self._is_raw_diarization_label(display_name):
-                    display_name = f"{display_name} @ {source_ref}"
-                speaker = self.memory.upsert_speaker(
-                    display_name=display_name,
-                    source_label=raw_label,
-                    is_user=self._is_user_label(normalized_label),
-                )
+                if self._is_raw_diarization_label(normalized_label):
+                    durable = False
+                else:
+                    speaker = self.memory.upsert_speaker(
+                        display_name=normalized_label,
+                        source_label=raw_label,
+                        is_user=self._is_user_label(normalized_label),
+                    )
 
-            resolved[raw_label] = TranscriptParticipant(
-                speaker_label=raw_label,
-                speaker_id=speaker.speaker_id,
-                display_name=speaker.display_name,
-                confidence=confidence,
-            )
+            if durable and speaker is not None:
+                resolved[raw_label] = TranscriptParticipant(
+                    speaker_label=raw_label,
+                    speaker_id=speaker.speaker_id,
+                    display_name=speaker.display_name,
+                    confidence=confidence,
+                    durable=True,
+                )
+            else:
+                resolved[raw_label] = TranscriptParticipant(
+                    speaker_label=raw_label,
+                    speaker_id=f"transient:{source_ref}:{normalized_label.lower()}",
+                    display_name=normalized_label,
+                    confidence=confidence,
+                    durable=False,
+                )
         return resolved
 
     def _normalize_label(self, raw_label: str) -> tuple[str, float]:

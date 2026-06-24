@@ -70,7 +70,11 @@ Rules:
                 extracted = llm_items
         evidence: List[TranscriptEvidence] = []
         for turn, extracted_item in zip(turns, extracted):
-            participant = participants.get(extracted_item.get("speaker_label", turn.speaker_label))
+            participant = self._resolve_participant(
+                turn=turn,
+                extracted_item=extracted_item,
+                participants=participants,
+            )
             if participant is None:
                 continue
             evidence.append(
@@ -78,7 +82,7 @@ Rules:
                     evidence_id=uuid.uuid4().hex,
                     source_ref=source_ref,
                     speaker_id=participant.speaker_id,
-                    speaker_label=extracted_item.get("speaker_label", turn.speaker_label),
+                    speaker_label=turn.speaker_label,
                     session_id=session_id,
                     signal_type=str(extracted_item.get("signal_type", "context")).strip() or "context",
                     content=str(extracted_item.get("content", turn.text)).strip() or turn.text,
@@ -91,6 +95,18 @@ Rules:
                     ),
                     created_at=created_at,
                 )
+            )
+        if not evidence and turns:
+            self.logger.warning(
+                "LLM evidence extraction produced zero usable items for %s; falling back to heuristic alignment.",
+                source_ref,
+            )
+            return await self.extract(
+                turns=turns,
+                participants=participants,
+                source_ref=source_ref,
+                session_id=session_id,
+                model="",
             )
         return evidence
 
@@ -234,3 +250,30 @@ Rules:
             return max(0.05, min(0.98, float(value)))
         except (TypeError, ValueError):
             return fallback
+
+    def _resolve_participant(
+        self,
+        *,
+        turn: TranscriptTurn,
+        extracted_item: dict,
+        participants: Dict[str, TranscriptParticipant],
+    ) -> TranscriptParticipant | None:
+        direct = participants.get(turn.speaker_label)
+        if direct is not None:
+            return direct
+
+        llm_label = str(extracted_item.get("speaker_label", "")).strip()
+        if llm_label:
+            direct = participants.get(llm_label)
+            if direct is not None:
+                return direct
+            normalized_llm = self._normalize_label(llm_label)
+            for raw_label, participant in participants.items():
+                if self._normalize_label(raw_label) == normalized_llm:
+                    return participant
+        return None
+
+    def _normalize_label(self, label: str) -> str:
+        label = label.strip().lower()
+        label = re.sub(r"\s*-\s*\[\d+(?:\.\d+)?%\]\s*$", "", label)
+        return " ".join(label.split())

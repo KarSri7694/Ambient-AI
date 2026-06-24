@@ -23,6 +23,7 @@ from application.services.simple_task_execution_service import SimpleTaskExecuti
 from application.services.speaker_resolution_service import SpeakerResolutionService
 from application.services.transcript_evidence_service import TranscriptEvidenceService
 from application.services.transcript_classification_service import TranscriptClassificationService
+from application.services.transcript_normalization_service import TranscriptNormalizationService
 from application.services.open_loop_service import OpenLoopService
 from application.services.user_profile_service import UserProfileService
 from audio_agent import AudioAgentService
@@ -44,7 +45,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 API_BASE_URL = "http://localhost:8080"
-DEFAULT_MODEL = "Qwen-3.5-9B-Q4_K_M"
+DEFAULT_MODEL = "Qwen-3.5-9B-Fable-Distilled-Q4_K_M"
 MCP_CONFIG_PATH = "mcp.json"
 PROJECT_ROOT = Path(__file__).parent.parent
 PROMPTS_ROOT = PROJECT_ROOT / "prompts"
@@ -139,15 +140,21 @@ class TranscriptionService:
         )
         if processed:
             logger.info("Processed %s proactive research topics during idle.", processed)
-        reflection_actions = await ambient_reflection.reflect(
+        reflection_result = await ambient_reflection.reflect_with_metadata(
             model=DEFAULT_MODEL,
             recent_context=memory_store.get_recent_context(),
         )
-        if reflection_actions:
+        if not reflection_result.llm_invoked:
             logger.info(
-                "Ambient reflection produced %s action(s): %s",
-                len(reflection_actions),
-                ", ".join(action.action_type for action in reflection_actions),
+                "Ambient reflection skipped: no candidates (candidate_count=%s).",
+                reflection_result.candidate_count,
+            )
+        else:
+            logger.info(
+                "Ambient reflection invoked with %s candidate(s) and produced %s action(s): %s",
+                reflection_result.candidate_count,
+                len(reflection_result.actions),
+                ", ".join(action.action_type for action in reflection_result.actions),
             )
 
     def _build_services(self):
@@ -182,6 +189,7 @@ class TranscriptionService:
             memory=memory_store,
             prompts_root=str(PROMPTS_ROOT),
         )
+        transcript_normalizer = TranscriptNormalizationService(llm_provider=logged_llm)
         speaker_resolution = SpeakerResolutionService(memory=memory_store)
         classifier = TranscriptClassificationService(llm_provider=logged_llm)
         evidence_service = TranscriptEvidenceService(llm_provider=logged_llm)
@@ -221,6 +229,7 @@ class TranscriptionService:
             memory_store,
             research_vault,
             memory_context_builder,
+            transcript_normalizer,
             speaker_resolution,
             classifier,
             evidence_service,
@@ -242,6 +251,7 @@ class TranscriptionService:
         proactive_topic_detector: ProactiveTopicDetectionService,
         memory_store: SQLiteMemoryAdapter,
         memory_context_builder: MemoryContextBuilder,
+        transcript_normalizer: TranscriptNormalizationService,
         speaker_resolution: SpeakerResolutionService,
         classifier: TranscriptClassificationService,
         evidence_service: TranscriptEvidenceService,
@@ -252,6 +262,14 @@ class TranscriptionService:
         content: str,
         transcript_path: str,
     ):
+        normalized_content = await transcript_normalizer.normalize(
+            content,
+            model=DEFAULT_MODEL,
+        )
+        if normalized_content.strip() and normalized_content != content:
+            logger.info("Transcript normalized for %s before downstream processing.", transcript_path)
+            content = normalized_content
+            Path(transcript_path).write_text(content, encoding="utf-8")
         turns = classifier.parse_transcript(content)
         if not turns:
             logger.info("No parsed turns found in transcript %s.", transcript_path)
@@ -268,12 +286,21 @@ class TranscriptionService:
         )
         session = await session_tracker.attach_to_session(evidence_items, model=DEFAULT_MODEL)
         evidence_items = [replace(item, session_id=session.session_id) for item in evidence_items]
-        for item in evidence_items:
+        durable_participants = {
+            participant.speaker_label: participant
+            for participant in participants.values()
+            if participant.durable
+        }
+        durable_evidence_items = [
+            item for item in evidence_items
+            if participants.get(item.speaker_label) is not None and participants[item.speaker_label].durable
+        ]
+        for item in durable_evidence_items:
             memory_store.append_evidence(item)
         session_tracker.refresh_digest()
         open_loops = await open_loop_service.process(
             session=session,
-            evidence_items=evidence_items,
+            evidence_items=durable_evidence_items,
             model=DEFAULT_MODEL,
         )
         if open_loops:
@@ -281,7 +308,7 @@ class TranscriptionService:
         user_speaker = user_profile_service.infer_user_speaker()
         facets = await user_profile_service.update_from_evidence(
             user_speaker=user_speaker,
-            evidence_items=evidence_items,
+            evidence_items=durable_evidence_items,
             model=DEFAULT_MODEL,
         )
         if facets:
@@ -319,7 +346,7 @@ class TranscriptionService:
                 notification_store=notification_store,
                 proactive_topic_detector=proactive_topic_detector,
                 memory_store=memory_store,
-                participants=participants,
+                participants=durable_participants,
                 simple_executor=simple_executor,
                 executor_prompt=executor_prompt,
             )
@@ -431,6 +458,7 @@ class TranscriptionService:
             memory_store,
             research_vault,
             memory_context_builder,
+            transcript_normalizer,
             speaker_resolution,
             classifier,
             evidence_service,
@@ -498,6 +526,7 @@ class TranscriptionService:
                                 proactive_topic_detector=proactive_topic_detector,
                                 memory_store=memory_store,
                                 memory_context_builder=memory_context_builder,
+                                transcript_normalizer=transcript_normalizer,
                                 speaker_resolution=speaker_resolution,
                                 classifier=classifier,
                                 evidence_service=evidence_service,

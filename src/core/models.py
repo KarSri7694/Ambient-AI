@@ -153,6 +153,7 @@ class TranscriptParticipant:
     speaker_id: str
     display_name: str
     confidence: float = 0.0
+    durable: bool = True
 
 
 @dataclass(frozen=True)

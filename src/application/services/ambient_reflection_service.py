@@ -63,6 +63,17 @@ Rules:
 - DISMISS_ITEM payload should include: agenda_id or candidate_id.
 """
 
+    class ReflectionRunResult:
+        def __init__(
+            self,
+            actions: List[AmbientReflectionAction],
+            candidate_count: int,
+            llm_invoked: bool,
+        ):
+            self.actions = actions
+            self.candidate_count = candidate_count
+            self.llm_invoked = llm_invoked
+
     def __init__(
         self,
         llm_service: LLMInteractionService,
@@ -84,6 +95,10 @@ Rules:
         self.logger = logger or logging.getLogger(self.__class__.__name__)
 
     async def reflect(self, model: str, recent_context: str) -> List[AmbientReflectionAction]:
+        result = await self.reflect_with_metadata(model=model, recent_context=recent_context)
+        return result.actions
+
+    async def reflect_with_metadata(self, model: str, recent_context: str) -> ReflectionRunResult:
         facts = self._all_facts()
         open_items = self.agenda.list_items(statuses=["open", "surfaced"], limit=50)
         topics = self.topic_queue.list_topics(statuses=["pending", "completed"], limit=50)
@@ -99,14 +114,22 @@ Rules:
             limit=8,
         )
         if not candidates:
-            return [AmbientReflectionAction(action_type="NOTHING", payload={})]
+            return self.ReflectionRunResult(
+                actions=[AmbientReflectionAction(action_type="NOTHING", payload={})],
+                candidate_count=0,
+                llm_invoked=False,
+            )
 
         parsed_actions = await self._request_actions(
             model=model,
             recent_context=recent_context,
             candidates=candidates,
         )
-        return self._apply_actions(parsed_actions, candidates)
+        return self.ReflectionRunResult(
+            actions=self._apply_actions(parsed_actions, candidates),
+            candidate_count=len(candidates),
+            llm_invoked=True,
+        )
 
     async def _request_actions(
         self,
