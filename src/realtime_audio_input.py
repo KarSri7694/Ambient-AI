@@ -25,7 +25,7 @@ class RealTimeAudioInputService:
         channels: int = 1,
         chunk: int = 512,
         pre_roll_ms: int = 400,
-        uploads_dir: str = "uploads",
+        uploads_dir: str = os.environ.get("USER_DATA_DIR", "D:\\USER_DATA") + "\\uploads",
         threshold: float = 0.7,
         min_silence_duration_ms: int = 2000,
         input_device_index: int | None = None,
@@ -283,7 +283,7 @@ class RealTimeAudioInputService:
 
 def main():
     """Instantiate RealTimeAudioInputService and start live audio recording."""
-    audio_input = RealTimeAudioInputService(min_silence_duration_ms=5000)
+    audio_input = RealTimeAudioInputService(min_silence_duration_ms=2000, threshold=0.7, pre_roll_ms=1500)
     audio_input.start_recording()
 
 
