@@ -16,6 +16,8 @@ import night_mode
 from utils.threading_util import run_async
 import yt_dlp
 from infrastructure.adapter.llamaCppAdapter import LlamaCppAdapter
+import csv
+import subprocess
 
 mcp = FastMCP("My MCP Server")
 
@@ -25,6 +27,32 @@ SERPAPI_API_KEY = os.environ.get("SERPAPI_API_KEY")
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 SCOPES = ['https://www.googleapis.com/auth/calendar.events']
+
+
+def read_model_details() -> list[dict[str, str]]:
+    """Load model metadata from the project-local model registry."""
+    details_path = os.path.join("D:\\Projects\\ambient_ai", "model_details.csv")
+    models: list[dict[str, str]] = []
+    if not os.path.exists(details_path):
+        return models
+
+    with open(details_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            if ":" in line:
+                name, description = line.split(":", 1)
+                models.append({
+                    "name": name.strip(),
+                    "description": description.strip(),
+                })
+            else:
+                models.append({
+                    "name": line,
+                    "description": "",
+                })
+    return models
 
 def connect_facts_db():
     db_path = os.path.join("D:\\Projects\\ambient_ai\\database", "facts.db")
@@ -248,24 +276,79 @@ def download_youtube_video(
         night_mode.add_notification(completion_msg)
         return f"❌ Download error: {e}"
 
-@mcp.tool(enabled=True)
-def save_state():
+@mcp.tool()
+def powershell_terminal(
+    command: Annotated[str, "A PowerShell command to run"],
+) -> str:
     """
-    Save the current state of the LLM (e.g., KV cache) for later restoration.
+    Run a PowerShell command. returns stdout/stderr.
     """
-    try:
-        llm_adapter = LlamaCppAdapter(base_url="http://localhost:8080")
-        models = requests.get(llm_adapter.api_uri_v1 + "/models").json()
-        for model in models.get("data", []):
-            if model.get("status", {}).get("value") == "loaded":
-                LlamaCppAdapter.currently_loaded_model = model.get("id")
-                break
-        save_path = llm_adapter.save_current_kv_state()
-        if save_path is None:
-            return "Error saving state: llama.cpp rejected the slot save request."
-        return f"State save requested successfully: {save_path.name}"
-    except Exception as e:
-        return f"Error saving state: {e}"
+    blocked_tokens = [
+        "remove-item",
+        "del ",
+        "rmdir ",
+        "format ",
+        "git reset",
+        "git checkout --",
+    ]
+    normalized = command.lower()
+    if any(token in normalized for token in blocked_tokens):
+        return "Blocked command."
 
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", command],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            cwd=r"D:\Projects\ambient_ai",
+        )
+    except subprocess.TimeoutExpired:
+        return "Command timed out after 30 seconds."
+    except Exception as e:
+        return f"Terminal execution error: {e}"
+
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+    combined_output = stdout
+    if stderr:
+        combined_output = f"{stdout}\n{stderr}".strip()
+
+    if result.returncode != 0:
+        return (
+            f"Command failed with exit code {result.returncode}.\n"
+            f"{combined_output or 'No output returned.'}"
+        )
+    return combined_output or "Command completed with no output."
+
+@mcp.tool()
+def list_available_models() -> dict:
+    """
+    List the available local models and their intended use cases.
+    Call this before load_agent. Do not invent model names.
+    """
+    models = read_model_details()
+    return {
+        "models": models,
+        "count": len(models),
+    }
+
+@mcp.tool(enabled=True)
+async def restore_previous_agent(message_to_agent: Annotated[str, "Message to the agent about the task and the  detailed summary of the task you performed"]):
+    """
+    Restore the LLM state from the most recently saved state.
+    """
+    # This tool is implemented directly in the LLMInteractionService to ensure the message history is properly handled during the model restoration.
+    pass
+    
+@mcp.tool(enabled=True)
+def load_agent(model_name: Annotated[str, "The name of the model to load"], message: Annotated[str, "Task to be performed by the model"]) -> str:
+    """
+    Load a different specialised model and perform a task with it.
+    Call list_available_models first and use one of the exact returned model names.
+    """
+    # This tool is implemented directly in the LLMInteractionService to ensure the message history is properly handled during the model switch.
+    pass
+    
 if __name__ == "__main__":
     mcp.run()
