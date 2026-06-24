@@ -28,15 +28,25 @@ class LLMInteractionService:
 
     AGENT_DEPTH = 0
     MAX_AGENT_DEPTH = 3
-    MAX_ITERATIONS = 10
-    TERMINAL_TOOL_NAMES = {}
+    MAX_ITERATIONS = 25
+    TERMINAL_TOOL_NAMES = {"restore_previous_agent"}
     PARENT_DIR = Path(__file__).parent.parent.parent.parent
     kv_state_dir = PARENT_DIR / "model_kv_states"
     kv_control = KVStateControl(kv_state_dir)
     
     AGENT_PROMPT = (
-        "Your goal is to complete the given user task and after the task is "
-        "completed, call the restore_previous_agent tool."
+        "You are a deployed sub-agent working on a delegated task.\n"
+        "\n"
+        "Rules:\n"
+        "- Complete only the delegated task.\n"
+        "- Do not plan broadly, do not reframe the task, and do not restate tool inventories.\n"
+        "- Do not call load_agent.\n"
+        "- Do not call list_available_models.\n"
+        "- Do not try to spawn another agent unless the delegated task explicitly requires it and the tool is available.\n"
+        "- If the task can be completed directly from your own knowledge or the currently available context, do it directly.\n"
+        "- Use other tools only if they are strictly necessary to complete the delegated task.\n"
+        "- When the task is complete, immediately call restore_previous_agent exactly once.\n"
+        "- In message_to_agent, return only the concrete result of the delegated task, with no extra planning.\n"
     )
     
     def __init__(self, llm_provider: LLMProvider, tool_bridge: ToolBridgePort):
@@ -322,6 +332,7 @@ class LLMInteractionService:
                             "content": response_content,
                         })
                         continue
+                    parent_model_name = self.llm.get_current_model() or self._frame.model
                     model_name = tool_args.get("model_name")
                     available_model_names = self._get_available_model_names()
                     if not model_name:
@@ -353,7 +364,7 @@ class LLMInteractionService:
                             "content": response_content,
                         })
                         continue
-                    await self.llm.save_and_unload(self._frame.messages)
+                    saved_parent_kv_state = await self.llm.save_and_unload(self._frame.messages)
                     await self.llm.load_model(model_name)
                     self._push_frame(model=model_name, depth=agent_depth + 1)
                     try:
@@ -365,6 +376,19 @@ class LLMInteractionService:
                         )
                     finally:
                         self._pop_frame()
+
+                    current_model_name = self.llm.get_current_model()
+                    if parent_model_name and current_model_name != parent_model_name:
+                        self.logger.info(
+                            "Sub-agent returned without restoring parent state; recovering parent model %s.",
+                            parent_model_name,
+                        )
+                        if current_model_name:
+                            await self.llm.unload_model()
+                        if saved_parent_kv_state is not None:
+                            await self.llm.load_and_restore()
+                        else:
+                            await self.llm.load_model(parent_model_name)
                     response_content = child_result
                 elif tool_name == "restore_previous_agent":
                     response_content = f"Agent task completed. Restoring previous agent."
@@ -373,8 +397,9 @@ class LLMInteractionService:
                     if messages_path.exists():
                         with open(messages_path, "r") as f:
                             messages = json.load(f)
-                        self._frame.messages = list(messages)
-                        self._frame.messages.append({
+                        target_frame = self._frame_stack[-2] if len(self._frame_stack) > 1 else self._frame
+                        target_frame.messages = list(messages)
+                        target_frame.messages.append({
                             "role": "assistant",
                             "content": f"[Sub-Agent] Deployed sub-agent has worked on the given task and returned the following result: {tool_args.get('message_to_agent', '')}."
                         })
