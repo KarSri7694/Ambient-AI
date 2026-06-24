@@ -69,6 +69,15 @@ def get_unread_notifications():
     conn.close()
     return [dict(row) for row in rows]
 
+def peek_unread_notifications():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM system_notifications WHERE read=0 ORDER BY created_at ASC")
+    rows = c.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
 def mark_notification_read(notification_id):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
