@@ -7,7 +7,16 @@ from pathlib import Path
 from typing import List, Optional
 
 from application.ports.memory_port import MemoryPort
-from core.models import MemoryEvent, MemoryFact, MemoryReflection, SpeakerRecord
+from core.models import (
+    ConversationSession,
+    MemoryEvent,
+    MemoryFact,
+    MemoryReflection,
+    OpenLoop,
+    SpeakerRecord,
+    TranscriptEvidence,
+    UserProfileFacet,
+)
 
 
 class SQLiteMemoryAdapter(MemoryPort):
@@ -18,6 +27,8 @@ class SQLiteMemoryAdapter(MemoryPort):
         self.memory_root = Path(memory_root)
         self.speakers_dir = self.memory_root / "speakers"
         self.recent_context_path = self.memory_root / "recent_context.md"
+        self.session_digest_path = self.memory_root / "session_digest.md"
+        self.open_loop_digest_path = self.memory_root / "open_loops.md"
         self.index_path = self.memory_root / "index.json"
 
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -101,6 +112,79 @@ class SQLiteMemoryAdapter(MemoryPort):
                 )
                 """
             )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS transcript_evidence (
+                    evidence_id TEXT PRIMARY KEY,
+                    source_ref TEXT NOT NULL,
+                    speaker_id TEXT NOT NULL,
+                    speaker_label TEXT NOT NULL,
+                    session_id TEXT,
+                    signal_type TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    normalized_entities TEXT NOT NULL,
+                    time_hints TEXT NOT NULL,
+                    action_hints TEXT NOT NULL,
+                    trust_score REAL NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (speaker_id) REFERENCES speakers (speaker_id)
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS conversation_sessions (
+                    session_id TEXT PRIMARY KEY,
+                    started_at TEXT NOT NULL,
+                    ended_at TEXT NOT NULL,
+                    participant_ids TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    topic_summary TEXT NOT NULL,
+                    entity_summary TEXT NOT NULL,
+                    recent_turn_summary TEXT NOT NULL,
+                    last_activity_at TEXT NOT NULL,
+                    continuation_score REAL NOT NULL,
+                    derived_loop_ids TEXT NOT NULL
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS open_loops (
+                    loop_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    loop_type TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    owner_speaker_id TEXT NOT NULL,
+                    source_session_id TEXT NOT NULL,
+                    supporting_event_ids TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    urgency REAL NOT NULL,
+                    due_hint TEXT,
+                    next_action_hint TEXT,
+                    last_updated_at TEXT NOT NULL,
+                    resolution_summary TEXT,
+                    FOREIGN KEY (owner_speaker_id) REFERENCES speakers (speaker_id)
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_profile_facets (
+                    facet_id TEXT PRIMARY KEY,
+                    speaker_id TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    strength INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    source_event_ids TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (speaker_id) REFERENCES speakers (speaker_id)
+                )
+                """
+            )
     def _now(self) -> str:
         return datetime.now().isoformat()
 
@@ -141,6 +225,68 @@ class SQLiteMemoryAdapter(MemoryPort):
             valid_from=row["valid_from"],
             valid_to=row["valid_to"],
             superseded_by=row["superseded_by"],
+            source_event_ids=json.loads(row["source_event_ids"]),
+            updated_at=row["updated_at"],
+        )
+
+    def _evidence_from_row(self, row: sqlite3.Row) -> TranscriptEvidence:
+        return TranscriptEvidence(
+            evidence_id=row["evidence_id"],
+            source_ref=row["source_ref"],
+            speaker_id=row["speaker_id"],
+            speaker_label=row["speaker_label"],
+            session_id=row["session_id"],
+            signal_type=row["signal_type"],
+            content=row["content"],
+            normalized_entities=json.loads(row["normalized_entities"]),
+            time_hints=json.loads(row["time_hints"]),
+            action_hints=json.loads(row["action_hints"]),
+            trust_score=float(row["trust_score"]),
+            created_at=row["created_at"],
+        )
+
+    def _session_from_row(self, row: sqlite3.Row) -> ConversationSession:
+        return ConversationSession(
+            session_id=row["session_id"],
+            started_at=row["started_at"],
+            ended_at=row["ended_at"],
+            participant_ids=json.loads(row["participant_ids"]),
+            status=row["status"],
+            topic_summary=row["topic_summary"],
+            entity_summary=row["entity_summary"],
+            recent_turn_summary=row["recent_turn_summary"],
+            last_activity_at=row["last_activity_at"],
+            continuation_score=float(row["continuation_score"]),
+            derived_loop_ids=json.loads(row["derived_loop_ids"]),
+        )
+
+    def _loop_from_row(self, row: sqlite3.Row) -> OpenLoop:
+        return OpenLoop(
+            loop_id=row["loop_id"],
+            title=row["title"],
+            loop_type=row["loop_type"],
+            status=row["status"],
+            owner_speaker_id=row["owner_speaker_id"],
+            source_session_id=row["source_session_id"],
+            supporting_event_ids=json.loads(row["supporting_event_ids"]),
+            confidence=float(row["confidence"]),
+            urgency=float(row["urgency"]),
+            due_hint=row["due_hint"],
+            next_action_hint=row["next_action_hint"],
+            last_updated_at=row["last_updated_at"],
+            resolution_summary=row["resolution_summary"],
+        )
+
+    def _facet_from_row(self, row: sqlite3.Row) -> UserProfileFacet:
+        return UserProfileFacet(
+            facet_id=row["facet_id"],
+            speaker_id=row["speaker_id"],
+            category=row["category"],
+            title=row["title"],
+            summary=row["summary"],
+            confidence=float(row["confidence"]),
+            strength=int(row["strength"]),
+            status=row["status"],
             source_event_ids=json.loads(row["source_event_ids"]),
             updated_at=row["updated_at"],
         )
@@ -369,3 +515,205 @@ class SQLiteMemoryAdapter(MemoryPort):
 
     def save_recent_context(self, content: str) -> None:
         self.recent_context_path.write_text(content, encoding="utf-8")
+
+    def append_evidence(self, evidence: TranscriptEvidence) -> None:
+        with self._managed_connection() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO transcript_evidence (
+                    evidence_id, source_ref, speaker_id, speaker_label, session_id,
+                    signal_type, content, normalized_entities, time_hints, action_hints,
+                    trust_score, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    evidence.evidence_id,
+                    evidence.source_ref,
+                    evidence.speaker_id,
+                    evidence.speaker_label,
+                    evidence.session_id,
+                    evidence.signal_type,
+                    evidence.content,
+                    json.dumps(evidence.normalized_entities),
+                    json.dumps(evidence.time_hints),
+                    json.dumps(evidence.action_hints),
+                    evidence.trust_score,
+                    evidence.created_at,
+                ),
+            )
+
+    def get_recent_evidence(
+        self,
+        speaker_ids: Optional[List[str]] = None,
+        limit: int = 20,
+    ) -> List[TranscriptEvidence]:
+        query = "SELECT * FROM transcript_evidence"
+        params: List[object] = []
+        if speaker_ids:
+            placeholders = ", ".join("?" for _ in speaker_ids)
+            query += f" WHERE speaker_id IN ({placeholders})"
+            params.extend(speaker_ids)
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        with self._managed_connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [self._evidence_from_row(row) for row in rows]
+
+    def upsert_session(self, session: ConversationSession) -> ConversationSession:
+        with self._managed_connection() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO conversation_sessions (
+                    session_id, started_at, ended_at, participant_ids, status,
+                    topic_summary, entity_summary, recent_turn_summary, last_activity_at,
+                    continuation_score, derived_loop_ids
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session.session_id,
+                    session.started_at,
+                    session.ended_at,
+                    json.dumps(session.participant_ids),
+                    session.status,
+                    session.topic_summary,
+                    session.entity_summary,
+                    session.recent_turn_summary,
+                    session.last_activity_at,
+                    session.continuation_score,
+                    json.dumps(session.derived_loop_ids),
+                ),
+            )
+        return session
+
+    def get_session(self, session_id: str) -> Optional[ConversationSession]:
+        with self._managed_connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM conversation_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        return self._session_from_row(row) if row else None
+
+    def list_sessions(self, statuses: Optional[List[str]] = None, limit: int = 20) -> List[ConversationSession]:
+        query = "SELECT * FROM conversation_sessions"
+        params: List[object] = []
+        if statuses:
+            placeholders = ", ".join("?" for _ in statuses)
+            query += f" WHERE status IN ({placeholders})"
+            params.extend(statuses)
+        query += " ORDER BY last_activity_at DESC LIMIT ?"
+        params.append(limit)
+        with self._managed_connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [self._session_from_row(row) for row in rows]
+
+    def upsert_open_loop(self, loop: OpenLoop) -> OpenLoop:
+        with self._managed_connection() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO open_loops (
+                    loop_id, title, loop_type, status, owner_speaker_id, source_session_id,
+                    supporting_event_ids, confidence, urgency, due_hint, next_action_hint,
+                    last_updated_at, resolution_summary
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    loop.loop_id,
+                    loop.title,
+                    loop.loop_type,
+                    loop.status,
+                    loop.owner_speaker_id,
+                    loop.source_session_id,
+                    json.dumps(loop.supporting_event_ids),
+                    loop.confidence,
+                    loop.urgency,
+                    loop.due_hint,
+                    loop.next_action_hint,
+                    loop.last_updated_at,
+                    loop.resolution_summary,
+                ),
+            )
+        return loop
+
+    def get_open_loop(self, loop_id: str) -> Optional[OpenLoop]:
+        with self._managed_connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM open_loops WHERE loop_id = ?",
+                (loop_id,),
+            ).fetchone()
+        return self._loop_from_row(row) if row else None
+
+    def list_open_loops(self, statuses: Optional[List[str]] = None, limit: int = 20) -> List[OpenLoop]:
+        query = "SELECT * FROM open_loops"
+        params: List[object] = []
+        if statuses:
+            placeholders = ", ".join("?" for _ in statuses)
+            query += f" WHERE status IN ({placeholders})"
+            params.extend(statuses)
+        query += " ORDER BY last_updated_at DESC, urgency DESC LIMIT ?"
+        params.append(limit)
+        with self._managed_connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [self._loop_from_row(row) for row in rows]
+
+    def upsert_profile_facet(self, facet: UserProfileFacet) -> UserProfileFacet:
+        with self._managed_connection() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO user_profile_facets (
+                    facet_id, speaker_id, category, title, summary, confidence,
+                    strength, status, source_event_ids, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    facet.facet_id,
+                    facet.speaker_id,
+                    facet.category,
+                    facet.title,
+                    facet.summary,
+                    facet.confidence,
+                    facet.strength,
+                    facet.status,
+                    json.dumps(facet.source_event_ids),
+                    facet.updated_at,
+                ),
+            )
+        return facet
+
+    def get_profile_facets(
+        self,
+        speaker_id: str,
+        categories: Optional[List[str]] = None,
+        statuses: Optional[List[str]] = None,
+        limit: int = 50,
+    ) -> List[UserProfileFacet]:
+        query = "SELECT * FROM user_profile_facets WHERE speaker_id = ?"
+        params: List[object] = [speaker_id]
+        if categories:
+            placeholders = ", ".join("?" for _ in categories)
+            query += f" AND category IN ({placeholders})"
+            params.extend(categories)
+        if statuses:
+            placeholders = ", ".join("?" for _ in statuses)
+            query += f" AND status IN ({placeholders})"
+            params.extend(statuses)
+        query += " ORDER BY strength DESC, updated_at DESC LIMIT ?"
+        params.append(limit)
+        with self._managed_connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [self._facet_from_row(row) for row in rows]
+
+    def save_session_digest(self, content: str) -> None:
+        self.session_digest_path.write_text(content, encoding="utf-8")
+
+    def get_session_digest(self) -> str:
+        if not self.session_digest_path.exists():
+            return ""
+        return self.session_digest_path.read_text(encoding="utf-8")
+
+    def save_open_loop_digest(self, content: str) -> None:
+        self.open_loop_digest_path.write_text(content, encoding="utf-8")
+
+    def get_open_loop_digest(self) -> str:
+        if not self.open_loop_digest_path.exists():
+            return ""
+        return self.open_loop_digest_path.read_text(encoding="utf-8")

@@ -8,6 +8,17 @@ from core.models import Notification
 class SQLiteNotificationAdapter(NotificationPort):
     """Adapter wrapping night_mode notification functions behind NotificationPort."""
 
+    def peek_unread_notifications(self) -> List[Notification]:
+        rows = night_mode.peek_unread_notifications()
+        return [
+            Notification(
+                id=row["id"],
+                message=row["message"],
+                source=row.get("source", "system"),
+            )
+            for row in rows
+        ]
+
     def get_unread_notifications(self) -> List[Notification]:
         rows = night_mode.get_unread_notifications()
         return [
