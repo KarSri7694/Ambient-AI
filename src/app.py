@@ -25,11 +25,15 @@ from application.services.transcript_evidence_service import TranscriptEvidenceS
 from application.services.transcript_classification_service import TranscriptClassificationService
 from application.services.transcript_normalization_service import TranscriptNormalizationService
 from application.services.open_loop_service import OpenLoopService
+from application.services.passive_observer_followup_service import PassiveObserverFollowupService
+from application.services.passive_observer_service import PassiveObserverService
 from application.services.user_profile_service import UserProfileService
+from application.services.visual_user_fact_service import VisualUserFactService
 from audio_agent import AudioAgentService
 from infrastructure.adapter.llamaCppAdapter import LlamaCppAdapter
 from infrastructure.adapter.LoggingLLMProvider import LoggingLLMProvider
 from infrastructure.adapter.MCPToolAdapter import MCPToolAdapter
+from infrastructure.adapter.MSSScreenCaptureAdapter import MssScreenCaptureAdapter
 from infrastructure.adapter.SQLiteMemoryAdapter import SQLiteMemoryAdapter
 from infrastructure.adapter.SQLiteAmbientAgendaAdapter import SQLiteAmbientAgendaAdapter
 from infrastructure.adapter.SQLiteInteractionLogAdapter import SQLiteInteractionLogAdapter
@@ -45,7 +49,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 API_BASE_URL = "http://localhost:8080"
-DEFAULT_MODEL = "Qwen-3.5-9B-Fable-Distilled-Q4_K_M"
+DEFAULT_MODEL = "Qwen-3.5-9B-Fable-Distilled-Q4_K_M-Vision"
 MCP_CONFIG_PATH = "mcp.json"
 PROJECT_ROOT = Path(__file__).parent.parent
 PROMPTS_ROOT = PROJECT_ROOT / "prompts"
@@ -57,9 +61,16 @@ AMBIENT_AGENDA_DB_PATH = PROJECT_ROOT / "database" / "ambient_agenda.db"
 INTERACTION_LOG_DB_PATH = PROJECT_ROOT / "database" / "interaction_logs.db"
 CURRENT_RESPONSE_PATH = PROJECT_ROOT / "database" / "current_llm_response.md"
 RESEARCH_VAULT_ROOT = USER_DATA_DIR / "research_vault"
+PASSIVE_OBSERVER_ROOT = USER_DATA_DIR / "passive_observer"
 CLASSIFIER_PROMPT = "TRANSCRIPT_CLASSIFIER.md"
 SIMPLE_EXECUTOR_PROMPT = "SIMPLE_EXECUTOR.md"
 PROACTIVE_RESEARCH_PROMPT = "PROACTIVE_RESEARCH.md"
+PASSIVE_OBSERVER_ENABLED = os.getenv("PASSIVE_OBSERVER_ENABLED", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 
 def build_available_skills_summary() -> str:
@@ -127,6 +138,8 @@ class TranscriptionService:
         memory_consolidation: MemoryConsolidationService,
         proactive_research_service: ProactiveResearchService,
         ambient_reflection: AmbientReflectionService,
+        passive_followup: PassiveObserverFollowupService | None,
+        visual_user_fact_service: VisualUserFactService | None,
         memory_store: SQLiteMemoryAdapter,
         proactive_research_prompt: str,
     ) -> None:
@@ -140,22 +153,32 @@ class TranscriptionService:
         )
         if processed:
             logger.info("Processed %s proactive research topics during idle.", processed)
-        reflection_result = await ambient_reflection.reflect_with_metadata(
-            model=DEFAULT_MODEL,
-            recent_context=memory_store.get_recent_context(),
-        )
-        if not reflection_result.llm_invoked:
-            logger.info(
-                "Ambient reflection skipped: no candidates (candidate_count=%s).",
-                reflection_result.candidate_count,
-            )
+        if passive_followup is not None:
+            followup_result = await passive_followup.maybe_queue_followup(model=DEFAULT_MODEL)
+            if followup_result.get("action") == "queue_task":
+                logger.info(
+                    "Passive observer queued deferred task: %s",
+                    followup_result.get("title", ""),
+                )
+            else:
+                logger.info("Passive observer idle follow-up found no task to queue.")
         else:
-            logger.info(
-                "Ambient reflection invoked with %s candidate(s) and produced %s action(s): %s",
-                reflection_result.candidate_count,
-                len(reflection_result.actions),
-                ", ".join(action.action_type for action in reflection_result.actions),
+            reflection_result = await ambient_reflection.reflect_with_metadata(
+                model=DEFAULT_MODEL,
+                recent_context=memory_store.get_recent_context(),
             )
+            if not reflection_result.llm_invoked:
+                logger.info(
+                    "Ambient reflection skipped: no candidates (candidate_count=%s).",
+                    reflection_result.candidate_count,
+                )
+            else:
+                logger.info(
+                    "Ambient reflection invoked with %s candidate(s) and produced %s action(s): %s",
+                    reflection_result.candidate_count,
+                    len(reflection_result.actions),
+                    ", ".join(action.action_type for action in reflection_result.actions),
+                )
 
     def _build_services(self):
         llm_adapter = LlamaCppAdapter(base_url=API_BASE_URL)
@@ -218,6 +241,30 @@ class TranscriptionService:
             topic_queue=proactive_topic_queue,
             scorer=agenda_scorer,
         )
+        passive_followup = (
+            PassiveObserverFollowupService(
+                memory=memory_store,
+                task_queue=task_queue,
+                llm_provider=logged_llm,
+            )
+            if PASSIVE_OBSERVER_ENABLED
+            else None
+        )
+        visual_user_fact_service = (
+            VisualUserFactService(memory=memory_store)
+            if PASSIVE_OBSERVER_ENABLED
+            else None
+        )
+        passive_observer = (
+            PassiveObserverService(
+                memory=memory_store,
+                llm_provider=logged_llm,
+                screen_capture=MssScreenCaptureAdapter(output_dir=str(PASSIVE_OBSERVER_ROOT / "screenshots")),
+                screenshot_root=str(PASSIVE_OBSERVER_ROOT / "screenshots"),
+            )
+            if PASSIVE_OBSERVER_ENABLED
+            else None
+        )
         return (
             llm_adapter,
             tool_bridge,
@@ -241,6 +288,9 @@ class TranscriptionService:
             proactive_research_service,
             memory_consolidation,
             ambient_reflection,
+            passive_followup,
+            visual_user_fact_service,
+            passive_observer,
         )
 
     async def _process_one(
@@ -470,6 +520,9 @@ class TranscriptionService:
             proactive_research_service,
             memory_consolidation,
             ambient_reflection,
+            passive_followup,
+            visual_user_fact_service,
+            passive_observer,
         ) = self._build_services()
         proactive_research_prompt = memory_context_builder.build_prompt(
             base_prompt_filename=PROACTIVE_RESEARCH_PROMPT,
@@ -478,7 +531,9 @@ class TranscriptionService:
             include_skills=False,
         )
         idle_cycle_interval = 30
+        passive_observer_interval = 10
         last_idle_cycle_at = 0.0
+        last_passive_observer_at = 0.0
         services_initialized = False
 
         try:
@@ -547,6 +602,34 @@ class TranscriptionService:
                         self.queue.task_done()
 
                 now = time.monotonic()
+                if (
+                    PASSIVE_OBSERVER_ENABLED
+                    and passive_observer is not None
+                    and not processed_transcript
+                    and now - last_passive_observer_at >= passive_observer_interval
+                ):
+                    try:
+                        with self.gpu_lock:
+                            observation = await passive_observer.observe(
+                                model=DEFAULT_MODEL,
+                                recent_context=memory_store.get_recent_context(),
+                            )
+                        if observation is not None:
+                            if visual_user_fact_service is not None:
+                                updated_facts = visual_user_fact_service.update_from_observation(observation)
+                                if updated_facts:
+                                    logger.info(
+                                        "Updated %s visual user fact(s) from passive observation.",
+                                        len(updated_facts),
+                                    )
+                            logger.info(
+                                "Passive observer stored observation for %s.",
+                                observation.app_name or observation.page_hint or "screen",
+                            )
+                    except Exception:
+                        logger.exception("Passive observer cycle failed.")
+                    last_passive_observer_at = now
+
                 if not processed_transcript and now - last_idle_cycle_at >= idle_cycle_interval:
                     logger.info("Running ambient idle cycle.")
                     try:
@@ -555,6 +638,8 @@ class TranscriptionService:
                                 memory_consolidation=memory_consolidation,
                                 proactive_research_service=proactive_research_service,
                                 ambient_reflection=ambient_reflection,
+                                passive_followup=passive_followup,
+                                visual_user_fact_service=visual_user_fact_service,
                                 memory_store=memory_store,
                                 proactive_research_prompt=proactive_research_prompt,
                             )

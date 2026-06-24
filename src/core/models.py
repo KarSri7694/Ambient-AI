@@ -329,6 +329,65 @@ class UserProfileFacet:
 
 
 @dataclass(frozen=True)
+class VisualObservation:
+    """One passive visual inference derived from a screenshot."""
+    observation_id: str
+    screenshot_path: str
+    created_at: str
+    observation_type: str = "screen"
+    app_name: Optional[str] = None
+    window_title: Optional[str] = None
+    page_hint: Optional[str] = None
+    summary: str = ""
+    inferred_user_activity: str = ""
+    previous_activity_status: str = "unclear"
+    salient_entities: List[str] = field(default_factory=list)
+    completed_items: List[str] = field(default_factory=list)
+    open_loops: List[str] = field(default_factory=list)
+    possible_next_task: Optional[str] = None
+    suggested_research_topics: List[str] = field(default_factory=list)
+    user_fact_hypotheses: List[Dict[str, str]] = field(default_factory=list)
+    confidence: float = 0.0
+    session_id: Optional[str] = None
+    raw_payload_json: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class VisualUserFact:
+    """A visual user-fact candidate promoted from repeated passive observations."""
+    fact_id: str
+    fact_key: str
+    category: str
+    title: str
+    summary: str
+    status: str = "temporary"
+    score: float = 0.0
+    observation_count: int = 1
+    session_count: int = 1
+    first_seen_at: str = ""
+    last_seen_at: str = ""
+    source_observation_ids: List[str] = field(default_factory=list)
+    source_session_ids: List[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class VisualSession:
+    """A short-lived passive visual activity session spanning related screenshots."""
+    session_id: str
+    started_at: str
+    ended_at: str
+    status: str = "open"
+    activity_summary: str = ""
+    app_name: Optional[str] = None
+    window_title: Optional[str] = None
+    page_hint: Optional[str] = None
+    last_activity_at: str = ""
+    continuation_score: float = 0.0
+    observation_ids: List[str] = field(default_factory=list)
+    related_loop_ids: List[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class InteractionLogEntry:
     """One persisted LLM interaction request/response pair."""
     interaction_id: str

@@ -22,8 +22,10 @@ class MemoryContextBuilder:
         prompt_parts = [
             self._read_prompt_file(base_prompt_filename),
             self._read_prompt_file("USER.md"),
+            self._build_user_info_section(),
             self._build_session_digest_section(),
             self._build_open_loop_digest_section(),
+            self._build_visual_digest_section(),
             self._build_recent_context_section(),
             self._build_participant_memory_section(participants),
         ]
@@ -43,6 +45,12 @@ class MemoryContextBuilder:
             recent_context = "_No recent shared context yet._"
         return f"## Recent Shared Context\n{recent_context}"
 
+    def _build_user_info_section(self) -> str:
+        user_info = self.memory.get_user_info().strip()
+        if not user_info:
+            user_info = "_No durable visual user info yet._"
+        return f"## USER_INFO\n{user_info}"
+
     def _build_session_digest_section(self) -> str:
         session_digest = self.memory.get_session_digest().strip()
         if not session_digest:
@@ -54,6 +62,12 @@ class MemoryContextBuilder:
         if not open_loop_digest:
             open_loop_digest = "_No open loops tracked yet._"
         return f"## Open Loops\n{open_loop_digest}"
+
+    def _build_visual_digest_section(self) -> str:
+        visual_digest = self.memory.get_visual_digest().strip()
+        if not visual_digest:
+            visual_digest = "_No passive visual context yet._"
+        return f"## Passive Visual Context\n{visual_digest}"
 
     def _build_participant_memory_section(
         self,

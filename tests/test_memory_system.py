@@ -35,6 +35,7 @@ class MemorySystemTests(unittest.TestCase):
         self.memory.save_session_digest("# Session Digest\n\n- Existing session\n")
         self.memory.save_open_loop_digest("# Open Loops\n\n- Existing loop\n")
         self.memory.save_visual_digest("# Passive Visual Context\n\n- Existing visual context\n")
+        self.memory.save_user_info("# USER_INFO\n\n- Existing durable user fact\n")
 
     def tearDown(self):
         self.temp_dir.cleanup()
@@ -75,6 +76,7 @@ class MemorySystemTests(unittest.TestCase):
         self.assertIn("Existing session", prompt)
         self.assertIn("Existing loop", prompt)
         self.assertIn("Existing visual context", prompt)
+        self.assertIn("Existing durable user fact", prompt)
         self.assertIn("Shared context item", prompt)
         self.assertIn("Alice likes black coffee.", prompt)
         self.assertIn("Skill summary", prompt)

@@ -10,6 +10,9 @@ from core.models import (
     SpeakerRecord,
     TranscriptEvidence,
     UserProfileFacet,
+    VisualObservation,
+    VisualUserFact,
+    VisualSession,
 )
 
 
@@ -152,4 +155,57 @@ class MemoryPort(ABC):
 
     @abstractmethod
     def get_open_loop_digest(self) -> str:
+        pass
+
+    @abstractmethod
+    def append_visual_observation(self, observation: VisualObservation) -> None:
+        pass
+
+    @abstractmethod
+    def get_recent_visual_observations(self, limit: int = 10) -> List[VisualObservation]:
+        pass
+
+    @abstractmethod
+    def upsert_visual_session(self, session: VisualSession) -> VisualSession:
+        pass
+
+    @abstractmethod
+    def get_visual_session(self, session_id: str) -> Optional[VisualSession]:
+        pass
+
+    @abstractmethod
+    def list_visual_sessions(self, statuses: Optional[List[str]] = None, limit: int = 20) -> List[VisualSession]:
+        pass
+
+    @abstractmethod
+    def save_visual_digest(self, content: str) -> None:
+        pass
+
+    @abstractmethod
+    def get_visual_digest(self) -> str:
+        pass
+
+    @abstractmethod
+    def upsert_visual_user_fact(self, fact: VisualUserFact) -> VisualUserFact:
+        pass
+
+    @abstractmethod
+    def get_visual_user_fact(self, fact_key: str) -> Optional[VisualUserFact]:
+        pass
+
+    @abstractmethod
+    def list_visual_user_facts(
+        self,
+        statuses: Optional[List[str]] = None,
+        categories: Optional[List[str]] = None,
+        limit: int = 100,
+    ) -> List[VisualUserFact]:
+        pass
+
+    @abstractmethod
+    def save_user_info(self, content: str) -> None:
+        pass
+
+    @abstractmethod
+    def get_user_info(self) -> str:
         pass
