@@ -55,7 +55,7 @@ class MCPToolAdapter(ToolBridgePort):
                         "type": "function",
                         "function": {
                             "name": tool.name,
-                            "description": tool.description,
+                            "description": tool.description or "",
                             "parameters": {
                                 "type": "object",
                                 "properties": {
