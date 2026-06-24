@@ -1,7 +1,16 @@
 from abc import ABC, abstractmethod
 from typing import List, Optional
 
-from core.models import MemoryEvent, MemoryFact, MemoryReflection, SpeakerRecord
+from core.models import (
+    ConversationSession,
+    MemoryEvent,
+    MemoryFact,
+    MemoryReflection,
+    OpenLoop,
+    SpeakerRecord,
+    TranscriptEvidence,
+    UserProfileFacet,
+)
 
 
 class MemoryPort(ABC):
@@ -77,4 +86,70 @@ class MemoryPort(ABC):
 
     @abstractmethod
     def save_recent_context(self, content: str) -> None:
+        pass
+
+    @abstractmethod
+    def append_evidence(self, evidence: TranscriptEvidence) -> None:
+        pass
+
+    @abstractmethod
+    def get_recent_evidence(
+        self,
+        speaker_ids: Optional[List[str]] = None,
+        limit: int = 20,
+    ) -> List[TranscriptEvidence]:
+        pass
+
+    @abstractmethod
+    def upsert_session(self, session: ConversationSession) -> ConversationSession:
+        pass
+
+    @abstractmethod
+    def get_session(self, session_id: str) -> Optional[ConversationSession]:
+        pass
+
+    @abstractmethod
+    def list_sessions(self, statuses: Optional[List[str]] = None, limit: int = 20) -> List[ConversationSession]:
+        pass
+
+    @abstractmethod
+    def upsert_open_loop(self, loop: OpenLoop) -> OpenLoop:
+        pass
+
+    @abstractmethod
+    def get_open_loop(self, loop_id: str) -> Optional[OpenLoop]:
+        pass
+
+    @abstractmethod
+    def list_open_loops(self, statuses: Optional[List[str]] = None, limit: int = 20) -> List[OpenLoop]:
+        pass
+
+    @abstractmethod
+    def upsert_profile_facet(self, facet: UserProfileFacet) -> UserProfileFacet:
+        pass
+
+    @abstractmethod
+    def get_profile_facets(
+        self,
+        speaker_id: str,
+        categories: Optional[List[str]] = None,
+        statuses: Optional[List[str]] = None,
+        limit: int = 50,
+    ) -> List[UserProfileFacet]:
+        pass
+
+    @abstractmethod
+    def save_session_digest(self, content: str) -> None:
+        pass
+
+    @abstractmethod
+    def get_session_digest(self) -> str:
+        pass
+
+    @abstractmethod
+    def save_open_loop_digest(self, content: str) -> None:
+        pass
+
+    @abstractmethod
+    def get_open_loop_digest(self) -> str:
         pass

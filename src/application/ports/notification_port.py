@@ -7,6 +7,11 @@ class NotificationPort(ABC):
     """Port for system notification operations."""
 
     @abstractmethod
+    def peek_unread_notifications(self) -> List[Notification]:
+        """Retrieve unread notifications without mutating their read state."""
+        pass
+
+    @abstractmethod
     def get_unread_notifications(self) -> List[Notification]:
         """Retrieve all unread notifications and mark them as read."""
         pass
