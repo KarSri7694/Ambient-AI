@@ -16,6 +16,7 @@ from infrastructure.adapter.ASR_Adapter import WhisperAdapter as asr_adapter
 from infrastructure.adapter.pyannoteAdapter import PyannoteAdapter
 from infrastructure.adapter.ecapaVoxcelebAdapter import EcapaVoxcelebAdapter
 from infrastructure.adapter.SQLiteVoiceAdapter import SQLiteVoiceAdapter
+from application.services.system_idle_service import SystemIdleService
 from core.models import DiarizationResult, TranscriptionResult
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -36,6 +37,7 @@ TRANSCRIPTIONS_DIR = USER_DATA_DIR / "transcriptions"
 HIN2HINGLISH = "Hin2Hinglish-ct2/"
 CLEANED_AUDIO_DIR = USER_DATA_DIR / "cleaned_audio"
 TEMP_AUDIO_DIR = USER_DATA_DIR / "temp_audio"
+USER_IDLE_THRESHOLD_SECONDS = 300
 
 HF_TOKEN = os.getenv("HF_TOKEN", None)
 MIN_TIME_THRESHOLD = 0.2 #seconds
@@ -217,6 +219,9 @@ class AudioAgentService:
             transcription_queue=self.transcription_queue
             )
         self.processing_queue = queue.Queue()
+        self.system_idle_service = SystemIdleService(
+            idle_threshold_seconds=USER_IDLE_THRESHOLD_SECONDS,
+        )
         self.worker_thread = threading.Thread(target=self._process_uploads, daemon=True)
     def get_audio_active_event(self) -> threading.Event:
         return self.audio_active_event
@@ -225,8 +230,13 @@ class AudioAgentService:
         return self.transcription_queue
     
     def _process_uploads(self):
-        logging.info("Audio pipeline is idle, waiting for uploads.")
+        logging.info("Audio pipeline is waiting for uploads and user idle.")
         while True:
+            if not self.system_idle_service.is_user_idle():
+                self.audio_active_event.clear()
+                time.sleep(1)
+                continue
+
             try:
                 file_path = self.processing_queue.get(timeout=1)
             except queue.Empty:
@@ -238,7 +248,7 @@ class AudioAgentService:
 
             self.audio_active_event.set()
             self.llm_active_event.clear()
-            logging.info("Audio file received. ASR pipeline is active.")
+            logging.info("Audio file received while system is idle. ASR pipeline is active.")
 
             try:
                 with self.gpu_lock:

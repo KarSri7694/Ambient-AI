@@ -1,4 +1,3 @@
-import hashlib
 import json
 import logging
 import uuid
@@ -76,30 +75,31 @@ Rules:
         self.screenshot_root = Path(screenshot_root)
         self.screenshot_root.mkdir(parents=True, exist_ok=True)
         self.logger = logger or logging.getLogger(self.__class__.__name__)
-        self._last_capture_hash: Optional[str] = None
 
-    async def observe(self, *, model: str, recent_context: str) -> Optional[VisualObservation]:
+    def capture_screenshot(self) -> str:
         screenshot_path = self._capture_path()
-        captured_path = Path(self.screen_capture.capture_screenshot(str(screenshot_path)))
-        capture_hash = self._hash_file(captured_path)
-        if capture_hash == self._last_capture_hash:
-            self._trim_screenshot(captured_path)
-            return None
-        self._last_capture_hash = capture_hash
+        return str(Path(self.screen_capture.capture_screenshot(str(screenshot_path))))
 
+    async def process_screenshot(
+        self,
+        *,
+        screenshot_path: str,
+        model: str,
+        recent_context: str,
+        captured_at: str | None = None,
+    ) -> Optional[VisualObservation]:
         parsed = await self._analyze(
-            screenshot_path=str(captured_path),
+            screenshot_path=screenshot_path,
             model=model,
             recent_context=recent_context,
         )
         if not parsed or not self._truthy(parsed.get("worth_noting", True)):
-            self._prune_screenshots()
             return None
 
         observation = VisualObservation(
             observation_id=uuid.uuid4().hex,
-            screenshot_path=str(captured_path),
-            created_at=datetime.now().isoformat(),
+            screenshot_path=screenshot_path,
+            created_at=captured_at or datetime.now().isoformat(),
             observation_type="screen",
             app_name=self._opt_text(parsed.get("app_name")),
             window_title=self._opt_text(parsed.get("window_title")),
@@ -129,8 +129,15 @@ Rules:
             )
         )
         self.refresh_digest()
-        self._prune_screenshots()
         return observation
+
+    async def observe(self, *, model: str, recent_context: str) -> Optional[VisualObservation]:
+        screenshot_path = self.capture_screenshot()
+        return await self.process_screenshot(
+            screenshot_path=screenshot_path,
+            model=model,
+            recent_context=recent_context,
+        )
 
     def refresh_digest(self, session_limit: int = 4, observation_limit: int = 5) -> None:
         sessions = self.memory.list_visual_sessions(statuses=["open"], limit=session_limit)
@@ -181,6 +188,9 @@ Rules:
         self.memory.save_visual_digest("\n".join(lines) + "\n")
 
     async def _analyze(self, *, screenshot_path: str, model: str, recent_context: str) -> dict:
+        if not Path(screenshot_path).exists():
+            self.logger.warning("Passive observer screenshot missing before analysis: %s", screenshot_path)
+            return {}
         recent_observations = self.memory.get_recent_visual_observations(limit=3)
         previous_observation = recent_observations[0] if recent_observations else None
         payload = {
@@ -301,16 +311,6 @@ Rules:
             path.unlink(missing_ok=True)
         except OSError:
             self.logger.debug("Failed to remove screenshot %s", path)
-
-    def _hash_file(self, path: Path) -> str:
-        digest = hashlib.sha1()
-        with path.open("rb") as handle:
-            while True:
-                chunk = handle.read(8192)
-                if not chunk:
-                    break
-                digest.update(chunk)
-        return digest.hexdigest()
 
     async def _consume_stream_text(self, completion) -> str:
         parts: List[str] = []

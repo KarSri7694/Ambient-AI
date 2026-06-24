@@ -1,10 +1,12 @@
 import sqlite3
 import json
 from datetime import datetime
+from pathlib import Path
 
 DB_FILE = "database/night_queue.db"
 
 def init_db():
+    Path(DB_FILE).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     # Create Tasks Table
@@ -23,8 +25,14 @@ def init_db():
                   created_at TEXT)''')
     conn.commit()
     conn.close()
+
+
+def _ensure_db():
+    init_db()
+
 #Functions for managing night shift tasks
 def add_task(description, priority="medium"):
+    _ensure_db()
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("INSERT INTO night_queue (description, priority, status, created_at) VALUES (?, ?, ?, ?)",
@@ -34,6 +42,7 @@ def add_task(description, priority="medium"):
     return "Task queued."
 
 def get_pending_tasks():
+    _ensure_db()
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row # Allows accessing columns by name
     c = conn.cursor()
@@ -43,6 +52,7 @@ def get_pending_tasks():
     return [dict(row) for row in rows]
 
 def mark_task_complete(task_id, status="completed"):
+    _ensure_db()
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("UPDATE night_queue SET status=? WHERE id=?", (status, task_id))
@@ -51,6 +61,7 @@ def mark_task_complete(task_id, status="completed"):
 
 # Functions for system notifications
 def add_notification(message, source="system"):
+    _ensure_db()
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("INSERT INTO system_notifications (message, source, created_at) VALUES (?, ?, ?)",
@@ -59,6 +70,7 @@ def add_notification(message, source="system"):
     conn.close()
 
 def get_unread_notifications():
+    _ensure_db()
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
@@ -70,6 +82,7 @@ def get_unread_notifications():
     return [dict(row) for row in rows]
 
 def peek_unread_notifications():
+    _ensure_db()
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
@@ -79,12 +92,13 @@ def peek_unread_notifications():
     return [dict(row) for row in rows]
 
 def mark_notification_read(notification_id):
+    _ensure_db()
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("UPDATE system_notifications SET read=1 WHERE id=?", (notification_id,))
     conn.commit()
     conn.close()
-# Run init once
+_ensure_db()
+
 if __name__ == "__main__":
-    init_db()
     print("Database initialized.")

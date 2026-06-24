@@ -15,6 +15,7 @@ from application.services.ambient_reflection_service import AmbientReflectionSer
 from application.services.agenda_scoring_service import AgendaScoringService
 from application.services.memory_consolidation_service import MemoryConsolidationService
 from application.services.memory_context_builder import MemoryContextBuilder
+from application.services.night_mode_service import NightModeService
 from application.services.proactive_research_service import ProactiveResearchService
 from application.services.proactive_topic_detection_service import ProactiveTopicDetectionService
 from application.services.research_vault_service import ResearchVaultService
@@ -27,6 +28,8 @@ from application.services.transcript_normalization_service import TranscriptNorm
 from application.services.open_loop_service import OpenLoopService
 from application.services.passive_observer_followup_service import PassiveObserverFollowupService
 from application.services.passive_observer_service import PassiveObserverService
+from application.services.screenshot_queue_service import ScreenshotQueueService
+from application.services.system_idle_service import SystemIdleService
 from application.services.user_profile_service import UserProfileService
 from application.services.visual_user_fact_service import VisualUserFactService
 from audio_agent import AudioAgentService
@@ -40,6 +43,8 @@ from infrastructure.adapter.SQLiteInteractionLogAdapter import SQLiteInteraction
 from infrastructure.adapter.SQLiteNotificationAdapter import SQLiteNotificationAdapter
 from infrastructure.adapter.SQLiteProactiveTopicQueueAdapter import SQLiteProactiveTopicQueueAdapter
 from infrastructure.adapter.SQLiteTaskQueueAdapter import SQLiteTaskQueueAdapter
+from infrastructure.adapter.TodoistTaskAdapter import TodoistTaskAdapter
+from database_bootstrap import ensure_runtime_databases
 from core.models import MemoryEvent, TranscriptClassificationResult
 
 logging.basicConfig(
@@ -60,6 +65,9 @@ PROACTIVE_TOPICS_DB_PATH = PROJECT_ROOT / "database" / "proactive_topics.db"
 AMBIENT_AGENDA_DB_PATH = PROJECT_ROOT / "database" / "ambient_agenda.db"
 INTERACTION_LOG_DB_PATH = PROJECT_ROOT / "database" / "interaction_logs.db"
 CURRENT_RESPONSE_PATH = PROJECT_ROOT / "database" / "current_llm_response.md"
+VOICE_DB_PATH = PROJECT_ROOT / "database" / "voice_database.db"
+FINANCE_DB_PATH = PROJECT_ROOT / "database" / "finance.db"
+FACTS_DB_PATH = PROJECT_ROOT / "database" / "facts.db"
 RESEARCH_VAULT_ROOT = USER_DATA_DIR / "research_vault"
 PASSIVE_OBSERVER_ROOT = USER_DATA_DIR / "passive_observer"
 CLASSIFIER_PROMPT = "TRANSCRIPT_CLASSIFIER.md"
@@ -71,6 +79,11 @@ PASSIVE_OBSERVER_ENABLED = os.getenv("PASSIVE_OBSERVER_ENABLED", "false").strip(
     "yes",
     "on",
 }
+USER_IDLE_THRESHOLD_SECONDS = 120
+SCREENSHOT_QUEUE_MAXLEN = 180
+MAX_SCREENSHOTS_PER_IDLE_CYCLE = 6
+NIGHT_MODE_START_HOUR = 0
+NIGHT_MODE_END_HOUR = 6
 
 
 def build_available_skills_summary() -> str:
@@ -132,6 +145,35 @@ class TranscriptionService:
         await tool_bridge.cleanup()
         self.llm_active_event.clear()
 
+    async def _ensure_ambient_runtime(
+        self,
+        *,
+        llm_adapter,
+        tool_bridge,
+        llm_service,
+        services_initialized: bool,
+        reason: str,
+    ) -> bool:
+        if services_initialized:
+            return True
+        logger.info("Loading ambient runtime: %s", reason)
+        await self._ensure_llm_ready(llm_adapter, tool_bridge, llm_service)
+        return True
+
+    async def _release_ambient_runtime(
+        self,
+        *,
+        llm_adapter,
+        tool_bridge,
+        services_initialized: bool,
+        reason: str,
+    ) -> bool:
+        if not services_initialized:
+            return False
+        logger.info("Unloading ambient runtime: %s", reason)
+        await self._release_llm(llm_adapter, tool_bridge)
+        return False
+
     async def _run_idle_cycle(
         self,
         *,
@@ -180,7 +222,21 @@ class TranscriptionService:
                     ", ".join(action.action_type for action in reflection_result.actions),
                 )
 
+    def _is_night_mode_window(self, current_time: datetime | None = None) -> bool:
+        now = current_time or datetime.now()
+        return NIGHT_MODE_START_HOUR <= now.hour < NIGHT_MODE_END_HOUR
+
     def _build_services(self):
+        ensure_runtime_databases(
+            memory_db_path=str(MEMORY_DB_PATH),
+            memory_root=str(MEMORY_ROOT),
+            ambient_agenda_db_path=str(AMBIENT_AGENDA_DB_PATH),
+            interaction_log_db_path=str(INTERACTION_LOG_DB_PATH),
+            proactive_topics_db_path=str(PROACTIVE_TOPICS_DB_PATH),
+            voice_db_path=str(VOICE_DB_PATH),
+            finance_db_path=str(FINANCE_DB_PATH),
+            facts_db_path=str(FACTS_DB_PATH),
+        )
         llm_adapter = LlamaCppAdapter(base_url=API_BASE_URL)
         interaction_log_store = SQLiteInteractionLogAdapter(
             db_path=str(INTERACTION_LOG_DB_PATH),
@@ -196,6 +252,7 @@ class TranscriptionService:
             tool_bridge=tool_bridge,
         )
         task_queue = SQLiteTaskQueueAdapter()
+        todoist_task_provider = TodoistTaskAdapter()
         notification_store = SQLiteNotificationAdapter()
         agenda_store = SQLiteAmbientAgendaAdapter(
             db_path=str(AMBIENT_AGENDA_DB_PATH),
@@ -241,6 +298,16 @@ class TranscriptionService:
             topic_queue=proactive_topic_queue,
             scorer=agenda_scorer,
         )
+        night_mode_service = NightModeService(
+            task_queue=task_queue,
+            task_provider=todoist_task_provider,
+            notification_port=notification_store,
+            llm_service=llm_service,
+            memory_consolidator=memory_consolidation,
+            proactive_research_service=proactive_research_service,
+            ambient_reflection_service=ambient_reflection,
+            model=DEFAULT_MODEL,
+        )
         passive_followup = (
             PassiveObserverFollowupService(
                 memory=memory_store,
@@ -252,6 +319,16 @@ class TranscriptionService:
         )
         visual_user_fact_service = (
             VisualUserFactService(memory=memory_store)
+            if PASSIVE_OBSERVER_ENABLED
+            else None
+        )
+        system_idle_service = SystemIdleService(
+            idle_threshold_seconds=USER_IDLE_THRESHOLD_SECONDS,
+        )
+        screenshot_queue = (
+            ScreenshotQueueService(
+                maxlen=SCREENSHOT_QUEUE_MAXLEN,
+            )
             if PASSIVE_OBSERVER_ENABLED
             else None
         )
@@ -288,8 +365,11 @@ class TranscriptionService:
             proactive_research_service,
             memory_consolidation,
             ambient_reflection,
+            night_mode_service,
             passive_followup,
             visual_user_fact_service,
+            system_idle_service,
+            screenshot_queue,
             passive_observer,
         )
 
@@ -520,8 +600,11 @@ class TranscriptionService:
             proactive_research_service,
             memory_consolidation,
             ambient_reflection,
+            night_mode_service,
             passive_followup,
             visual_user_fact_service,
+            system_idle_service,
+            screenshot_queue,
             passive_observer,
         ) = self._build_services()
         proactive_research_prompt = memory_context_builder.build_prompt(
@@ -534,28 +617,55 @@ class TranscriptionService:
         passive_observer_interval = 10
         last_idle_cycle_at = 0.0
         last_passive_observer_at = 0.0
+        user_idle_now = False
         services_initialized = False
 
         try:
-            logger.info("Starting ambient LLM in continuous idle mode.")
-            await self._ensure_llm_ready(llm_adapter, tool_bridge, llm_service)
-            services_initialized = True
+            logger.info("Starting ambient runtime manager.")
 
             while True:
+                current_user_idle = system_idle_service.is_user_idle() if PASSIVE_OBSERVER_ENABLED else False
+                if current_user_idle != user_idle_now:
+                    user_idle_now = current_user_idle
+                    if user_idle_now:
+                        logger.info("User idle detected (>= %ss). Ambient idle mode enabled.", USER_IDLE_THRESHOLD_SECONDS)
+                        last_idle_cycle_at = 0.0
+                    else:
+                        logger.info("User activity detected. Ambient work will stay queued until idle resumes.")
+
                 if self.audio_active_event.is_set():
-                    logger.info("ASR claimed GPU. Unloading ambient LLM until audio processing completes.")
-                    if services_initialized:
-                        await self._release_llm(llm_adapter, tool_bridge)
-                        services_initialized = False
+                    logger.info("ASR claimed GPU. Unloading ambient runtime until audio processing completes.")
+                    services_initialized = await self._release_ambient_runtime(
+                        llm_adapter=llm_adapter,
+                        tool_bridge=tool_bridge,
+                        services_initialized=services_initialized,
+                        reason="ASR pipeline is using the GPU",
+                    )
                     while self.audio_active_event.is_set():
                         await asyncio.sleep(0.5)
-                    logger.info("ASR finished. Reloading ambient LLM.")
-                    await self._ensure_llm_ready(llm_adapter, tool_bridge, llm_service)
-                    services_initialized = True
                     last_idle_cycle_at = 0.0
 
                 processed_transcript = False
-                while True:
+                if user_idle_now:
+                    try:
+                        services_initialized = await self._ensure_ambient_runtime(
+                            llm_adapter=llm_adapter,
+                            tool_bridge=tool_bridge,
+                            llm_service=llm_service,
+                            services_initialized=services_initialized,
+                            reason="processing explicit Ambient AI Tasks",
+                        )
+                        with self.gpu_lock:
+                            processed_explicit_tasks = await night_mode_service.run_external_task_cycle()
+                        if processed_explicit_tasks:
+                            logger.info(
+                                "Processed %s explicit Ambient AI Tasks before transcript drain.",
+                                processed_explicit_tasks,
+                            )
+                    except Exception:
+                        logger.exception("Explicit Ambient AI Tasks cycle failed.")
+
+                while user_idle_now:
                     try:
                         file_path = self.queue.get_nowait()
                     except queue.Empty:
@@ -573,6 +683,13 @@ class TranscriptionService:
                         continue
 
                     try:
+                        services_initialized = await self._ensure_ambient_runtime(
+                            llm_adapter=llm_adapter,
+                            tool_bridge=tool_bridge,
+                            llm_service=llm_service,
+                            services_initialized=services_initialized,
+                            reason=f"processing transcript {file_path}",
+                        )
                         with self.gpu_lock:
                             await self._process_one(
                                 llm_service=llm_service,
@@ -602,57 +719,128 @@ class TranscriptionService:
                         self.queue.task_done()
 
                 now = time.monotonic()
+
                 if (
                     PASSIVE_OBSERVER_ENABLED
                     and passive_observer is not None
-                    and not processed_transcript
+                    and screenshot_queue is not None
                     and now - last_passive_observer_at >= passive_observer_interval
                 ):
                     try:
-                        with self.gpu_lock:
-                            observation = await passive_observer.observe(
-                                model=DEFAULT_MODEL,
-                                recent_context=memory_store.get_recent_context(),
-                            )
-                        if observation is not None:
-                            if visual_user_fact_service is not None:
-                                updated_facts = visual_user_fact_service.update_from_observation(observation)
-                                if updated_facts:
-                                    logger.info(
-                                        "Updated %s visual user fact(s) from passive observation.",
-                                        len(updated_facts),
-                                    )
-                            logger.info(
-                                "Passive observer stored observation for %s.",
-                                observation.app_name or observation.page_hint or "screen",
-                            )
+                        screenshot_path = passive_observer.capture_screenshot()
+                        queued = screenshot_queue.enqueue(screenshot_path)
+                        logger.info("Queued screenshot for passive observer: %s (queue_size=%s)", queued.screenshot_path, screenshot_queue.size())
                     except Exception:
-                        logger.exception("Passive observer cycle failed.")
+                        logger.exception("Passive observer screenshot capture failed.")
                     last_passive_observer_at = now
 
-                if not processed_transcript and now - last_idle_cycle_at >= idle_cycle_interval:
-                    logger.info("Running ambient idle cycle.")
-                    try:
-                        with self.gpu_lock:
-                            await self._run_idle_cycle(
-                                memory_consolidation=memory_consolidation,
-                                proactive_research_service=proactive_research_service,
-                                ambient_reflection=ambient_reflection,
-                                passive_followup=passive_followup,
-                                visual_user_fact_service=visual_user_fact_service,
-                                memory_store=memory_store,
-                                proactive_research_prompt=proactive_research_prompt,
+                if (
+                    PASSIVE_OBSERVER_ENABLED
+                    and passive_observer is not None
+                    and screenshot_queue is not None
+                    and user_idle_now
+                    and not screenshot_queue.is_empty()
+                ):
+                    processed_screenshots = 0
+                    while (
+                        processed_screenshots < MAX_SCREENSHOTS_PER_IDLE_CYCLE
+                        and not screenshot_queue.is_empty()
+                    ):
+                        if not system_idle_service.is_user_idle():
+                            user_idle_now = False
+                            logger.info("User activity resumed during screenshot backlog processing. Pausing idle mode.")
+                            break
+                        job = screenshot_queue.dequeue()
+                        if job is None:
+                            break
+                        try:
+                            if not Path(job.screenshot_path).exists():
+                                logger.warning("Queued screenshot no longer exists, skipping: %s", job.screenshot_path)
+                                processed_screenshots += 1
+                                continue
+                            services_initialized = await self._ensure_ambient_runtime(
+                                llm_adapter=llm_adapter,
+                                tool_bridge=tool_bridge,
+                                llm_service=llm_service,
+                                services_initialized=services_initialized,
+                                reason="processing queued passive-observer screenshots",
                             )
+                            with self.gpu_lock:
+                                observation = await passive_observer.process_screenshot(
+                                    screenshot_path=job.screenshot_path,
+                                    model=DEFAULT_MODEL,
+                                    recent_context=memory_store.get_recent_context(),
+                                    captured_at=job.captured_at,
+                                )
+                            if observation is not None:
+                                if visual_user_fact_service is not None:
+                                    updated_facts = visual_user_fact_service.update_from_observation(observation)
+                                    if updated_facts:
+                                        logger.info(
+                                            "Updated %s visual user fact(s) from passive observation.",
+                                            len(updated_facts),
+                                        )
+                                logger.info(
+                                    "Processed queued screenshot for %s.",
+                                    observation.app_name or observation.page_hint or "screen",
+                                )
+                        except Exception:
+                            logger.exception("Queued passive observer screenshot processing failed.")
+                        finally:
+                            try:
+                                Path(job.screenshot_path).unlink(missing_ok=True)
+                            except OSError:
+                                logger.debug("Failed to remove processed screenshot %s", job.screenshot_path)
+                        processed_screenshots += 1
+
+                if user_idle_now and now - last_idle_cycle_at >= idle_cycle_interval:
+                    try:
+                        services_initialized = await self._ensure_ambient_runtime(
+                            llm_adapter=llm_adapter,
+                            tool_bridge=tool_bridge,
+                            llm_service=llm_service,
+                            services_initialized=services_initialized,
+                            reason="running ambient idle work",
+                        )
+                        with self.gpu_lock:
+                            if self._is_night_mode_window():
+                                logger.info("Night mode window active during idle. Running night mode cycle.")
+                                cycle_result = await night_mode_service.run_night_cycle()
+                                logger.info("Night mode cycle result: %s", cycle_result)
+                            else:
+                                logger.info("Running ambient idle cycle.")
+                                await self._run_idle_cycle(
+                                    memory_consolidation=memory_consolidation,
+                                    proactive_research_service=proactive_research_service,
+                                    ambient_reflection=ambient_reflection,
+                                    passive_followup=passive_followup,
+                                    visual_user_fact_service=visual_user_fact_service,
+                                    memory_store=memory_store,
+                                    proactive_research_prompt=proactive_research_prompt,
+                                )
                     except Exception:
-                        logger.exception("Ambient idle cycle failed.")
+                        logger.exception("Idle cycle failed.")
                     last_idle_cycle_at = now
+
+                if not user_idle_now:
+                    services_initialized = await self._release_ambient_runtime(
+                        llm_adapter=llm_adapter,
+                        tool_bridge=tool_bridge,
+                        services_initialized=services_initialized,
+                        reason="user is active; defer audio/transcript/ambient work and keep VRAM clear",
+                    )
 
                 await asyncio.sleep(1)
         finally:
             if services_initialized:
                 consolidated = memory_consolidation.consolidate()
                 logger.info("Memory consolidation processed %s events during shutdown.", consolidated)
-                await self._release_llm(llm_adapter, tool_bridge)
+                await self._release_ambient_runtime(
+                    llm_adapter=llm_adapter,
+                    tool_bridge=tool_bridge,
+                    services_initialized=services_initialized,
+                    reason="application shutdown",
+                )
 
     def start_service(self):
         loop = asyncio.new_event_loop()
