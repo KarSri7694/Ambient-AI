@@ -1,6 +1,7 @@
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import time
+from datetime import datetime
 import threading
 import queue
 from pathlib import Path
@@ -11,7 +12,7 @@ import torchaudio
 import logging
 from collections import defaultdict
 from audio_preprocessor import AudioPreprocessor
-from infrastructure.adapter.ASR_Adapter import WhisperAdapter
+from infrastructure.adapter.ASR_Adapter import WhisperAdapter as asr_adapter
 from infrastructure.adapter.pyannoteAdapter import PyannoteAdapter
 from infrastructure.adapter.ecapaVoxcelebAdapter import EcapaVoxcelebAdapter
 from infrastructure.adapter.SQLiteVoiceAdapter import SQLiteVoiceAdapter
@@ -28,15 +29,25 @@ current_dir = Path(__file__).parent
 project_root = current_dir.parent
 os.chdir(project_root)
 
-UPLOAD_DIR = "uploads/"
+USER_DATA_DIR = Path(os.getenv("USER_DATA_DIR", str("D:\\USER_DATA")))
+UPLOAD_DIR = USER_DATA_DIR / "uploads"
 VOICE_DB = "database/voice_database.db"
-TRANSCRIPTIONS_DIR = "transcriptions/"
+TRANSCRIPTIONS_DIR = USER_DATA_DIR / "transcriptions"
 HIN2HINGLISH = "Hin2Hinglish-ct2/"
-CLEANED_AUDIO_DIR = "cleaned_audio/"
+CLEANED_AUDIO_DIR = USER_DATA_DIR / "cleaned_audio"
 
 HF_TOKEN = os.getenv("HF_TOKEN", None)
 MIN_TIME_THRESHOLD = 0.2 #seconds
-file_counter = 1
+
+if not UPLOAD_DIR.exists():
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+if not TRANSCRIPTIONS_DIR.exists():
+    TRANSCRIPTIONS_DIR.mkdir(parents=True, exist_ok=True)
+
+if not CLEANED_AUDIO_DIR.exists():
+    CLEANED_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+
 class AudioAgent:
     def __init__(self, transcription_queue: queue.Queue):
         self.preprocessor = None
@@ -50,7 +61,7 @@ class AudioAgent:
         return self.preprocessor.run(audio_file_path)
     
     def transcribe_audio(self, audio_file_path: str, vad_filter: bool, word_timestamps: bool, batch_size: int = 8)-> list[TranscriptionResult]:
-        self.asr = WhisperAdapter(model_size=HIN2HINGLISH, device="cuda")
+        self.asr = asr_adapter(model_size=HIN2HINGLISH, device="cuda")
         try:
             return self.asr.transcribe_audio(audio_file_path, vad_filter, word_timestamps, batch_size)
         finally:
@@ -110,7 +121,6 @@ class AudioAgent:
         gc.collect()
         
     def merge_transciptions_and_diarizations(self, transcription: list[TranscriptionResult], diarization_result: list[DiarizationResult]):
-        global file_counter
         if transcription is None:
             logging.error("No transcription object received")
             return
@@ -147,14 +157,14 @@ class AudioAgent:
             logging.warning("No words matched diarization turns; transcript not written.")
             return
         
-        transcript_path = os.path.join(TRANSCRIPTIONS_DIR, f"final_transcript_{str(file_counter)}.txt")
+        transcript_name = f"transcript_{datetime.now().strftime('%d%m%Y_%H%M%S')}.txt"
+        transcript_path = os.path.join(TRANSCRIPTIONS_DIR, transcript_name)
         with open(transcript_path, "w", encoding="utf-8") as f:
             for entry in final_transcript:
                 f.write(f"[{entry[0]:.4f} - {entry[1]:.4f}] -> {entry[2]}: {entry[3]}\n")
 
-        logging.info(f"Final transcript for-{diarization_result[0].audio_file} saved to final_transcript_{str(file_counter)}.txt")
+        logging.info(f"Final transcript for-{diarization_result[0].audio_file} saved to {transcript_name}")
         self.transcription_queue.put(transcript_path)
-        file_counter += 1
     
     def unload_model(self, attr_name: str):
         '''
