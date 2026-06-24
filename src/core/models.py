@@ -204,3 +204,143 @@ class TranscriptClassificationResult:
     reason: str
     suggested_action: Optional[str] = None
     memory_content: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ProactiveTopicCandidate:
+    """A queued proactive research topic inferred from ambient context."""
+    topic_id: str
+    normalized_topic: str
+    display_title: str
+    source_ref: str
+    speaker_label: str
+    summary_hint: str
+    salience_score: float
+    status: str = "pending"
+    first_seen_at: str = ""
+    last_seen_at: str = ""
+    artifact_path: Optional[str] = None
+    last_researched_at: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ResearchPackageResult:
+    """Result of producing or updating a proactive research package."""
+    display_title: str
+    artifact_path: str
+    summary: str
+    notes: str
+    links: List[Dict[str, str]] = field(default_factory=list)
+    was_update: bool = False
+    meaningful_change: bool = True
+
+
+@dataclass(frozen=True)
+class AmbientAgendaItem:
+    """A durable ambient priority considered between transcript turns."""
+    agenda_id: str
+    title: str
+    kind: str
+    source_type: str
+    source_ref: str
+    priority_score: float
+    status: str
+    created_at: str
+    updated_at: str
+    due_at: Optional[str] = None
+    last_considered_at: Optional[str] = None
+    backing_topic_id: Optional[str] = None
+    backing_memory_ids: List[str] = field(default_factory=list)
+    surface_message: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class AmbientReflectionAction:
+    """One bounded action chosen by the reflection layer."""
+    action_type: str
+    payload: Dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class TranscriptEvidence:
+    """Structured evidence extracted from one transcript turn."""
+    evidence_id: str
+    source_ref: str
+    speaker_id: str
+    speaker_label: str
+    session_id: Optional[str]
+    signal_type: str
+    content: str
+    normalized_entities: List[str] = field(default_factory=list)
+    time_hints: List[str] = field(default_factory=list)
+    action_hints: List[str] = field(default_factory=list)
+    trust_score: float = 0.0
+    created_at: str = ""
+
+
+@dataclass(frozen=True)
+class ConversationSession:
+    """A transcript-backed conversation episode spanning multiple chunks."""
+    session_id: str
+    started_at: str
+    ended_at: str
+    participant_ids: List[str] = field(default_factory=list)
+    status: str = "open"
+    topic_summary: str = ""
+    entity_summary: str = ""
+    recent_turn_summary: str = ""
+    last_activity_at: str = ""
+    continuation_score: float = 0.0
+    derived_loop_ids: List[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class OpenLoop:
+    """A durable unresolved intent inferred from transcript evidence."""
+    loop_id: str
+    title: str
+    loop_type: str
+    status: str
+    owner_speaker_id: str
+    source_session_id: str
+    supporting_event_ids: List[str] = field(default_factory=list)
+    confidence: float = 0.0
+    urgency: float = 0.0
+    due_hint: Optional[str] = None
+    next_action_hint: Optional[str] = None
+    last_updated_at: str = ""
+    resolution_summary: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class UserProfileFacet:
+    """One categorized profile entry derived from repeated transcript evidence."""
+    facet_id: str
+    speaker_id: str
+    category: str
+    title: str
+    summary: str
+    confidence: float = 0.0
+    strength: int = 1
+    status: str = "tentative"
+    source_event_ids: List[str] = field(default_factory=list)
+    updated_at: str = ""
+
+
+@dataclass(frozen=True)
+class InteractionLogEntry:
+    """One persisted LLM interaction request/response pair."""
+    interaction_id: str
+    created_at: str
+    completed_at: Optional[str]
+    source: str
+    model: str
+    messages_json: str
+    tools_json: Optional[str] = None
+    image_path: Optional[str] = None
+    response_text: Optional[str] = None
+    reasoning_text: Optional[str] = None
+    tool_calls_json: Optional[str] = None
+    error_text: Optional[str] = None
+    duration_ms: Optional[int] = None
+    metadata_json: Optional[str] = None
