@@ -34,6 +34,7 @@ class SpeakerResolutionService:
                 speaker = self.memory.upsert_speaker(
                     display_name=display_name,
                     source_label=raw_label,
+                    is_user=self._is_user_label(normalized_label),
                 )
 
             resolved[raw_label] = TranscriptParticipant(
@@ -52,3 +53,7 @@ class SpeakerResolutionService:
 
     def _is_raw_diarization_label(self, label: str) -> bool:
         return bool(self.RAW_DIARIZATION_PATTERN.match(label.strip()))
+
+    def _is_user_label(self, label: str) -> bool:
+        normalized = label.strip().upper()
+        return normalized in {"USER", "ME"}

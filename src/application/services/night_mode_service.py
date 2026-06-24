@@ -4,8 +4,10 @@ import logging
 from application.ports.notification_port import NotificationPort
 from application.ports.task_provider_port import TaskProviderPort
 from application.ports.task_queue_port import TaskQueuePort
+from application.services.ambient_reflection_service import AmbientReflectionService
 from application.services.llm_interaction_service import LLMInteractionService
 from application.services.memory_consolidation_service import MemoryConsolidationService
+from application.services.proactive_research_service import ProactiveResearchService
 
 
 class NightModeService:
@@ -15,6 +17,10 @@ class NightModeService:
         "You are an autonomous agent working through a list of night-time tasks. "
         "You have access to various tools to help you accomplish these tasks. "
         "DO NOT use the `queue_night_task` tool here."
+    )
+    DEFAULT_PROACTIVE_RESEARCH_PROMPT = (
+        "You are doing bounded proactive research on a topic that surfaced ambiently. "
+        "Produce a private research package and do not take outbound actions."
     )
 
     SLEEP_INTERVAL = 30
@@ -27,6 +33,8 @@ class NightModeService:
         notification_port: NotificationPort,
         llm_service: LLMInteractionService,
         memory_consolidator: MemoryConsolidationService | None = None,
+        proactive_research_service: ProactiveResearchService | None = None,
+        ambient_reflection_service: AmbientReflectionService | None = None,
         model: str = "",
         username: str = "",
     ):
@@ -35,6 +43,8 @@ class NightModeService:
         self.notifications = notification_port
         self.llm_service = llm_service
         self.memory_consolidator = memory_consolidator
+        self.proactive_research_service = proactive_research_service
+        self.ambient_reflection_service = ambient_reflection_service
         self.model = model
         self.logger = logging.getLogger(self.__class__.__name__)
 
@@ -101,6 +111,33 @@ class NightModeService:
                         self.logger.info("Consolidated %s pending memory events.", consolidated)
                 except Exception as exc:
                     self.logger.error("Error consolidating memory: %s", exc)
+
+            if self.proactive_research_service is not None:
+                try:
+                    processed = await self.proactive_research_service.process_topics(
+                        system_prompt=self.DEFAULT_PROACTIVE_RESEARCH_PROMPT,
+                        model=self.model,
+                        max_topics=2,
+                    )
+                    if processed:
+                        self.logger.info("Processed %s proactive research topics.", processed)
+                except Exception as exc:
+                    self.logger.error("Error running proactive research: %s", exc)
+
+            if self.ambient_reflection_service is not None and self.memory_consolidator is not None:
+                try:
+                    reflection_actions = await self.ambient_reflection_service.reflect(
+                        model=self.model,
+                        recent_context=self.memory_consolidator.memory.get_recent_context(),
+                    )
+                    if reflection_actions:
+                        self.logger.info(
+                            "Ambient reflection produced %s action(s): %s",
+                            len(reflection_actions),
+                            ", ".join(action.action_type for action in reflection_actions),
+                        )
+                except Exception as exc:
+                    self.logger.error("Error running ambient reflection: %s", exc)
 
             notifications_str = self._format_notifications()
             if notifications_str == "No new notifications.":

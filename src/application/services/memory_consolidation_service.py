@@ -60,6 +60,15 @@ class MemoryConsolidationService:
                     profile_lines.append(f"- [{topic}] {fact.fact_text}")
             else:
                 profile_lines.append("- No curated memory yet.")
+            facets = self.memory.get_profile_facets(
+                speaker_id,
+                statuses=["durable", "tentative"],
+                limit=30,
+            )
+            if facets:
+                profile_lines.extend(["", "## Ambient Facets"])
+                for facet in facets:
+                    profile_lines.append(f"- [{facet.category}] {facet.summary}")
             self.memory.save_speaker_profile(speaker_id, "\n".join(profile_lines) + "\n")
 
             if accepted_facts:
@@ -82,6 +91,27 @@ class MemoryConsolidationService:
         else:
             recent_context_lines.append("- No recent shared context.")
         self.memory.save_recent_context("\n".join(recent_context_lines) + "\n")
+
+        sessions = self.memory.list_sessions(statuses=["open"], limit=5)
+        session_lines = ["# Session Digest", ""]
+        if sessions:
+            for session in sessions:
+                session_lines.append(f"- {session.topic_summary or 'general conversation'}")
+                if session.recent_turn_summary:
+                    session_lines.append(f"  {session.recent_turn_summary}")
+        else:
+            session_lines.append("- No active sessions.")
+        self.memory.save_session_digest("\n".join(session_lines) + "\n")
+
+        loops = self.memory.list_open_loops(statuses=["open", "tentative"], limit=10)
+        loop_lines = ["# Open Loops", ""]
+        if loops:
+            for loop in loops:
+                suffix = f" | due: {loop.due_hint}" if loop.due_hint else ""
+                loop_lines.append(f"- [{loop.status}] {loop.title}{suffix}")
+        else:
+            loop_lines.append("- No tracked open loops.")
+        self.memory.save_open_loop_digest("\n".join(loop_lines) + "\n")
 
         self.memory.mark_events_consolidated(processed_event_ids, consolidated_at)
         return len(processed_event_ids)
