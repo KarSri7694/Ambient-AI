@@ -143,20 +143,35 @@ class LLMInteractionService:
                     model_names.append(name)
         return model_names
 
-    def _tools_for_agent_depth(self, agent_depth: int) -> List[Dict[str, Any]]:
+    def _tools_for_agent_depth(
+        self,
+        agent_depth: int,
+        allowed_tool_names: Optional[set[str]] = None,
+    ) -> List[Dict[str, Any]]:
         """Return the tool set allowed for the current agent depth."""
         if not self._tools:
             return []
         if agent_depth < self.MAX_AGENT_DEPTH:
-            return list(self._tools)
+            tools = list(self._tools)
+        else:
+            filtered_tools: List[Dict[str, Any]] = []
+            for tool in self._tools:
+                function_meta = tool.get("function", {})
+                tool_name = function_meta.get("name")
+                if tool_name in {"load_agent", "list_available_models"}:
+                    continue
+                filtered_tools.append(tool)
+            tools = filtered_tools
+
+        if allowed_tool_names is None:
+            return tools
 
         filtered_tools: List[Dict[str, Any]] = []
-        for tool in self._tools:
+        for tool in tools:
             function_meta = tool.get("function", {})
             tool_name = function_meta.get("name")
-            if tool_name in {"load_agent", "list_available_models"}:
-                continue
-            filtered_tools.append(tool)
+            if tool_name in allowed_tool_names:
+                filtered_tools.append(tool)
         return filtered_tools
 
     async def run_interaction(
@@ -166,6 +181,7 @@ class LLMInteractionService:
         model: str,
         image_path: str = "",
         agent_depth: int = 0,
+        allowed_tool_names: Optional[set[str]] = None,
     ) -> str:
         """
         Run a full LLM interaction: send user input, stream response,
@@ -190,7 +206,7 @@ class LLMInteractionService:
             completion = await self.llm.chat_completion_stream(
                 model=model,
                 messages=self._frame.messages,
-                tools=self._tools_for_agent_depth(agent_depth),
+                tools=self._tools_for_agent_depth(agent_depth, allowed_tool_names=allowed_tool_names),
                 image=image_path if iteration == 1 else "",
             )
 
@@ -210,7 +226,11 @@ class LLMInteractionService:
             })
 
             # Execute each tool call
-            tool_results = await self._execute_tool_calls(tool_calls, agent_depth=agent_depth)
+            tool_results = await self._execute_tool_calls(
+                tool_calls,
+                agent_depth=agent_depth,
+                allowed_tool_names=allowed_tool_names,
+            )
             if any(name in self.TERMINAL_TOOL_NAMES for name, _ in tool_results):
                 self.logger.info("Terminal tool executed; ending interaction loop.")
                 # if tool_results[0][0] == "save_state":
@@ -300,6 +320,7 @@ class LLMInteractionService:
         self,
         tool_calls: List[Dict],
         agent_depth: int = 0,
+        allowed_tool_names: Optional[set[str]] = None,
     ) -> List[tuple[str, str]]:
         """
         Execute tool calls, append results to history, and return the tool outputs.
@@ -317,6 +338,17 @@ class LLMInteractionService:
 
             try:
                 tool_args = json.loads(tool_args_str) if tool_args_str else {}
+                if allowed_tool_names is not None and tool_name not in allowed_tool_names:
+                    response_content = f"Error: tool '{tool_name}' is not allowed in this interaction."
+                    self.logger.warning(response_content)
+                    tool_results.append((tool_name, response_content))
+                    self._frame.messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_id,
+                        "name": tool_name,
+                        "content": response_content,
+                    })
+                    continue
                 if tool_name == "load_agent":
                     if agent_depth >= self.MAX_AGENT_DEPTH:
                         response_content = (
@@ -373,6 +405,7 @@ class LLMInteractionService:
                             system_prompt=self.AGENT_PROMPT,
                             model=model_name,
                             agent_depth=agent_depth + 1,
+                            allowed_tool_names=allowed_tool_names,
                         )
                     finally:
                         self._pop_frame()

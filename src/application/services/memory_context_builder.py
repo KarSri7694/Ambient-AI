@@ -14,16 +14,19 @@ class MemoryContextBuilder:
 
     def build_prompt(
         self,
+        base_prompt_filename: str,
         skills_summary: str,
         participants: Iterable[TranscriptParticipant],
+        include_skills: bool = True,
     ) -> str:
         prompt_parts = [
-            self._read_prompt_file("AGENT.md"),
+            self._read_prompt_file(base_prompt_filename),
             self._read_prompt_file("USER.md"),
             self._build_recent_context_section(),
             self._build_participant_memory_section(participants),
-            skills_summary,
         ]
+        if include_skills:
+            prompt_parts.append(skills_summary)
         return "\n\n".join(part for part in prompt_parts if part.strip())
 
     def _read_prompt_file(self, filename: str) -> str:

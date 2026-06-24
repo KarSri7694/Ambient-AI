@@ -7,16 +7,21 @@ import queue
 import threading
 import time
 from typing import Optional
+import uuid
 
 from application.services.llm_interaction_service import LLMInteractionService
 from application.services.memory_consolidation_service import MemoryConsolidationService
 from application.services.memory_context_builder import MemoryContextBuilder
-from application.services.memory_extraction_service import MemoryExtractionService
+from application.services.simple_task_execution_service import SimpleTaskExecutionService
 from application.services.speaker_resolution_service import SpeakerResolutionService
+from application.services.transcript_classification_service import TranscriptClassificationService
 from audio_agent import AudioAgentService
 from infrastructure.adapter.llamaCppAdapter import LlamaCppAdapter
 from infrastructure.adapter.MCPToolAdapter import MCPToolAdapter
 from infrastructure.adapter.SQLiteMemoryAdapter import SQLiteMemoryAdapter
+from infrastructure.adapter.SQLiteNotificationAdapter import SQLiteNotificationAdapter
+from infrastructure.adapter.SQLiteTaskQueueAdapter import SQLiteTaskQueueAdapter
+from core.models import MemoryEvent, TranscriptClassificationResult
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,6 +37,8 @@ PROMPTS_ROOT = PROJECT_ROOT / "prompts"
 USER_DATA_DIR = Path(os.getenv("USER_DATA_DIR", "D:\\USER_DATA"))
 MEMORY_ROOT = USER_DATA_DIR / "memory"
 MEMORY_DB_PATH = PROJECT_ROOT / "database" / "memory.db"
+CLASSIFIER_PROMPT = "TRANSCRIPT_CLASSIFIER.md"
+SIMPLE_EXECUTOR_PROMPT = "SIMPLE_EXECUTOR.md"
 
 
 def build_available_skills_summary() -> str:
@@ -89,6 +96,8 @@ class TranscriptionService:
             llm_provider=llm_adapter,
             tool_bridge=tool_bridge,
         )
+        task_queue = SQLiteTaskQueueAdapter()
+        notification_store = SQLiteNotificationAdapter()
         memory_store = SQLiteMemoryAdapter(
             db_path=str(MEMORY_DB_PATH),
             memory_root=str(MEMORY_ROOT),
@@ -98,70 +107,167 @@ class TranscriptionService:
             prompts_root=str(PROMPTS_ROOT),
         )
         speaker_resolution = SpeakerResolutionService(memory=memory_store)
-        memory_extraction = MemoryExtractionService(llm_provider=llm_adapter)
+        classifier = TranscriptClassificationService(llm_provider=llm_adapter)
+        simple_executor = SimpleTaskExecutionService(llm_service=llm_service)
         memory_consolidation = MemoryConsolidationService(memory=memory_store)
         return (
             llm_adapter,
             tool_bridge,
             llm_service,
+            task_queue,
+            notification_store,
             memory_store,
             memory_context_builder,
             speaker_resolution,
-            memory_extraction,
+            classifier,
+            simple_executor,
             memory_consolidation,
         )
 
     async def _process_one(
         self,
         llm_service: LLMInteractionService,
+        task_queue: SQLiteTaskQueueAdapter,
+        notification_store: SQLiteNotificationAdapter,
         memory_store: SQLiteMemoryAdapter,
         memory_context_builder: MemoryContextBuilder,
         speaker_resolution: SpeakerResolutionService,
-        memory_extraction: MemoryExtractionService,
+        classifier: TranscriptClassificationService,
+        simple_executor: SimpleTaskExecutionService,
         content: str,
         transcript_path: str,
     ):
-        turns = memory_extraction.parse_transcript(content)
+        turns = classifier.parse_transcript(content)
         participants = speaker_resolution.resolve_labels(
             [turn.speaker_label for turn in turns],
             source_ref=Path(transcript_path).stem,
         )
-        system_prompt = memory_context_builder.build_prompt(
+        classifier_prompt = memory_context_builder.build_prompt(
+            base_prompt_filename=CLASSIFIER_PROMPT,
             skills_summary=build_available_skills_summary(),
             participants=participants.values(),
+            include_skills=False,
+        )
+        executor_prompt = memory_context_builder.build_prompt(
+            base_prompt_filename=SIMPLE_EXECUTOR_PROMPT,
+            skills_summary=build_available_skills_summary(),
+            participants=participants.values(),
+            include_skills=False,
         )
 
         try:
-            await llm_service.run_interaction(
-                user_input=f"Current date and time: {datetime.now()}     Transcript Content: {content}",
-                system_prompt=system_prompt,
-                model=DEFAULT_MODEL,
-            )
-            candidate_events = await memory_extraction.extract_events(
+            classification = await classifier.classify(
                 transcript_text=content,
                 participants=participants,
+                system_prompt=classifier_prompt,
                 model=DEFAULT_MODEL,
-                source_ref=transcript_path,
             )
-            for event in candidate_events:
-                memory_store.append_event(event)
             logger.info(
-                "Captured %s candidate memory events from %s",
-                len(candidate_events),
-                transcript_path,
+                "Transcript classified as %s for %s: %s",
+                classification.label,
+                classification.speaker_label,
+                classification.summary,
+            )
+            await self._dispatch_classification(
+                classification=classification,
+                content=content,
+                transcript_path=transcript_path,
+                task_queue=task_queue,
+                notification_store=notification_store,
+                memory_store=memory_store,
+                participants=participants,
+                simple_executor=simple_executor,
+                executor_prompt=executor_prompt,
             )
         finally:
             llm_service.reset_context()
+
+    async def _dispatch_classification(
+        self,
+        classification: TranscriptClassificationResult,
+        content: str,
+        transcript_path: str,
+        task_queue: SQLiteTaskQueueAdapter,
+        notification_store: SQLiteNotificationAdapter,
+        memory_store: SQLiteMemoryAdapter,
+        participants,
+        simple_executor: SimpleTaskExecutionService,
+        executor_prompt: str,
+    ) -> None:
+        if classification.label == "NOTHING":
+            return
+
+        if classification.label in {"FACT", "PREFERENCE"}:
+            participant = participants.get(classification.speaker_label)
+            if participant is None:
+                return
+            memory_text = classification.memory_content or classification.summary
+            memory_store.append_event(
+                MemoryEvent(
+                    event_id=uuid.uuid4().hex,
+                    speaker_id=participant.speaker_id,
+                    source_type="transcript",
+                    source_ref=transcript_path,
+                    event_kind=classification.label.lower(),
+                    content=memory_text,
+                    confidence=classification.confidence,
+                    status="candidate",
+                    created_at=datetime.now().isoformat(),
+                )
+            )
+            return
+
+        if classification.label == "TASK_COMPLEX":
+            queue_payload = (
+                f"Transcript source: {transcript_path}\n"
+                f"Speaker: {classification.speaker_label}\n"
+                f"Summary: {classification.summary}\n"
+                f"Suggested action: {classification.suggested_action or classification.summary}\n"
+                f"Transcript content:\n{content}"
+            )
+            task_queue.add_task(queue_payload, priority="medium")
+            notification_store.add_notification(
+                f"Queued complex ambient task: {classification.summary}",
+                source="classifier",
+            )
+            return
+
+        if classification.label in {"REMINDER", "TASK_SIMPLE"}:
+            try:
+                execution_result = await simple_executor.execute(
+                    classification=classification,
+                    transcript_text=content,
+                    system_prompt=executor_prompt,
+                    model=DEFAULT_MODEL,
+                )
+                logger.info("Simple executor result: %s", execution_result)
+            except Exception as exc:
+                logger.exception("Simple executor failed for %s", classification.summary)
+                notification_store.add_notification(
+                    f"Simple execution failed for '{classification.summary}': {exc}",
+                    source="simple_executor",
+                )
+                fallback_payload = (
+                    f"Fallback queued from simple executor failure.\n"
+                    f"Classification: {classification.label}\n"
+                    f"Summary: {classification.summary}\n"
+                    f"Transcript source: {transcript_path}"
+                )
+                task_queue.add_task(fallback_payload, priority="medium")
+            return
 
     async def run_loop(self):
         (
             llm_adapter,
             tool_bridge,
             llm_service,
+            task_queue,
+            notification_store,
             memory_store,
             memory_context_builder,
             speaker_resolution,
-            memory_extraction,
+            classifier,
+            simple_executor,
             memory_consolidation,
         ) = self._build_services()
         services_initialized = False
@@ -228,10 +334,13 @@ class TranscriptionService:
                     with self.gpu_lock:
                         await self._process_one(
                             llm_service=llm_service,
+                            task_queue=task_queue,
+                            notification_store=notification_store,
                             memory_store=memory_store,
                             memory_context_builder=memory_context_builder,
                             speaker_resolution=speaker_resolution,
-                            memory_extraction=memory_extraction,
+                            classifier=classifier,
+                            simple_executor=simple_executor,
                             content=content,
                             transcript_path=file_path,
                         )

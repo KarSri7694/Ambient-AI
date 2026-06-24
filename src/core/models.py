@@ -192,3 +192,15 @@ class MemoryReflection:
     summary: str
     created_at: str
     source_event_ids: List[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class TranscriptClassificationResult:
+    """A single bounded classification result for one transcript chunk."""
+    label: str
+    speaker_label: str
+    summary: str
+    confidence: float
+    reason: str
+    suggested_action: Optional[str] = None
+    memory_content: Optional[str] = None
