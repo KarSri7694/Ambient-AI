@@ -190,7 +190,7 @@ def schedule_meeting(title: Annotated[str, "Title of the meeting"] = None,
 def add(a: int, b: int) -> int:
     return a + b
 
-@mcp.tool(enabled=False)
+@mcp.tool
 def google_search(query: Annotated[str, "The google search query"], 
                num_results: Annotated[int, "Number of top results to return"] = 5) -> str:
     """
@@ -199,7 +199,7 @@ def google_search(query: Annotated[str, "The google search query"],
     params = {
         "engine": "google",
         "q": query,
-        "api_key": ""
+        "api_key": SERPAPI_API_KEY
     }
     
     search = serpapi.search(params)
