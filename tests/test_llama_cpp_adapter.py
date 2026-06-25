@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import sys
 from pathlib import Path
@@ -35,7 +36,51 @@ def test_kv_state_filename_rejects_unrecognized_names():
         KVStateControl.extract_model_name_from_kv_state_file("state.bin")
 
 
-def test_restore_and_load_loads_extracted_model_before_restore(monkeypatch):
+def test_restore_and_load_loads_extracted_model_before_restore(monkeypatch, tmp_path):
+    model_name = "models/Qwen 3 VL"
+    filename = (
+        f"{KVStateControl.encode_model_name_for_filename(model_name)}"
+        "_20260608_123456_kv_state.bin"
+    )
+    kv_path = tmp_path / filename
+    kv_path.write_bytes(b"placeholder")
+    adapter = LlamaCppAdapter.__new__(LlamaCppAdapter)
+    adapter.logger = logging.getLogger("test")
+    adapter.currently_loaded_model = None
+    calls = []
+
+    async def fake_load_model(name, unload_previous=True):
+        calls.append(("load", name, unload_previous))
+        adapter.currently_loaded_model = name
+
+    def fake_restore(name):
+        calls.append(("restore", name))
+
+    class FakeKVState:
+        def peek_kv_state(self):
+            return str(kv_path)
+
+        def pop_kv_state(self):
+            return str(kv_path)
+
+        @staticmethod
+        def extract_model_name_from_kv_state_file(name):
+            return KVStateControl.extract_model_name_from_kv_state_file(name)
+
+    adapter.kv_state = FakeKVState()
+    monkeypatch.setattr(adapter, "load_model", fake_load_model)
+    monkeypatch.setattr(adapter, "restore_kv_state", fake_restore)
+    monkeypatch.setattr(adapter, "_wait_for_model_restore_ready", lambda _model_name: None)
+
+    asyncio.run(adapter.load_and_restore())
+
+    assert calls == [
+        ("load", model_name, True),
+        ("restore", str(kv_path)),
+    ]
+
+
+def test_restore_and_load_skips_kv_restore_when_state_file_is_missing(monkeypatch, tmp_path):
     model_name = "models/Qwen 3 VL"
     filename = (
         f"{KVStateControl.encode_model_name_for_filename(model_name)}"
@@ -50,12 +95,12 @@ def test_restore_and_load_loads_extracted_model_before_restore(monkeypatch):
         calls.append(("load", name, unload_previous))
         adapter.currently_loaded_model = name
 
-    async def fake_restore(name):
-        calls.append(("restore", name))
-
     class FakeKVState:
+        def peek_kv_state(self):
+            return str(tmp_path / filename)
+
         def pop_kv_state(self):
-            return filename
+            return str(tmp_path / filename)
 
         @staticmethod
         def extract_model_name_from_kv_state_file(name):
@@ -63,14 +108,12 @@ def test_restore_and_load_loads_extracted_model_before_restore(monkeypatch):
 
     adapter.kv_state = FakeKVState()
     monkeypatch.setattr(adapter, "load_model", fake_load_model)
-    monkeypatch.setattr(adapter, "restore_kv_state", fake_restore)
+    monkeypatch.setattr(adapter, "restore_kv_state", lambda _: calls.append(("restore", filename)))
 
-    asyncio.run(adapter.load_and_restore())
+    restored = asyncio.run(adapter.load_and_restore())
 
-    assert calls == [
-        ("load", model_name, True),
-        ("restore", filename),
-    ]
+    assert restored.name == filename
+    assert calls == [("load", model_name, True)]
 
 
 def test_save_and_unload_awaits_unload_after_successful_save(monkeypatch):
@@ -78,8 +121,8 @@ def test_save_and_unload_awaits_unload_after_successful_save(monkeypatch):
     adapter.currently_loaded_model = "model"
     calls = []
 
-    def fake_save():
-        calls.append("save")
+    def fake_save(messages):
+        calls.append(("save", messages))
         return Path("state.bin")
 
     async def fake_unload():
@@ -89,8 +132,45 @@ def test_save_and_unload_awaits_unload_after_successful_save(monkeypatch):
     monkeypatch.setattr(adapter, "save_current_kv_state", fake_save)
     monkeypatch.setattr(adapter, "unload_model", fake_unload)
 
-    assert asyncio.run(adapter.save_and_unload()) == Path("state.bin")
-    assert calls == ["save", "unload"]
+    assert asyncio.run(adapter.save_and_unload([{"role": "user", "content": "hi"}])) == Path("state.bin")
+    assert calls == [("save", [{"role": "user", "content": "hi"}]), "unload"]
+
+
+def test_save_current_kv_state_uses_python_only_snapshot_for_multimodal(monkeypatch, tmp_path):
+    adapter = LlamaCppAdapter.__new__(LlamaCppAdapter)
+    adapter.logger = logging.getLogger("test")
+    adapter.currently_loaded_model = "vision-model"
+    pushed = []
+    updated = {}
+    shared_dir = tmp_path
+
+    class FakeKVState:
+        def kv_state_dir(self):
+            return shared_dir
+
+        def safe_kv_state_filename(self):
+            return (
+                f"{KVStateControl.encode_model_name_for_filename('vision-model')}"
+                "_20260608_123456_kv_state.bin"
+            )
+
+        def update_shared_state(self, **kwargs):
+            updated.update(kwargs)
+
+        def push_kv_state(self, value):
+            pushed.append(str(value))
+
+    adapter.kv_state = FakeKVState()
+    monkeypatch.setattr(adapter, "_is_multimodal_model", lambda _model_name=None: True)
+
+    saved_path = adapter.save_current_kv_state([{"role": "user", "content": "hello"}])
+
+    assert saved_path is not None
+    assert saved_path.name.endswith("_kv_state.bin")
+    assert pushed == [str(saved_path)]
+    manifest = json.loads(saved_path.with_suffix(".json").read_text(encoding="utf-8"))
+    assert manifest["kv_cache_saved"] is False
+    assert manifest["messages"] == [{"role": "user", "content": "hello"}]
 
 
 def test_get_current_model_reads_shared_state_when_instance_is_empty(monkeypatch):

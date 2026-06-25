@@ -5,6 +5,7 @@ import logging
 import copy
 import json
 import time
+from datetime import datetime
 
 from application.ports.LLMProvider import LLMProvider
 from application.ports.modelManager import ModelManager
@@ -33,6 +34,7 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         """Load a model through the llama.cpp server model-management endpoint."""
         if self.currently_loaded_model == model_name:
             self.logger.info(f"Model {model_name} is already loaded.")
+            self._wait_for_model_status(model_name, expected_status="loaded")
             return
 
         if unload_previous and self.currently_loaded_model is not None:
@@ -44,10 +46,12 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
             self.logger.info(f"Successfully loaded model: {model_name}")
             self.currently_loaded_model = model_name
             self.kv_state.update_shared_state(currently_loaded_model=model_name)
+            self._wait_for_model_status(model_name, expected_status="loaded")
         elif response.status_code == 400 and "model is already running" in response.text.lower():
             self.logger.info(f"Specified model: {model_name} is already running.")
             self.currently_loaded_model = model_name
             self.kv_state.update_shared_state(currently_loaded_model=model_name)
+            self._wait_for_model_status(model_name, expected_status="loaded")
         else:
             self.logger.error(f"Failed to load model: {model_name}. Response: {response.text}")
 
@@ -61,8 +65,10 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         response = requests.post(f"{self.base_url}/models/unload", json=model)
         if response.status_code == 200:
             self.logger.info(f"Successfully unloaded model: {self.currently_loaded_model}")
+            unloaded_model = self.currently_loaded_model
             self.currently_loaded_model = None
             self.kv_state.update_shared_state(currently_loaded_model=None)
+            self._wait_for_model_status(unloaded_model, expected_status="unloaded")
         elif response.status_code == 400 and "model is not running" in response.text.lower():
             self.logger.info(f"Model {self.currently_loaded_model} is not running.")
             self.currently_loaded_model = None
@@ -77,13 +83,11 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
     def _discover_loaded_model(self) -> Optional[str]:
         """Query the llama.cpp API for the currently loaded model, if any."""
         try:
-            response = requests.get(f"{self.api_uri_v1}/models", timeout=10)
-            response.raise_for_status()
+            models = self._fetch_models()
         except requests.RequestException as exc:
             self.logger.warning("Failed to query loaded llama.cpp models: %s", exc)
             return None
 
-        models = response.json().get("data", [])
         for model in models:
             if model.get("status", {}).get("value") == "loaded":
                 model_id = model.get("id")
@@ -92,6 +96,60 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
                     self.kv_state.update_shared_state(currently_loaded_model=model_id)
                     return model_id
         return None
+
+    def _fetch_models(self) -> List[Dict[str, Any]]:
+        response = requests.get(f"{self.api_uri_v1}/models", timeout=10)
+        response.raise_for_status()
+        payload = response.json()
+        return payload.get("data", [])
+
+    def _get_model_metadata(self, model_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        target = model_name or self.currently_loaded_model or self.get_current_model()
+        if not target:
+            return None
+        for model in self._fetch_models():
+            if model.get("id") == target:
+                return model
+        return None
+
+    def _is_multimodal_model(self, model_name: Optional[str] = None) -> bool:
+        metadata = self._get_model_metadata(model_name)
+        if not metadata:
+            return False
+        modalities = metadata.get("architecture", {}).get("input_modalities", [])
+        normalized = {str(modality).strip().lower() for modality in modalities}
+        return len(normalized) > 1 or "image" in normalized or "audio" in normalized
+
+    def _wait_for_model_status(
+        self,
+        model_name: str,
+        *,
+        expected_status: str,
+        timeout_seconds: float = 30.0,
+    ) -> None:
+        deadline = time.time() + timeout_seconds
+        last_status: Optional[str] = None
+        last_error: Optional[Exception] = None
+
+        while time.time() < deadline:
+            try:
+                metadata = self._get_model_metadata(model_name)
+                if metadata is not None:
+                    last_status = metadata.get("status", {}).get("value")
+                    if last_status == expected_status:
+                        return
+            except Exception as exc:
+                last_error = exc
+            time.sleep(0.25)
+
+        if last_error is not None:
+            raise RuntimeError(
+                f"Timed out waiting for model {model_name} to report status {expected_status}."
+            ) from last_error
+        raise RuntimeError(
+            f"Timed out waiting for model {model_name} to report status {expected_status}. "
+            f"Last seen status was {last_status!r}."
+        )
 
     def _slot_base_url(self) -> str:
         """Resolve the server URL that exposes llama.cpp slot save/restore endpoints."""
@@ -144,6 +202,30 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
             self.currently_loaded_model = self.get_current_model() or self._discover_loaded_model()
 
         save_path = self.kv_state.kv_state_dir() / self.kv_state.safe_kv_state_filename()
+        json_path = save_path.with_suffix(".json")
+        json_path.write_text(
+            json.dumps(
+                {
+                    "model_name": self.currently_loaded_model,
+                    "messages": messages,
+                    "saved_at": datetime.now().isoformat(),
+                    "kv_cache_saved": False,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        if self._is_multimodal_model(self.currently_loaded_model):
+            self.kv_state.update_shared_state(currently_loaded_model=self.currently_loaded_model)
+            self.kv_state.push_kv_state(save_path)
+            self.logger.info(
+                "Skipping KV slot save for multimodal model %s; preserving Python message state only.",
+                self.currently_loaded_model,
+            )
+            return save_path
+
         slot_base_url = self._slot_base_url()
 
         payload = {"filename": save_path.name}
@@ -155,11 +237,20 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
             json=payload,
             timeout=30,
         )
-        json_path = save_path.with_suffix(".json")
-        with open(json_path, "w") as f:
-            json.dump(messages, f)
-
         if response.status_code == 200:
+            json_path.write_text(
+                json.dumps(
+                    {
+                        "model_name": self.currently_loaded_model,
+                        "messages": messages,
+                        "saved_at": datetime.now().isoformat(),
+                        "kv_cache_saved": True,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
             self.kv_state.update_shared_state(currently_loaded_model=self.currently_loaded_model)
             self.kv_state.push_kv_state(save_path)
             self.logger.info(
@@ -232,8 +323,15 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         model_name = self.kv_state.extract_model_name_from_kv_state_file(kv_state_file)
         if self.currently_loaded_model != model_name:
             await self.load_model(model_name)
-        self._wait_for_model_restore_ready(model_name)
-        self.restore_kv_state(kv_state_file)
+        kv_state_path = Path(kv_state_file)
+        if kv_state_path.exists():
+            self._wait_for_model_restore_ready(model_name)
+            self.restore_kv_state(kv_state_file)
+        else:
+            self.logger.info(
+                "No KV cache file exists for %s; restoring Python message context only.",
+                model_name,
+            )
         self.kv_state.pop_kv_state()
         return Path(kv_state_file)
 
