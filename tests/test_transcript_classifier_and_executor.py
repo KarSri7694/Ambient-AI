@@ -1,5 +1,6 @@
 import asyncio
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -8,9 +9,11 @@ SRC_ROOT = REPO_ROOT / "src"
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(SRC_ROOT))
 
+from application.services.activity_ledger_service import ActivityLedgerService
 from application.services.simple_task_execution_service import SimpleTaskExecutionService
 from application.services.transcript_classification_service import TranscriptClassificationService
 from core.models import TranscriptClassificationResult, TranscriptParticipant
+from infrastructure.adapter.SQLiteActivityLedgerAdapter import SQLiteActivityLedgerAdapter
 
 
 class FakeLLMService:
@@ -98,24 +101,33 @@ class TranscriptClassifierAndExecutorTests(unittest.TestCase):
 
     def test_simple_executor_uses_restricted_tools(self):
         llm_service = FakeLLMService()
-        executor = SimpleTaskExecutionService(llm_service=llm_service)
-        classification = TranscriptClassificationResult(
-            label="REMINDER",
-            speaker_label="USER",
-            summary="Tomorrow remind me to call mom.",
-            confidence=0.8,
-            reason="matched_reminder_tokens",
-            suggested_action="Create a reminder to call mom tomorrow.",
-        )
-
-        result = asyncio.run(
-            executor.execute(
-                classification=classification,
-                transcript_text="[0.0 - 1.0] -> USER: tomorrow remind me to call mom",
-                system_prompt="executor prompt",
-                model="unused",
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ledger = ActivityLedgerService(
+                SQLiteActivityLedgerAdapter(db_path=str(Path(tmpdir) / "activity_ledger.db"))
             )
-        )
+            executor = SimpleTaskExecutionService(llm_service=llm_service, activity_ledger=ledger)
+            classification = TranscriptClassificationResult(
+                label="REMINDER",
+                speaker_label="USER",
+                summary="Tomorrow remind me to call mom.",
+                confidence=0.8,
+                reason="matched_reminder_tokens",
+                suggested_action="Create a reminder to call mom tomorrow.",
+            )
+
+            result = asyncio.run(
+                executor.execute(
+                    classification=classification,
+                    transcript_text="[0.0 - 1.0] -> USER: tomorrow remind me to call mom",
+                    system_prompt="executor prompt",
+                    model="unused",
+                )
+            )
+
+            runs = ledger.ledger.list_runs(source_kind="simple_execution")
+            self.assertEqual(len(runs), 1)
+            self.assertEqual(runs[0].status, "completed")
+            self.assertEqual(runs[0].output_text, "executor-finished")
 
         self.assertEqual(result, "executor-finished")
         self.assertEqual(len(llm_service.calls), 1)

@@ -10,10 +10,12 @@ SRC_ROOT = REPO_ROOT / "src"
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(SRC_ROOT))
 
+from application.services.activity_ledger_service import ActivityLedgerService
 from application.services.proactive_research_service import ProactiveResearchService
 from application.services.proactive_topic_detection_service import ProactiveTopicDetectionService
 from application.services.research_vault_service import ResearchVaultService
 from core.models import TranscriptClassificationResult
+from infrastructure.adapter.SQLiteActivityLedgerAdapter import SQLiteActivityLedgerAdapter
 from infrastructure.adapter.SQLiteProactiveTopicQueueAdapter import SQLiteProactiveTopicQueueAdapter
 
 
@@ -114,6 +116,9 @@ class ProactiveResearchTests(unittest.TestCase):
             topic_queue=self.queue,
             vault=self.vault,
             notifications=notifications,
+            activity_ledger=ActivityLedgerService(
+                SQLiteActivityLedgerAdapter(db_path=str(self.temp_path / "activity_ledger.db"))
+            ),
         )
 
         worked = asyncio.run(service.process_next_topic(system_prompt="research prompt", model="unused"))
@@ -131,6 +136,12 @@ class ProactiveResearchTests(unittest.TestCase):
             llm_service.calls[0]["allowed_tool_names"],
             {"google_search", "powershell_terminal", "queue_night_task"},
         )
+        runs = service.activity_ledger.ledger.list_runs(source_kind="proactive_research")
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0].status, "completed")
+        detail = service.activity_ledger.ledger.get_run_detail(runs[0].run_id)
+        self.assertIsNotNone(detail)
+        self.assertEqual(len(detail.artifacts), 3)
 
 
 if __name__ == "__main__":

@@ -145,7 +145,7 @@ class PassiveObserverTests(unittest.TestCase):
         self.assertEqual(len(self.memory.list_visual_sessions(statuses=["open"], limit=5)), 1)
         self.assertIn("cart review left unfinished", self.memory.get_visual_digest())
 
-    def test_observer_skips_unchanged_screen(self):
+    def test_observer_allows_repeated_capture_processing(self):
         llm = FakeVisualLLM(
             [
                 json.dumps(
@@ -163,7 +163,23 @@ class PassiveObserverTests(unittest.TestCase):
                         "confidence": 0.75,
                         "worth_noting": True,
                     }
-                )
+                ),
+                json.dumps(
+                    {
+                        "app_name": "Docs",
+                        "summary": "Email draft is still open.",
+                        "inferred_user_activity": "still drafting an email",
+                        "previous_activity_status": "continued",
+                        "salient_entities": ["email"],
+                        "completed_items": [],
+                        "open_loops": ["finish email draft"],
+                        "possible_next_task": "finish the email draft",
+                        "user_fact_hypotheses": [],
+                        "suggested_research_topics": [],
+                        "confidence": 0.75,
+                        "worth_noting": True,
+                    }
+                ),
             ]
         )
         capture = FakeScreenCapture([b"same-image", b"same-image"])
@@ -178,8 +194,82 @@ class PassiveObserverTests(unittest.TestCase):
         second = asyncio.run(service.observe(model="test-model", recent_context=""))
 
         self.assertIsNotNone(first)
-        self.assertIsNone(second)
-        self.assertEqual(len(self.memory.get_recent_visual_observations(limit=5)), 1)
+        self.assertIsNotNone(second)
+        self.assertEqual(len(self.memory.get_recent_visual_observations(limit=5)), 2)
+
+    def test_process_screenshot_handles_deferred_queue_item(self):
+        llm = FakeVisualLLM(
+            [
+                json.dumps(
+                    {
+                        "app_name": "Steam",
+                        "summary": "Steam store is open on GTA 5.",
+                        "inferred_user_activity": "checking a game page",
+                        "previous_activity_status": "new",
+                        "salient_entities": ["steam", "gta 5"],
+                        "completed_items": [],
+                        "open_loops": ["decide whether to buy gta 5"],
+                        "possible_next_task": "compare GTA 5 editions later",
+                        "user_fact_hypotheses": [
+                            {
+                                "category": "entertainment_preference",
+                                "title": "interested in open world games",
+                                "summary": "User may be interested in open-world games.",
+                                "confidence": 0.7,
+                                "scope": "temporary",
+                                "evidence_strength": "medium",
+                            }
+                        ],
+                        "suggested_research_topics": [],
+                        "confidence": 0.75,
+                        "worth_noting": True,
+                    }
+                )
+            ]
+        )
+        screenshot = self.temp_path / "queued.png"
+        screenshot.write_bytes(b"queued")
+        service = PassiveObserverService(
+            memory=self.memory,
+            llm_provider=llm,
+            screen_capture=FakeScreenCapture([]),
+            screenshot_root=str(self.temp_path / "shots"),
+        )
+
+        observation = asyncio.run(
+            service.process_screenshot(
+                screenshot_path=str(screenshot),
+                model="test-model",
+                recent_context="",
+                captured_at="2026-06-25T10:00:00",
+            )
+        )
+
+        self.assertIsNotNone(observation)
+        self.assertEqual(observation.app_name, "Steam")
+        self.assertEqual(observation.created_at, "2026-06-25T10:00:00")
+        self.assertEqual(self.memory.get_recent_visual_observations(limit=1)[0].app_name, "Steam")
+        self.assertTrue(screenshot.exists())
+
+    def test_process_screenshot_returns_none_when_file_is_missing(self):
+        llm = FakeVisualLLM([json.dumps({"worth_noting": True})])
+        missing = self.temp_path / "missing.png"
+        service = PassiveObserverService(
+            memory=self.memory,
+            llm_provider=llm,
+            screen_capture=FakeScreenCapture([]),
+            screenshot_root=str(self.temp_path / "shots"),
+        )
+
+        observation = asyncio.run(
+            service.process_screenshot(
+                screenshot_path=str(missing),
+                model="test-model",
+                recent_context="",
+            )
+        )
+
+        self.assertIsNone(observation)
 
     def test_prompt_builder_includes_visual_digest(self):
         self.memory.save_visual_digest("# Passive Visual Context\n\n- Amazon cart review\n")
