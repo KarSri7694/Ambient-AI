@@ -88,6 +88,8 @@ PASSIVE_OBSERVER_ENABLED = os.getenv("PASSIVE_OBSERVER_ENABLED", "false").strip(
 }
 USER_IDLE_THRESHOLD_SECONDS = 20
 SCREENSHOT_QUEUE_MAXLEN = 180
+PASSIVE_OBSERVER_SSIM_THRESHOLD = float(os.getenv("PASSIVE_OBSERVER_SSIM_THRESHOLD", "0.92"))
+PASSIVE_OBSERVER_SSIM_COMPARE_COUNT = int(os.getenv("PASSIVE_OBSERVER_SSIM_COMPARE_COUNT", "4"))
 MAX_SCREENSHOTS_PER_IDLE_CYCLE = 6
 NIGHT_MODE_START_HOUR = 0
 NIGHT_MODE_END_HOUR = 6
@@ -362,6 +364,8 @@ class TranscriptionService:
         screenshot_queue = (
             ScreenshotQueueService(
                 maxlen=SCREENSHOT_QUEUE_MAXLEN,
+                ssim_threshold=PASSIVE_OBSERVER_SSIM_THRESHOLD,
+                ssim_compare_count=PASSIVE_OBSERVER_SSIM_COMPARE_COUNT,
             )
             if PASSIVE_OBSERVER_ENABLED
             else None
@@ -814,7 +818,10 @@ class TranscriptionService:
                     try:
                         screenshot_path = passive_observer.capture_screenshot()
                         queued = screenshot_queue.enqueue(screenshot_path)
-                        logger.info("Queued screenshot for passive observer: %s (queue_size=%s)", queued.screenshot_path, screenshot_queue.size())
+                        if queued is None:
+                            logger.info("Skipped screenshot for passive observer due to SSIM similarity filter: %s (queue_size=%s)", screenshot_path, screenshot_queue.size())
+                        else:
+                            logger.info("Queued screenshot for passive observer: %s (queue_size=%s)", queued.screenshot_path, screenshot_queue.size())
                     except Exception:
                         logger.exception("Passive observer screenshot capture failed.")
                     last_passive_observer_at = now
