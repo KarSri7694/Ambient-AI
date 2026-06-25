@@ -9,8 +9,11 @@ _METADATA: ContextVar[Dict[str, Any]] = ContextVar("interaction_metadata", defau
 
 @contextmanager
 def interaction_trace(source: str, metadata: Dict[str, Any] | None = None):
+    current_metadata = dict(_METADATA.get())
+    merged_metadata = dict(current_metadata)
+    merged_metadata.update(dict(metadata or {}))
     source_token = _SOURCE.set(source)
-    metadata_token = _METADATA.set(dict(metadata or {}))
+    metadata_token = _METADATA.set(merged_metadata)
     try:
         yield
     finally:

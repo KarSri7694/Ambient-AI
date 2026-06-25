@@ -404,3 +404,92 @@ class InteractionLogEntry:
     error_text: Optional[str] = None
     duration_ms: Optional[int] = None
     metadata_json: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ActivityRun:
+    """One user-facing unit of meaningful agent work."""
+    run_id: str
+    created_at: str
+    completed_at: Optional[str]
+    status: str
+    source_kind: str
+    trigger_kind: str
+    title: str
+    summary: str = ""
+    output_text: str = ""
+    model: str = ""
+    session_id: Optional[str] = None
+    parent_run_id: Optional[str] = None
+    priority: str = "medium"
+    error_text: Optional[str] = None
+    metadata_json: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ActivityStep:
+    """One ordered sub-step within an activity run."""
+    step_id: str
+    run_id: str
+    step_index: int
+    step_kind: str
+    title: str
+    status: str
+    started_at: str
+    completed_at: Optional[str] = None
+    input_ref: Optional[str] = None
+    output_ref: Optional[str] = None
+    error_text: Optional[str] = None
+    metadata_json: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ActivityArtifact:
+    """One linked file or small preview associated with a run."""
+    artifact_id: str
+    run_id: str
+    step_id: Optional[str]
+    artifact_kind: str
+    title: str
+    path: Optional[str]
+    mime_type: Optional[str]
+    text_preview: Optional[str]
+    metadata_json: Optional[str]
+    created_at: str
+
+
+@dataclass(frozen=True)
+class ActivityLink:
+    """One cross-link from an activity run to another durable entity."""
+    link_id: str
+    run_id: str
+    entity_type: str
+    entity_id: str
+    relation: str
+    metadata_json: Optional[str]
+
+
+@dataclass(frozen=True)
+class ActivityTraceLink:
+    """One linked raw interaction trace that belongs to a run."""
+    interaction_id: str
+    created_at: str
+    source: str
+    model: str
+    response_text: Optional[str] = None
+    reasoning_text: Optional[str] = None
+    tool_calls_json: Optional[str] = None
+    error_text: Optional[str] = None
+    duration_ms: Optional[int] = None
+    metadata_json: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ActivityRunDetail:
+    """Expanded view of a run for dashboards and API consumers."""
+    run: ActivityRun
+    steps: List[ActivityStep] = field(default_factory=list)
+    artifacts: List[ActivityArtifact] = field(default_factory=list)
+    links: List[ActivityLink] = field(default_factory=list)
+    tags: List[str] = field(default_factory=list)
+    traces: List[ActivityTraceLink] = field(default_factory=list)

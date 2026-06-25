@@ -5,6 +5,7 @@ from typing import List
 from application.ports.LLMProvider import LLMProvider
 from application.ports.memory_port import MemoryPort
 from application.ports.task_queue_port import TaskQueuePort
+from application.services.activity_ledger_service import ActivityLedgerService
 from application.services.interaction_trace import interaction_trace
 from core.models import VisualObservation
 
@@ -37,11 +38,13 @@ Rules:
         memory: MemoryPort,
         task_queue: TaskQueuePort,
         llm_provider: LLMProvider,
+        activity_ledger: ActivityLedgerService | None = None,
         logger: logging.Logger | None = None,
     ):
         self.memory = memory
         self.task_queue = task_queue
         self.llm = llm_provider
+        self.activity_ledger = activity_ledger
         self.logger = logger or logging.getLogger(self.__class__.__name__)
 
     async def maybe_queue_followup(self, *, model: str) -> dict:
@@ -82,6 +85,23 @@ Rules:
             f"[Passive observer] {title}\n{description}",
             priority="low",
         )
+        if self.activity_ledger is not None:
+            run = self.activity_ledger.queue_run(
+                source_kind="passive_observer_followup",
+                trigger_kind="ambient_inference",
+                title=title,
+                summary=description,
+                metadata={"source_observation_id": str(parsed.get("source_observation_id", "")).strip()},
+                tags=["passive_observer", "followup"],
+            )
+            source_observation_id = str(parsed.get("source_observation_id", "")).strip()
+            if source_observation_id:
+                self.activity_ledger.link_entity(
+                    run_id=run.run_id,
+                    entity_type="visual_observation",
+                    entity_id=source_observation_id,
+                    relation="derived_from",
+                )
         return {
             "action": "queue_task",
             "title": title,

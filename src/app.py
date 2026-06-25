@@ -11,6 +11,7 @@ from typing import Optional
 import uuid
 
 from application.services.llm_interaction_service import LLMInteractionService
+from application.services.activity_ledger_service import ActivityLedgerService
 from application.services.ambient_reflection_service import AmbientReflectionService
 from application.services.agenda_scoring_service import AgendaScoringService
 from application.services.memory_consolidation_service import MemoryConsolidationService
@@ -39,6 +40,7 @@ from infrastructure.adapter.MCPToolAdapter import MCPToolAdapter
 from infrastructure.adapter.MSSScreenCaptureAdapter import MssScreenCaptureAdapter
 from infrastructure.adapter.SQLiteMemoryAdapter import SQLiteMemoryAdapter
 from infrastructure.adapter.SQLiteAmbientAgendaAdapter import SQLiteAmbientAgendaAdapter
+from infrastructure.adapter.SQLiteActivityLedgerAdapter import SQLiteActivityLedgerAdapter
 from infrastructure.adapter.SQLiteInteractionLogAdapter import SQLiteInteractionLogAdapter
 from infrastructure.adapter.SQLiteNotificationAdapter import SQLiteNotificationAdapter
 from infrastructure.adapter.SQLiteProactiveTopicQueueAdapter import SQLiteProactiveTopicQueueAdapter
@@ -64,6 +66,7 @@ MEMORY_DB_PATH = PROJECT_ROOT / "database" / "memory.db"
 PROACTIVE_TOPICS_DB_PATH = PROJECT_ROOT / "database" / "proactive_topics.db"
 AMBIENT_AGENDA_DB_PATH = PROJECT_ROOT / "database" / "ambient_agenda.db"
 INTERACTION_LOG_DB_PATH = PROJECT_ROOT / "database" / "interaction_logs.db"
+ACTIVITY_LEDGER_DB_PATH = PROJECT_ROOT / "database" / "activity_ledger.db"
 CURRENT_RESPONSE_PATH = PROJECT_ROOT / "database" / "current_llm_response.md"
 VOICE_DB_PATH = PROJECT_ROOT / "database" / "voice_database.db"
 FINANCE_DB_PATH = PROJECT_ROOT / "database" / "finance.db"
@@ -233,6 +236,7 @@ class TranscriptionService:
             ambient_agenda_db_path=str(AMBIENT_AGENDA_DB_PATH),
             interaction_log_db_path=str(INTERACTION_LOG_DB_PATH),
             proactive_topics_db_path=str(PROACTIVE_TOPICS_DB_PATH),
+            activity_ledger_db_path=str(ACTIVITY_LEDGER_DB_PATH),
             voice_db_path=str(VOICE_DB_PATH),
             finance_db_path=str(FINANCE_DB_PATH),
             facts_db_path=str(FACTS_DB_PATH),
@@ -241,6 +245,11 @@ class TranscriptionService:
         interaction_log_store = SQLiteInteractionLogAdapter(
             db_path=str(INTERACTION_LOG_DB_PATH),
         )
+        activity_ledger_store = SQLiteActivityLedgerAdapter(
+            db_path=str(ACTIVITY_LEDGER_DB_PATH),
+            interaction_log_db_path=str(INTERACTION_LOG_DB_PATH),
+        )
+        activity_ledger = ActivityLedgerService(activity_ledger_store)
         logged_llm = LoggingLLMProvider(
             provider=llm_adapter,
             log_store=interaction_log_store,
@@ -276,7 +285,10 @@ class TranscriptionService:
         session_tracker = SessionTrackerService(memory=memory_store, llm_provider=logged_llm)
         open_loop_service = OpenLoopService(memory=memory_store, llm_provider=logged_llm)
         user_profile_service = UserProfileService(memory=memory_store, llm_provider=logged_llm)
-        simple_executor = SimpleTaskExecutionService(llm_service=llm_service)
+        simple_executor = SimpleTaskExecutionService(
+            llm_service=llm_service,
+            activity_ledger=activity_ledger,
+        )
         proactive_topic_detector = ProactiveTopicDetectionService(
             queue=proactive_topic_queue,
             vault=research_vault,
@@ -286,6 +298,7 @@ class TranscriptionService:
             topic_queue=proactive_topic_queue,
             vault=research_vault,
             notifications=notification_store,
+            activity_ledger=activity_ledger,
         )
         memory_consolidation = MemoryConsolidationService(memory=memory_store)
         agenda_scorer = AgendaScoringService(agenda=agenda_store)
@@ -306,6 +319,7 @@ class TranscriptionService:
             memory_consolidator=memory_consolidation,
             proactive_research_service=proactive_research_service,
             ambient_reflection_service=ambient_reflection,
+            activity_ledger=activity_ledger,
             model=DEFAULT_MODEL,
         )
         passive_followup = (
@@ -313,6 +327,7 @@ class TranscriptionService:
                 memory=memory_store,
                 task_queue=task_queue,
                 llm_provider=logged_llm,
+                activity_ledger=activity_ledger,
             )
             if PASSIVE_OBSERVER_ENABLED
             else None
@@ -363,6 +378,7 @@ class TranscriptionService:
             simple_executor,
             proactive_topic_detector,
             proactive_research_service,
+            activity_ledger,
             memory_consolidation,
             ambient_reflection,
             night_mode_service,
@@ -389,6 +405,7 @@ class TranscriptionService:
         open_loop_service: OpenLoopService,
         user_profile_service: UserProfileService,
         simple_executor: SimpleTaskExecutionService,
+        activity_ledger: ActivityLedgerService,
         content: str,
         transcript_path: str,
     ):
@@ -478,6 +495,7 @@ class TranscriptionService:
                 memory_store=memory_store,
                 participants=durable_participants,
                 simple_executor=simple_executor,
+                activity_ledger=activity_ledger,
                 executor_prompt=executor_prompt,
             )
         finally:
@@ -494,6 +512,7 @@ class TranscriptionService:
         memory_store: SQLiteMemoryAdapter,
         participants,
         simple_executor: SimpleTaskExecutionService,
+        activity_ledger: ActivityLedgerService,
         executor_prompt: str,
     ) -> None:
         if classification.label == "NOTHING":
@@ -543,6 +562,40 @@ class TranscriptionService:
                 f"Transcript content:\n{content}"
             )
             task_queue.add_task(queue_payload, priority="medium")
+            run = activity_ledger.queue_run(
+                source_kind="transcript_task",
+                trigger_kind="transcript",
+                title=classification.summary[:120],
+                summary=classification.summary,
+                output_text="Queued for later execution.",
+                metadata={
+                    "classification_label": classification.label,
+                    "speaker_label": classification.speaker_label,
+                    "transcript_path": transcript_path,
+                },
+                tags=["transcript", "complex_task", "queued_task"],
+            )
+            activity_ledger.link_entity(
+                run_id=run.run_id,
+                entity_type="transcript",
+                entity_id=transcript_path,
+                relation="derived_from",
+            )
+            activity_ledger.attach_artifact(
+                run_id=run.run_id,
+                artifact_kind="transcript",
+                title="Transcript source",
+                path=transcript_path,
+                mime_type="text/plain",
+                text_preview=content[:400],
+            )
+            if topic is not None:
+                activity_ledger.link_entity(
+                    run_id=run.run_id,
+                    entity_type="proactive_topic",
+                    entity_id=topic.topic_id,
+                    relation="queued_related_topic",
+                )
             notification_store.add_notification(
                 (
                     f"Queued complex ambient task: {classification.summary}"
@@ -598,6 +651,7 @@ class TranscriptionService:
             simple_executor,
             proactive_topic_detector,
             proactive_research_service,
+            activity_ledger,
             memory_consolidation,
             ambient_reflection,
             night_mode_service,
@@ -706,6 +760,7 @@ class TranscriptionService:
                                 open_loop_service=open_loop_service,
                                 user_profile_service=user_profile_service,
                                 simple_executor=simple_executor,
+                                activity_ledger=activity_ledger,
                                 content=content,
                                 transcript_path=file_path,
                             )

@@ -3,6 +3,7 @@ from pathlib import Path
 
 import night_mode
 from infrastructure.adapter.SQLiteAmbientAgendaAdapter import SQLiteAmbientAgendaAdapter
+from infrastructure.adapter.SQLiteActivityLedgerAdapter import SQLiteActivityLedgerAdapter
 from infrastructure.adapter.SQLiteInteractionLogAdapter import SQLiteInteractionLogAdapter
 from infrastructure.adapter.SQLiteMemoryAdapter import SQLiteMemoryAdapter
 from infrastructure.adapter.SQLiteProactiveTopicQueueAdapter import SQLiteProactiveTopicQueueAdapter
@@ -15,6 +16,7 @@ def ensure_runtime_databases(
     ambient_agenda_db_path: str,
     interaction_log_db_path: str,
     proactive_topics_db_path: str,
+    activity_ledger_db_path: str,
     voice_db_path: str,
     finance_db_path: str,
     facts_db_path: str,
@@ -23,6 +25,7 @@ def ensure_runtime_databases(
     Path(ambient_agenda_db_path).parent.mkdir(parents=True, exist_ok=True)
     Path(interaction_log_db_path).parent.mkdir(parents=True, exist_ok=True)
     Path(proactive_topics_db_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(activity_ledger_db_path).parent.mkdir(parents=True, exist_ok=True)
     Path(voice_db_path).parent.mkdir(parents=True, exist_ok=True)
     Path(finance_db_path).parent.mkdir(parents=True, exist_ok=True)
     Path(facts_db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -30,6 +33,10 @@ def ensure_runtime_databases(
     SQLiteMemoryAdapter(db_path=memory_db_path, memory_root=memory_root)
     SQLiteAmbientAgendaAdapter(db_path=ambient_agenda_db_path)
     SQLiteInteractionLogAdapter(db_path=interaction_log_db_path)
+    SQLiteActivityLedgerAdapter(
+        db_path=activity_ledger_db_path,
+        interaction_log_db_path=interaction_log_db_path,
+    )
     SQLiteProactiveTopicQueueAdapter(db_path=proactive_topics_db_path)
     _ensure_voice_db(voice_db_path)
     night_mode.init_db()

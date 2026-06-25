@@ -4,9 +4,103 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Ambient AI</title>
-    <body>
-        <h1>Welcome to Ambient AI</h1>
-        <p>This is the homepage for the Ambient AI project.</p>
-        <p><a href="/upload-form">Click Here</a>  to Upload Audio.</p>
-    </body>
+    <style>
+        :root {
+            --bg: #f4efe6;
+            --panel: #fffaf2;
+            --ink: #1d241f;
+            --muted: #5e6b62;
+            --accent: #9b5b2e;
+            --line: #dbcdb8;
+        }
+        body {
+            margin: 0;
+            font-family: Georgia, "Times New Roman", serif;
+            color: var(--ink);
+            background: radial-gradient(circle at top, #fff8ea 0%, var(--bg) 55%, #e8ddca 100%);
+        }
+        main {
+            max-width: 1000px;
+            margin: 0 auto;
+            padding: 32px 20px 48px;
+        }
+        .hero, .panel {
+            background: var(--panel);
+            border: 1px solid var(--line);
+            border-radius: 18px;
+            padding: 24px;
+            box-shadow: 0 14px 32px rgba(61, 43, 28, 0.08);
+            margin-bottom: 18px;
+        }
+        .hero h1, .panel h2 {
+            margin-top: 0;
+        }
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 12px;
+            margin-top: 18px;
+        }
+        .stat {
+            padding: 14px;
+            border-radius: 14px;
+            background: #f8f0e1;
+            border: 1px solid var(--line);
+        }
+        .stat strong {
+            display: block;
+            font-size: 1.5rem;
+            margin-bottom: 6px;
+        }
+        .run {
+            padding: 14px 0;
+            border-top: 1px solid var(--line);
+        }
+        .run:first-of-type {
+            border-top: 0;
+            padding-top: 0;
+        }
+        .meta {
+            color: var(--muted);
+            font-size: 0.95rem;
+        }
+        a {
+            color: var(--accent);
+            text-decoration: none;
+        }
+        a:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+<body>
+    <main>
+        <section class="hero">
+            <h1>Ambient AI Activity Ledger</h1>
+            <p>The ledger is the durable record of explicit tasks, transcript actions, research packages, and night-mode work.</p>
+            <p><a href="/activity/">Browse all activity</a> | <a href="/upload-form/">Upload audio</a></p>
+            <div class="stats">
+                <div class="stat"><strong>{{ summary.completed }}</strong><span>Completed</span></div>
+                <div class="stat"><strong>{{ summary.failed }}</strong><span>Failed</span></div>
+                <div class="stat"><strong>{{ summary.pending }}</strong><span>Queued or running</span></div>
+                <div class="stat"><strong>{{ summary.research }}</strong><span>Research runs</span></div>
+                <div class="stat"><strong>{{ summary.tasks }}</strong><span>Task runs</span></div>
+            </div>
+        </section>
+        <section class="panel">
+            <h2>Recent Work</h2>
+            {% if recent_runs %}
+                {% for run in recent_runs %}
+                    <div class="run">
+                        <div><a href="/activity/{{ run.run_id }}">{{ run.title }}</a></div>
+                        <div class="meta">{{ run.created_at }} | {{ run.status }} | {{ run.source_kind }}</div>
+                        <div>{{ run.summary or run.output_text or "No summary yet." }}</div>
+                    </div>
+                {% endfor %}
+            {% else %}
+                <p>No activity runs have been recorded yet.</p>
+            {% endif %}
+        </section>
+    </main>
+</body>
 </html>
