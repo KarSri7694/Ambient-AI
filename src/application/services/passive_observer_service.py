@@ -48,6 +48,7 @@ Look at the current screenshot, compare it with the previous observation summary
 Rules:
 - Be concrete, not poetic.
 - Prefer visible facts over speculation.
+- Use the provided screenshot timestamp to ground what the user was doing and when.
 - Use previous_activity_status to say whether the last observed activity appears complete, still continuing, or left midway.
 - Use completed_items only when the current screenshot makes earlier activity look done.
 - Use open_loops only for plausible unfinished user intent visible on screen right now.
@@ -92,6 +93,7 @@ Rules:
             screenshot_path=screenshot_path,
             model=model,
             recent_context=recent_context,
+            captured_at=captured_at,
         )
         if not parsed or not self._truthy(parsed.get("worth_noting", True)):
             return None
@@ -187,13 +189,21 @@ Rules:
             lines.append("- No recent visual observations.")
         self.memory.save_visual_digest("\n".join(lines) + "\n")
 
-    async def _analyze(self, *, screenshot_path: str, model: str, recent_context: str) -> dict:
+    async def _analyze(
+        self,
+        *,
+        screenshot_path: str,
+        model: str,
+        recent_context: str,
+        captured_at: str | None = None,
+    ) -> dict:
         if not Path(screenshot_path).exists():
             self.logger.warning("Passive observer screenshot missing before analysis: %s", screenshot_path)
             return {}
         recent_observations = self.memory.get_recent_visual_observations(limit=3)
         previous_observation = recent_observations[0] if recent_observations else None
         payload = {
+            "screenshot_captured_at": captured_at or datetime.now().isoformat(),
             "recent_context": recent_context,
             "visual_digest": self.memory.get_visual_digest(),
             "previous_observation": (

@@ -36,6 +36,7 @@ class DatabaseBootstrapTests(unittest.TestCase):
                 self._assert_table_exists(temp_path / "night_queue.db", "system_notifications")
                 self._assert_table_exists(temp_path / "memory.db", "speakers")
                 self._assert_table_exists(temp_path / "memory.db", "visual_user_facts")
+                self._assert_table_exists(temp_path / "memory.db", "semantic_memory_chunks")
                 self._assert_table_exists(temp_path / "ambient_agenda.db", "ambient_agenda")
                 self._assert_table_exists(temp_path / "interaction_logs.db", "interaction_logs")
                 self._assert_table_exists(temp_path / "proactive_topics.db", "proactive_topics")

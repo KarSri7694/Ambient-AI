@@ -20,6 +20,7 @@ from application.services.night_mode_service import NightModeService
 from application.services.proactive_research_service import ProactiveResearchService
 from application.services.proactive_topic_detection_service import ProactiveTopicDetectionService
 from application.services.research_vault_service import ResearchVaultService
+from application.services.semantic_memory_service import SemanticMemoryService
 from application.services.session_tracker_service import SessionTrackerService
 from application.services.simple_task_execution_service import SimpleTaskExecutionService
 from application.services.speaker_resolution_service import SpeakerResolutionService
@@ -36,6 +37,7 @@ from application.services.visual_user_fact_service import VisualUserFactService
 from audio_agent import AudioAgentService
 from infrastructure.adapter.llamaCppAdapter import LlamaCppAdapter
 from infrastructure.adapter.LoggingLLMProvider import LoggingLLMProvider
+from infrastructure.adapter.LlamaCppSemanticAdapter import LlamaCppEmbeddingAdapter, LlamaCppRerankerAdapter
 from infrastructure.adapter.MCPToolAdapter import MCPToolAdapter
 from infrastructure.adapter.MSSScreenCaptureAdapter import MssScreenCaptureAdapter
 from infrastructure.adapter.SQLiteMemoryAdapter import SQLiteMemoryAdapter
@@ -57,6 +59,8 @@ logger = logging.getLogger(__name__)
 
 API_BASE_URL = "http://localhost:8080"
 DEFAULT_MODEL = "Qwen-3.5-9B-Fable-Distilled-Q4_K_M-Vision"
+EMBEDDING_MODEL_PATH = "EmbeddingGemma"
+RERANKER_MODEL_PATH = "JinaReranker"
 MCP_CONFIG_PATH = "mcp.json"
 PROJECT_ROOT = Path(__file__).parent.parent
 PROMPTS_ROOT = PROJECT_ROOT / "prompts"
@@ -82,7 +86,7 @@ PASSIVE_OBSERVER_ENABLED = os.getenv("PASSIVE_OBSERVER_ENABLED", "false").strip(
     "yes",
     "on",
 }
-USER_IDLE_THRESHOLD_SECONDS = 120
+USER_IDLE_THRESHOLD_SECONDS = 20
 SCREENSHOT_QUEUE_MAXLEN = 180
 MAX_SCREENSHOTS_PER_IDLE_CYCLE = 6
 NIGHT_MODE_START_HOUR = 0
@@ -278,6 +282,21 @@ class TranscriptionService:
             memory=memory_store,
             prompts_root=str(PROMPTS_ROOT),
         )
+        semantic_embedder = LlamaCppEmbeddingAdapter(
+            llm=llm_adapter,
+            model_path=EMBEDDING_MODEL_PATH,
+            messages_provider=llm_service.get_context,
+        )
+        semantic_reranker = LlamaCppRerankerAdapter(
+            llm=llm_adapter,
+            model_path=RERANKER_MODEL_PATH,
+            messages_provider=llm_service.get_context,
+        )
+        semantic_memory_service = SemanticMemoryService(
+            memory=memory_store,
+            embedder=semantic_embedder,
+            reranker=semantic_reranker,
+        )
         transcript_normalizer = TranscriptNormalizationService(llm_provider=logged_llm)
         speaker_resolution = SpeakerResolutionService(memory=memory_store)
         classifier = TranscriptClassificationService(llm_provider=logged_llm)
@@ -368,6 +387,7 @@ class TranscriptionService:
             memory_store,
             research_vault,
             memory_context_builder,
+            semantic_memory_service,
             transcript_normalizer,
             speaker_resolution,
             classifier,
@@ -397,6 +417,7 @@ class TranscriptionService:
         proactive_topic_detector: ProactiveTopicDetectionService,
         memory_store: SQLiteMemoryAdapter,
         memory_context_builder: MemoryContextBuilder,
+        semantic_memory_service: SemanticMemoryService,
         transcript_normalizer: TranscriptNormalizationService,
         speaker_resolution: SpeakerResolutionService,
         classifier: TranscriptClassificationService,
@@ -460,17 +481,24 @@ class TranscriptionService:
         )
         if facets:
             logger.info("Updated %s user profile facet(s).", len(facets))
+        semantic_results = await semantic_memory_service.retrieve(
+            query=content,
+            speaker_ids=[participant.speaker_id for participant in durable_participants.values()],
+        )
+        semantic_memory_section = semantic_memory_service.format_prompt_section(semantic_results)
         classifier_prompt = memory_context_builder.build_prompt(
             base_prompt_filename=CLASSIFIER_PROMPT,
             skills_summary=build_available_skills_summary(),
             participants=participants.values(),
             include_skills=False,
+            semantic_memory_section=semantic_memory_section,
         )
         executor_prompt = memory_context_builder.build_prompt(
             base_prompt_filename=SIMPLE_EXECUTOR_PROMPT,
             skills_summary=build_available_skills_summary(),
             participants=participants.values(),
             include_skills=False,
+            semantic_memory_section=semantic_memory_section,
         )
         try:
             classification = await classifier.classify(
@@ -641,6 +669,7 @@ class TranscriptionService:
             memory_store,
             research_vault,
             memory_context_builder,
+            semantic_memory_service,
             transcript_normalizer,
             speaker_resolution,
             classifier,
@@ -668,7 +697,7 @@ class TranscriptionService:
             include_skills=False,
         )
         idle_cycle_interval = 30
-        passive_observer_interval = 10
+        passive_observer_interval = 10 #interval after which image is taken
         last_idle_cycle_at = 0.0
         last_passive_observer_at = 0.0
         user_idle_now = False
@@ -752,6 +781,7 @@ class TranscriptionService:
                                 proactive_topic_detector=proactive_topic_detector,
                                 memory_store=memory_store,
                                 memory_context_builder=memory_context_builder,
+                                semantic_memory_service=semantic_memory_service,
                                 transcript_normalizer=transcript_normalizer,
                                 speaker_resolution=speaker_resolution,
                                 classifier=classifier,

@@ -38,8 +38,36 @@ class _FakeChunk:
 class FakeVisualLLM:
     def __init__(self, responses):
         self.responses = list(responses)
+        self.currently_loaded_model = "main-model"
+        self.events = []
+        self.calls = []
+
+    def get_current_model(self):
+        return self.currently_loaded_model
+
+    async def load_model(self, model_name: str):
+        self.events.append(("load", model_name))
+        self.currently_loaded_model = model_name
+
+    async def unload_model(self):
+        self.events.append(("unload", self.currently_loaded_model))
+        self.currently_loaded_model = None
 
     async def chat_completion_stream(self, model, messages, tools=None, image="", temperature=0.7, top_p=0.95, top_k=0):
+        user_message = next((item for item in reversed(messages) if item.get("role") == "user"), {})
+        payload = {}
+        try:
+            payload = json.loads(user_message.get("content", "") or "{}")
+        except json.JSONDecodeError:
+            payload = {}
+        self.calls.append(
+            {
+                "model": model,
+                "image": image,
+                "loaded_model": self.currently_loaded_model,
+                "payload": payload,
+            }
+        )
         response = self.responses.pop(0)
 
         async def _gen():
@@ -135,6 +163,7 @@ class PassiveObserverTests(unittest.TestCase):
         observation = asyncio.run(service.observe(model="test-model", recent_context=""))
 
         self.assertIsNotNone(observation)
+        self.assertIn("screenshot_captured_at", llm.calls[0]["payload"])
         persisted = self.memory.get_recent_visual_observations(limit=5)
         self.assertEqual(len(persisted), 1)
         self.assertEqual(persisted[0].app_name, "Amazon")
@@ -248,6 +277,10 @@ class PassiveObserverTests(unittest.TestCase):
         self.assertIsNotNone(observation)
         self.assertEqual(observation.app_name, "Steam")
         self.assertEqual(observation.created_at, "2026-06-25T10:00:00")
+        self.assertEqual(
+            llm.calls[0]["payload"]["screenshot_captured_at"],
+            "2026-06-25T10:00:00",
+        )
         self.assertEqual(self.memory.get_recent_visual_observations(limit=1)[0].app_name, "Steam")
         self.assertTrue(screenshot.exists())
 

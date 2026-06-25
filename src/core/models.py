@@ -388,6 +388,29 @@ class VisualSession:
 
 
 @dataclass(frozen=True)
+class SemanticMemoryChunk:
+    """A searchable text chunk derived from durable ambient memory."""
+    chunk_id: str
+    source_type: str
+    source_id: str
+    source_ref: str
+    speaker_id: Optional[str]
+    content: str
+    metadata_json: str = "{}"
+    embedding: Optional[List[float]] = None
+    created_at: str = ""
+    updated_at: str = ""
+
+
+@dataclass(frozen=True)
+class SemanticMemoryResult:
+    """A ranked semantic memory hit for prompt injection."""
+    chunk: SemanticMemoryChunk
+    vector_score: float = 0.0
+    rerank_score: Optional[float] = None
+
+
+@dataclass(frozen=True)
 class InteractionLogEntry:
     """One persisted LLM interaction request/response pair."""
     interaction_id: str

@@ -18,6 +18,7 @@ class MemoryContextBuilder:
         skills_summary: str,
         participants: Iterable[TranscriptParticipant],
         include_skills: bool = True,
+        semantic_memory_section: str = "",
     ) -> str:
         prompt_parts = [
             self._read_prompt_file(base_prompt_filename),
@@ -26,6 +27,7 @@ class MemoryContextBuilder:
             self._build_session_digest_section(),
             self._build_open_loop_digest_section(),
             self._build_visual_digest_section(),
+            semantic_memory_section,
             self._build_recent_context_section(),
             self._build_participant_memory_section(participants),
         ]

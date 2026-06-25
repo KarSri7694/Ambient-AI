@@ -6,6 +6,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
+try:
+    import sqlite_vec
+except ImportError:  # pragma: no cover - depends on runtime environment
+    sqlite_vec = None
+
 from application.ports.memory_port import MemoryPort
 from core.models import (
     ConversationSession,
@@ -13,6 +18,8 @@ from core.models import (
     MemoryFact,
     MemoryReflection,
     OpenLoop,
+    SemanticMemoryChunk,
+    SemanticMemoryResult,
     SpeakerRecord,
     TranscriptEvidence,
     UserProfileFacet,
@@ -46,6 +53,7 @@ class SQLiteMemoryAdapter(MemoryPort):
     def _connection(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
+        self._load_sqlite_vec_extension(conn)
         return conn
 
     @contextmanager
@@ -253,6 +261,30 @@ class SQLiteMemoryAdapter(MemoryPort):
                 )
                 """
             )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS semantic_memory_chunks (
+                    chunk_id TEXT PRIMARY KEY,
+                    source_type TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    source_ref TEXT NOT NULL,
+                    speaker_id TEXT,
+                    content TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(source_type, source_id)
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS semantic_memory_config (
+                    config_key TEXT PRIMARY KEY,
+                    config_value TEXT NOT NULL
+                )
+                """
+            )
 
     def _ensure_visual_observation_columns(self) -> None:
         required_columns = {
@@ -434,6 +466,227 @@ class SQLiteMemoryAdapter(MemoryPort):
             related_loop_ids=json.loads(row["related_loop_ids"]),
         )
 
+    def _semantic_chunk_from_row(self, row: sqlite3.Row) -> SemanticMemoryChunk:
+        return SemanticMemoryChunk(
+            chunk_id=row["chunk_id"],
+            source_type=row["source_type"],
+            source_id=row["source_id"],
+            source_ref=row["source_ref"],
+            speaker_id=row["speaker_id"],
+            content=row["content"],
+            metadata_json=row["metadata_json"],
+            embedding=None,
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def _load_sqlite_vec_extension(self, conn: sqlite3.Connection) -> None:
+        if sqlite_vec is None:
+            return
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+
+    def _require_sqlite_vec(self) -> None:
+        if sqlite_vec is None:
+            raise RuntimeError(
+                "sqlite-vec is not installed in the active Python environment. "
+                "Install it in the interpreter used to run Ambient AI."
+            )
+
+    def _vector_table_exists(self, conn: sqlite3.Connection) -> bool:
+        row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'semantic_memory_embeddings'"
+        ).fetchone()
+        return row is not None
+
+    def _get_embedding_dimension(self, conn: sqlite3.Connection) -> Optional[int]:
+        row = conn.execute(
+            "SELECT config_value FROM semantic_memory_config WHERE config_key = 'embedding_dimension'"
+        ).fetchone()
+        if row is None:
+            return None
+        return int(row["config_value"])
+
+    def _ensure_vector_table(self, conn: sqlite3.Connection, dimension: int) -> None:
+        self._require_sqlite_vec()
+        if dimension <= 0:
+            raise ValueError("Embedding dimension must be positive.")
+        existing_dimension = self._get_embedding_dimension(conn)
+        if existing_dimension is None:
+            if not self._vector_table_exists(conn):
+                conn.execute(
+                    f"""
+                    CREATE VIRTUAL TABLE semantic_memory_embeddings
+                    USING vec0(embedding float[{dimension}])
+                    """
+                )
+            conn.execute(
+                """
+                INSERT INTO semantic_memory_config(config_key, config_value)
+                VALUES ('embedding_dimension', ?)
+                ON CONFLICT(config_key) DO UPDATE SET config_value = excluded.config_value
+                """,
+                (str(dimension),),
+            )
+            return
+        if existing_dimension != dimension:
+            raise RuntimeError(
+                f"Embedding dimension mismatch: existing vec0 table uses {existing_dimension}, "
+                f"new embedding has {dimension}."
+            )
+        if not self._vector_table_exists(conn):
+            conn.execute(
+                f"""
+                CREATE VIRTUAL TABLE semantic_memory_embeddings
+                USING vec0(embedding float[{dimension}])
+                """
+            )
+
+    def upsert_semantic_chunk(
+        self,
+        *,
+        source_type: str,
+        source_id: str,
+        source_ref: str,
+        content: str,
+        speaker_id: Optional[str] = None,
+        metadata_json: str = "{}",
+    ) -> SemanticMemoryChunk:
+        content = " ".join(content.split())
+        if not content:
+            content = f"{source_type} {source_id}"
+        now = self._now()
+        chunk_id = f"{source_type}:{source_id}"
+        with self._managed_connection() as conn:
+            existing = conn.execute(
+                "SELECT rowid, content FROM semantic_memory_chunks WHERE chunk_id = ?",
+                (chunk_id,),
+            ).fetchone()
+            conn.execute(
+                """
+                INSERT INTO semantic_memory_chunks (
+                    chunk_id, source_type, source_id, source_ref, speaker_id,
+                    content, metadata_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source_type, source_id) DO UPDATE SET
+                    source_ref=excluded.source_ref,
+                    speaker_id=excluded.speaker_id,
+                    content=excluded.content,
+                    metadata_json=excluded.metadata_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    chunk_id,
+                    source_type,
+                    source_id,
+                    source_ref,
+                    speaker_id,
+                    content,
+                    metadata_json,
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT rowid, * FROM semantic_memory_chunks WHERE chunk_id = ?",
+                (chunk_id,),
+            ).fetchone()
+            content_changed = existing is None or existing["content"] != content
+            if content_changed and self._vector_table_exists(conn):
+                conn.execute(
+                    "DELETE FROM semantic_memory_embeddings WHERE rowid = ?",
+                    (row["rowid"],),
+                )
+        return self._semantic_chunk_from_row(row)
+
+    def get_chunks_missing_embeddings(self, limit: int = 100) -> List[SemanticMemoryChunk]:
+        with self._managed_connection() as conn:
+            if self._vector_table_exists(conn):
+                rows = conn.execute(
+                    """
+                    SELECT semantic_memory_chunks.rowid, semantic_memory_chunks.*
+                    FROM semantic_memory_chunks
+                    LEFT JOIN semantic_memory_embeddings
+                        ON semantic_memory_embeddings.rowid = semantic_memory_chunks.rowid
+                    WHERE semantic_memory_embeddings.rowid IS NULL
+                    ORDER BY semantic_memory_chunks.updated_at ASC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT rowid, * FROM semantic_memory_chunks
+                    ORDER BY updated_at ASC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+        return [self._semantic_chunk_from_row(row) for row in rows]
+
+    def update_embedding(self, chunk_id: str, embedding: List[float]) -> None:
+        with self._managed_connection() as conn:
+            row = conn.execute(
+                "SELECT rowid FROM semantic_memory_chunks WHERE chunk_id = ?",
+                (chunk_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown semantic chunk: {chunk_id}")
+            self._ensure_vector_table(conn, len(embedding))
+            conn.execute(
+                "DELETE FROM semantic_memory_embeddings WHERE rowid = ?",
+                (row["rowid"],),
+            )
+            conn.execute(
+                "INSERT INTO semantic_memory_embeddings(rowid, embedding) VALUES (?, ?)",
+                (row["rowid"], json.dumps(embedding)),
+            )
+            conn.execute(
+                "UPDATE semantic_memory_chunks SET updated_at = ? WHERE chunk_id = ?",
+                (self._now(), chunk_id),
+            )
+
+    def vector_search(
+        self,
+        query_embedding: List[float],
+        *,
+        limit: int = 30,
+        speaker_ids: Optional[List[str]] = None,
+    ) -> List[SemanticMemoryResult]:
+        with self._managed_connection() as conn:
+            if not self._vector_table_exists(conn):
+                return []
+            embedding_dimension = self._get_embedding_dimension(conn)
+            if embedding_dimension != len(query_embedding):
+                return []
+
+            base_query = """
+                SELECT
+                    semantic_memory_chunks.*,
+                    semantic_memory_embeddings.distance AS distance
+                FROM semantic_memory_embeddings
+                JOIN semantic_memory_chunks
+                    ON semantic_memory_chunks.rowid = semantic_memory_embeddings.rowid
+                WHERE semantic_memory_embeddings.embedding MATCH ?
+                  AND k = ?
+            """
+            params: List[object] = [json.dumps(query_embedding), limit]
+            if speaker_ids:
+                placeholders = ", ".join("?" for _ in speaker_ids)
+                base_query += f" AND (semantic_memory_chunks.speaker_id IS NULL OR semantic_memory_chunks.speaker_id IN ({placeholders}))"
+                params.extend(speaker_ids)
+            base_query += " ORDER BY semantic_memory_embeddings.distance ASC"
+            rows = conn.execute(base_query, params).fetchall()
+
+        return [
+            SemanticMemoryResult(
+                chunk=self._semantic_chunk_from_row(row),
+                vector_score=-float(row["distance"]),
+            )
+            for row in rows
+        ]
+
     def _write_index(self) -> None:
         speakers = [
             {
@@ -543,6 +796,21 @@ class SQLiteMemoryAdapter(MemoryPort):
                     event.consolidated_at,
                 ),
             )
+        self.upsert_semantic_chunk(
+            source_type="memory_event",
+            source_id=event.event_id,
+            source_ref=event.source_ref,
+            speaker_id=event.speaker_id,
+            content=event.content,
+            metadata_json=json.dumps(
+                {
+                    "event_kind": event.event_kind,
+                    "confidence": event.confidence,
+                    "status": event.status,
+                    "created_at": event.created_at,
+                }
+            ),
+        )
     def get_recent_events(
         self,
         speaker_ids: Optional[List[str]] = None,
@@ -593,6 +861,20 @@ class SQLiteMemoryAdapter(MemoryPort):
                     fact.updated_at,
                 ),
             )
+        self.upsert_semantic_chunk(
+            source_type="memory_fact",
+            source_id=fact.fact_id,
+            source_ref=",".join(fact.source_event_ids),
+            speaker_id=fact.speaker_id,
+            content=fact.fact_text,
+            metadata_json=json.dumps(
+                {
+                    "topic": fact.topic,
+                    "valid_from": fact.valid_from,
+                    "updated_at": fact.updated_at,
+                }
+            ),
+        )
         return fact
 
     def get_facts(self, speaker_id: str) -> List[MemoryFact]:
@@ -684,6 +966,25 @@ class SQLiteMemoryAdapter(MemoryPort):
                     evidence.created_at,
                 ),
             )
+        self.upsert_semantic_chunk(
+            source_type="transcript_evidence",
+            source_id=evidence.evidence_id,
+            source_ref=evidence.source_ref,
+            speaker_id=evidence.speaker_id,
+            content=evidence.content,
+            metadata_json=json.dumps(
+                {
+                    "speaker_label": evidence.speaker_label,
+                    "session_id": evidence.session_id,
+                    "signal_type": evidence.signal_type,
+                    "normalized_entities": evidence.normalized_entities,
+                    "time_hints": evidence.time_hints,
+                    "action_hints": evidence.action_hints,
+                    "trust_score": evidence.trust_score,
+                    "created_at": evidence.created_at,
+                }
+            ),
+        )
 
     def get_recent_evidence(
         self,
@@ -775,6 +1076,32 @@ class SQLiteMemoryAdapter(MemoryPort):
                     loop.resolution_summary,
                 ),
             )
+        loop_text = " ".join(
+            part
+            for part in [
+                loop.title,
+                loop.next_action_hint or "",
+                loop.due_hint or "",
+                loop.resolution_summary or "",
+            ]
+            if part
+        )
+        self.upsert_semantic_chunk(
+            source_type="open_loop",
+            source_id=loop.loop_id,
+            source_ref=loop.source_session_id,
+            speaker_id=loop.owner_speaker_id,
+            content=loop_text,
+            metadata_json=json.dumps(
+                {
+                    "loop_type": loop.loop_type,
+                    "status": loop.status,
+                    "confidence": loop.confidence,
+                    "urgency": loop.urgency,
+                    "last_updated_at": loop.last_updated_at,
+                }
+            ),
+        )
         return loop
 
     def get_open_loop(self, loop_id: str) -> Optional[OpenLoop]:
@@ -903,6 +1230,33 @@ class SQLiteMemoryAdapter(MemoryPort):
                     observation.raw_payload_json,
                 ),
             )
+        observation_text = " ".join(
+            part
+            for part in [
+                observation.summary,
+                observation.inferred_user_activity,
+                observation.possible_next_task or "",
+                " ".join(observation.salient_entities),
+            ]
+            if part
+        )
+        self.upsert_semantic_chunk(
+            source_type="visual_observation",
+            source_id=observation.observation_id,
+            source_ref=observation.screenshot_path,
+            speaker_id=None,
+            content=observation_text,
+            metadata_json=json.dumps(
+                {
+                    "app_name": observation.app_name,
+                    "window_title": observation.window_title,
+                    "page_hint": observation.page_hint,
+                    "session_id": observation.session_id,
+                    "confidence": observation.confidence,
+                    "created_at": observation.created_at,
+                }
+            ),
+        )
 
     def get_recent_visual_observations(self, limit: int = 10) -> List[VisualObservation]:
         with self._managed_connection() as conn:
@@ -986,6 +1340,22 @@ class SQLiteMemoryAdapter(MemoryPort):
                     json.dumps(fact.source_session_ids),
                 ),
             )
+        self.upsert_semantic_chunk(
+            source_type="visual_user_fact",
+            source_id=fact.fact_id,
+            source_ref=fact.fact_key,
+            speaker_id=None,
+            content=f"{fact.title}. {fact.summary}",
+            metadata_json=json.dumps(
+                {
+                    "fact_key": fact.fact_key,
+                    "category": fact.category,
+                    "status": fact.status,
+                    "score": fact.score,
+                    "last_seen_at": fact.last_seen_at,
+                }
+            ),
+        )
         return fact
 
     def get_visual_user_fact(self, fact_key: str) -> Optional[VisualUserFact]:
