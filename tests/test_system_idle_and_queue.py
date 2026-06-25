@@ -5,6 +5,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from PIL import Image
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC_ROOT = REPO_ROOT / "src"
 sys.path.insert(0, str(REPO_ROOT))
@@ -74,6 +76,58 @@ class SystemIdleAndQueueTests(unittest.TestCase):
             newest = queue.dequeue()
             self.assertEqual(oldest.screenshot_path, str(second))
             self.assertEqual(newest.screenshot_path, str(third))
+
+    def test_screenshot_queue_skips_similar_recent_image(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_path = Path(tmpdir)
+            first = temp_path / "first.png"
+            duplicate = temp_path / "duplicate.png"
+            self._write_solid_image(first, color=(32, 64, 96))
+            self._write_solid_image(duplicate, color=(32, 64, 96))
+
+            queue = ScreenshotQueueService(maxlen=5, ssim_threshold=0.92, ssim_compare_count=4)
+            first_job = queue.enqueue(str(first), captured_at="2026-06-25T10:00:00")
+            duplicate_job = queue.enqueue(str(duplicate), captured_at="2026-06-25T10:00:10")
+
+            self.assertIsNotNone(first_job)
+            self.assertIsNone(duplicate_job)
+            self.assertFalse(duplicate.exists())
+            self.assertEqual(queue.size(), 1)
+
+    def test_screenshot_queue_accepts_different_recent_image(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_path = Path(tmpdir)
+            first = temp_path / "first.png"
+            different = temp_path / "different.png"
+            self._write_solid_image(first, color=(0, 0, 0))
+            self._write_solid_image(different, color=(255, 255, 255))
+
+            queue = ScreenshotQueueService(maxlen=5, ssim_threshold=0.92, ssim_compare_count=4)
+            queue.enqueue(str(first), captured_at="2026-06-25T10:00:00")
+            different_job = queue.enqueue(str(different), captured_at="2026-06-25T10:00:10")
+
+            self.assertIsNotNone(different_job)
+            self.assertTrue(different.exists())
+            self.assertEqual(queue.size(), 2)
+
+    def test_screenshot_queue_can_disable_similarity_filter(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_path = Path(tmpdir)
+            first = temp_path / "first.png"
+            duplicate = temp_path / "duplicate.png"
+            self._write_solid_image(first, color=(32, 64, 96))
+            self._write_solid_image(duplicate, color=(32, 64, 96))
+
+            queue = ScreenshotQueueService(maxlen=5, ssim_threshold=0.92, ssim_compare_count=0)
+            queue.enqueue(str(first), captured_at="2026-06-25T10:00:00")
+            duplicate_job = queue.enqueue(str(duplicate), captured_at="2026-06-25T10:00:10")
+
+            self.assertIsNotNone(duplicate_job)
+            self.assertTrue(duplicate.exists())
+            self.assertEqual(queue.size(), 2)
+
+    def _write_solid_image(self, path: Path, color: tuple[int, int, int]) -> None:
+        Image.new("RGB", (32, 32), color=color).save(path)
 
 
 if __name__ == "__main__":
