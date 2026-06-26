@@ -116,6 +116,7 @@ class NightTask:
     priority: str = "medium"
     status: str = "pending"
     created_at: Optional[str] = None
+    metadata_json: Optional[str] = None
 
 @dataclass
 class Notification:
@@ -339,6 +340,7 @@ class VisualObservation:
     window_title: Optional[str] = None
     page_hint: Optional[str] = None
     summary: str = ""
+    detailed_description: str = ""
     inferred_user_activity: str = ""
     previous_activity_status: str = "unclear"
     salient_entities: List[str] = field(default_factory=list)
@@ -385,6 +387,28 @@ class VisualSession:
     continuation_score: float = 0.0
     observation_ids: List[str] = field(default_factory=list)
     related_loop_ids: List[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class FusedContextEpisode:
+    """A cross-modal episode derived from transcript evidence and visual observations."""
+    episode_id: str
+    started_at: str
+    ended_at: str
+    transcript_evidence_ids: List[str] = field(default_factory=list)
+    visual_observation_ids: List[str] = field(default_factory=list)
+    source_refs: List[str] = field(default_factory=list)
+    entities: List[str] = field(default_factory=list)
+    activity_summary: str = ""
+    inferred_intent: str = ""
+    confidence: float = 0.0
+    user_fact_candidates: List[Dict[str, str]] = field(default_factory=list)
+    open_loop_candidates: List[Dict[str, str]] = field(default_factory=list)
+    suggested_next_action: Optional[str] = None
+    status: str = "active"
+    created_at: str = ""
+    updated_at: str = ""
+    raw_payload_json: Optional[str] = None
 
 
 @dataclass(frozen=True)
