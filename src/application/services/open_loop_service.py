@@ -163,8 +163,6 @@ Rules:
                         {"role": "user", "content": json.dumps(payload, indent=2)},
                     ],
                     tools=None,
-                    temperature=0.1,
-                    top_p=0.9,
                 )
             text = await self._consume_stream_text(completion)
             parsed = self._parse_json_object(text)

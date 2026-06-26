@@ -14,6 +14,7 @@ except ImportError:  # pragma: no cover - depends on runtime environment
 from application.ports.memory_port import MemoryPort
 from core.models import (
     ConversationSession,
+    FusedContextEpisode,
     MemoryEvent,
     MemoryFact,
     MemoryReflection,
@@ -40,6 +41,7 @@ class SQLiteMemoryAdapter(MemoryPort):
         self.session_digest_path = self.memory_root / "session_digest.md"
         self.open_loop_digest_path = self.memory_root / "open_loops.md"
         self.visual_digest_path = self.memory_root / "visual_context.md"
+        self.fused_context_digest_path = self.memory_root / "fused_context.md"
         self.user_info_path = self.memory_root.parent / "USER_INFO.md"
         self.index_path = self.memory_root / "index.json"
 
@@ -210,6 +212,7 @@ class SQLiteMemoryAdapter(MemoryPort):
                     window_title TEXT,
                     page_hint TEXT,
                     summary TEXT NOT NULL,
+                    detailed_description TEXT NOT NULL DEFAULT '',
                     inferred_user_activity TEXT NOT NULL,
                     previous_activity_status TEXT NOT NULL DEFAULT 'unclear',
                     salient_entities TEXT NOT NULL,
@@ -263,6 +266,29 @@ class SQLiteMemoryAdapter(MemoryPort):
             )
             cursor.execute(
                 """
+                CREATE TABLE IF NOT EXISTS fused_context_episodes (
+                    episode_id TEXT PRIMARY KEY,
+                    started_at TEXT NOT NULL,
+                    ended_at TEXT NOT NULL,
+                    transcript_evidence_ids TEXT NOT NULL,
+                    visual_observation_ids TEXT NOT NULL,
+                    source_refs TEXT NOT NULL,
+                    entities TEXT NOT NULL,
+                    activity_summary TEXT NOT NULL,
+                    inferred_intent TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    user_fact_candidates TEXT NOT NULL,
+                    open_loop_candidates TEXT NOT NULL,
+                    suggested_next_action TEXT,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    raw_payload_json TEXT
+                )
+                """
+            )
+            cursor.execute(
+                """
                 CREATE TABLE IF NOT EXISTS semantic_memory_chunks (
                     chunk_id TEXT PRIMARY KEY,
                     source_type TEXT NOT NULL,
@@ -292,6 +318,7 @@ class SQLiteMemoryAdapter(MemoryPort):
             "completed_items": "TEXT NOT NULL DEFAULT '[]'",
             "possible_next_task": "TEXT",
             "user_fact_hypotheses": "TEXT NOT NULL DEFAULT '[]'",
+            "detailed_description": "TEXT NOT NULL DEFAULT ''",
         }
         with self._managed_connection() as conn:
             existing = {
@@ -420,6 +447,7 @@ class SQLiteMemoryAdapter(MemoryPort):
             window_title=row["window_title"],
             page_hint=row["page_hint"],
             summary=row["summary"],
+            detailed_description=row["detailed_description"],
             inferred_user_activity=row["inferred_user_activity"],
             previous_activity_status=row["previous_activity_status"],
             salient_entities=json.loads(row["salient_entities"]),
@@ -464,6 +492,27 @@ class SQLiteMemoryAdapter(MemoryPort):
             continuation_score=float(row["continuation_score"]),
             observation_ids=json.loads(row["observation_ids"]),
             related_loop_ids=json.loads(row["related_loop_ids"]),
+        )
+
+    def _fused_context_episode_from_row(self, row: sqlite3.Row) -> FusedContextEpisode:
+        return FusedContextEpisode(
+            episode_id=row["episode_id"],
+            started_at=row["started_at"],
+            ended_at=row["ended_at"],
+            transcript_evidence_ids=json.loads(row["transcript_evidence_ids"]),
+            visual_observation_ids=json.loads(row["visual_observation_ids"]),
+            source_refs=json.loads(row["source_refs"]),
+            entities=json.loads(row["entities"]),
+            activity_summary=row["activity_summary"],
+            inferred_intent=row["inferred_intent"],
+            confidence=float(row["confidence"]),
+            user_fact_candidates=json.loads(row["user_fact_candidates"]),
+            open_loop_candidates=json.loads(row["open_loop_candidates"]),
+            suggested_next_action=row["suggested_next_action"],
+            status=row["status"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            raw_payload_json=row["raw_payload_json"],
         )
 
     def _semantic_chunk_from_row(self, row: sqlite3.Row) -> SemanticMemoryChunk:
@@ -1202,11 +1251,11 @@ class SQLiteMemoryAdapter(MemoryPort):
                 """
                 INSERT OR REPLACE INTO visual_observations (
                     observation_id, screenshot_path, created_at, observation_type,
-                    app_name, window_title, page_hint, summary, inferred_user_activity,
+                    app_name, window_title, page_hint, summary, detailed_description, inferred_user_activity,
                     previous_activity_status, salient_entities, completed_items, open_loops,
                     possible_next_task, suggested_research_topics, user_fact_hypotheses,
                     confidence, session_id, raw_payload_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     observation.observation_id,
@@ -1217,6 +1266,7 @@ class SQLiteMemoryAdapter(MemoryPort):
                     observation.window_title,
                     observation.page_hint,
                     observation.summary,
+                    observation.detailed_description,
                     observation.inferred_user_activity,
                     observation.previous_activity_status,
                     json.dumps(observation.salient_entities),
@@ -1234,6 +1284,7 @@ class SQLiteMemoryAdapter(MemoryPort):
             part
             for part in [
                 observation.summary,
+                observation.detailed_description,
                 observation.inferred_user_activity,
                 observation.possible_next_task or "",
                 " ".join(observation.salient_entities),
@@ -1251,6 +1302,7 @@ class SQLiteMemoryAdapter(MemoryPort):
                     "app_name": observation.app_name,
                     "window_title": observation.window_title,
                     "page_hint": observation.page_hint,
+                    "detailed_description": observation.detailed_description,
                     "session_id": observation.session_id,
                     "confidence": observation.confidence,
                     "created_at": observation.created_at,
@@ -1265,6 +1317,14 @@ class SQLiteMemoryAdapter(MemoryPort):
                 (limit,),
             ).fetchall()
         return [self._visual_observation_from_row(row) for row in rows]
+
+    def get_visual_observation(self, observation_id: str) -> Optional[VisualObservation]:
+        with self._managed_connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM visual_observations WHERE observation_id = ?",
+                (observation_id,),
+            ).fetchone()
+        return self._visual_observation_from_row(row) if row else None
 
     def upsert_visual_session(self, session: VisualSession) -> VisualSession:
         with self._managed_connection() as conn:
@@ -1313,6 +1373,109 @@ class SQLiteMemoryAdapter(MemoryPort):
         with self._managed_connection() as conn:
             rows = conn.execute(query, params).fetchall()
         return [self._visual_session_from_row(row) for row in rows]
+
+    def upsert_fused_context_episode(self, episode: FusedContextEpisode) -> FusedContextEpisode:
+        with self._managed_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO fused_context_episodes (
+                    episode_id, started_at, ended_at, transcript_evidence_ids,
+                    visual_observation_ids, source_refs, entities, activity_summary,
+                    inferred_intent, confidence, user_fact_candidates,
+                    open_loop_candidates, suggested_next_action, status, created_at,
+                    updated_at, raw_payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(episode_id) DO UPDATE SET
+                    started_at=excluded.started_at,
+                    ended_at=excluded.ended_at,
+                    transcript_evidence_ids=excluded.transcript_evidence_ids,
+                    visual_observation_ids=excluded.visual_observation_ids,
+                    source_refs=excluded.source_refs,
+                    entities=excluded.entities,
+                    activity_summary=excluded.activity_summary,
+                    inferred_intent=excluded.inferred_intent,
+                    confidence=excluded.confidence,
+                    user_fact_candidates=excluded.user_fact_candidates,
+                    open_loop_candidates=excluded.open_loop_candidates,
+                    suggested_next_action=excluded.suggested_next_action,
+                    status=excluded.status,
+                    updated_at=excluded.updated_at,
+                    raw_payload_json=excluded.raw_payload_json
+                """,
+                (
+                    episode.episode_id,
+                    episode.started_at,
+                    episode.ended_at,
+                    json.dumps(episode.transcript_evidence_ids),
+                    json.dumps(episode.visual_observation_ids),
+                    json.dumps(episode.source_refs),
+                    json.dumps(episode.entities),
+                    episode.activity_summary,
+                    episode.inferred_intent,
+                    episode.confidence,
+                    json.dumps(episode.user_fact_candidates),
+                    json.dumps(episode.open_loop_candidates),
+                    episode.suggested_next_action,
+                    episode.status,
+                    episode.created_at,
+                    episode.updated_at,
+                    episode.raw_payload_json,
+                ),
+            )
+        content = " ".join(
+            part
+            for part in [
+                episode.activity_summary,
+                episode.inferred_intent,
+                episode.suggested_next_action or "",
+                " ".join(episode.entities),
+            ]
+            if part
+        )
+        self.upsert_semantic_chunk(
+            source_type="fused_context_episode",
+            source_id=episode.episode_id,
+            source_ref=", ".join(episode.source_refs),
+            speaker_id=None,
+            content=content,
+            metadata_json=json.dumps(
+                {
+                    "started_at": episode.started_at,
+                    "ended_at": episode.ended_at,
+                    "transcript_evidence_ids": episode.transcript_evidence_ids,
+                    "visual_observation_ids": episode.visual_observation_ids,
+                    "entities": episode.entities,
+                    "confidence": episode.confidence,
+                    "status": episode.status,
+                }
+            ),
+        )
+        return episode
+
+    def get_fused_context_episode(self, episode_id: str) -> Optional[FusedContextEpisode]:
+        with self._managed_connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM fused_context_episodes WHERE episode_id = ?",
+                (episode_id,),
+            ).fetchone()
+        return self._fused_context_episode_from_row(row) if row else None
+
+    def list_fused_context_episodes(
+        self,
+        statuses: Optional[List[str]] = None,
+        limit: int = 20,
+    ) -> List[FusedContextEpisode]:
+        query = "SELECT * FROM fused_context_episodes"
+        params: List[object] = []
+        if statuses:
+            placeholders = ", ".join("?" for _ in statuses)
+            query += f" WHERE status IN ({placeholders})"
+            params.extend(statuses)
+        query += " ORDER BY updated_at DESC LIMIT ?"
+        params.append(limit)
+        with self._managed_connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [self._fused_context_episode_from_row(row) for row in rows]
 
     def upsert_visual_user_fact(self, fact: VisualUserFact) -> VisualUserFact:
         with self._managed_connection() as conn:
@@ -1398,3 +1561,11 @@ class SQLiteMemoryAdapter(MemoryPort):
         if not self.visual_digest_path.exists():
             return ""
         return self.visual_digest_path.read_text(encoding="utf-8")
+
+    def save_fused_context_digest(self, content: str) -> None:
+        self.fused_context_digest_path.write_text(content, encoding="utf-8")
+
+    def get_fused_context_digest(self) -> str:
+        if not self.fused_context_digest_path.exists():
+            return ""
+        return self.fused_context_digest_path.read_text(encoding="utf-8")

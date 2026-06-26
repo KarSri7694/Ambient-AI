@@ -24,9 +24,15 @@ Look at the current screenshot, compare it with the previous observation summary
   "window_title": "short visible title if inferable",
   "page_hint": "short page/screen hint",
   "summary": "1-2 sentence concrete summary of what is on screen",
+  "detailed_description": "information-rich detail about what is visible, what options/items are in focus, and what the user appears to be evaluating",
   "inferred_user_activity": "what the user seems to be doing or trying to do",
   "previous_activity_status": "new|continued|completed|left_midway|unclear",
   "salient_entities": ["entity1", "entity2"],
+  "visible_targets": ["products/mods/files/pages/options currently in focus"],
+  "selection_context": ["filters, sort, tabs, categories, version, search query, platform, price range, size, color, etc."],
+  "decision_factors": ["attributes that seem to matter such as compatibility, brand, style, rating, price, version, feature"],
+  "comparison_axes": ["what appears to be compared across choices"],
+  "artifact_state": "browsing|comparing|drafting|editing|reviewing|configuring|finalizing|unclear",
   "completed_items": ["things that now look done compared with previous observation"],
   "open_loops": ["unfinished thing the user may return to"],
   "possible_next_task": "most likely next thing the user would want done later",
@@ -48,16 +54,24 @@ Look at the current screenshot, compare it with the previous observation summary
 Rules:
 - Be concrete, not poetic.
 - Prefer visible facts over speculation.
+- When the screen is relevant, capture as much useful visible detail as possible.
+- Use detailed_description to be information-rich: mention specific products, mods, filters, selected options, search terms, compatibility/version hints, prices, ratings, categories, site sections, and comparison cues when visible.
+- Include every useful visible clue that would help a later agent mimic the user's browsing or decision process.
 - Use the provided screenshot timestamp to ground what the user was doing and when.
 - Use previous_activity_status to say whether the last observed activity appears complete, still continuing, or left midway.
 - Use completed_items only when the current screenshot makes earlier activity look done.
-- Use open_loops only for plausible unfinished user intent visible on screen right now.
-- possible_next_task should be a single concrete later follow-up, not a paragraph.
+- Use open_loops only for unresolved intent that would still matter later, not the next immediate click or gesture.
+- possible_next_task should be a single durable later follow-up on an artifact or workflow, not a transient UI action.
+- Bad examples for open_loops/possible_next_task: "scroll more", "accept call", "click next", "continue feed", "dismiss popup".
+- Good examples: "finish draft reply", "resume code change", "compare shortlisted products", "review saved research topic".
+- For modding/game pages, include game name, mod type, compatibility/version hints, category, loader/framework hints, and any visible installation or requirements clues.
+- For shopping pages, include product type, filters, size/color/brand/rating/price clues, sorting, and the attributes that seem to drive comparison.
 - Infer small user-fact hypotheses conservatively from visible behavior.
 - Single-session preference guesses should usually remain temporary.
 - Use wording like "may be interested in" or "currently looking for" unless repeated evidence is visually obvious.
 - Use suggested_research_topics only when the screen indicates something worth following up later.
 - confidence must be between 0 and 1.
+- If the screen is relevant, prefer high recall over brevity.
 - If the screen is idle, blank, locked, or not useful, set worth_noting to false and keep fields minimal.
 """
 
@@ -107,6 +121,7 @@ Rules:
             window_title=self._opt_text(parsed.get("window_title")),
             page_hint=self._opt_text(parsed.get("page_hint")),
             summary=self._opt_text(parsed.get("summary")) or "Passive observation captured.",
+            detailed_description=self._opt_text(parsed.get("detailed_description")) or "",
             inferred_user_activity=self._opt_text(parsed.get("inferred_user_activity")) or "",
             previous_activity_status=self._opt_text(parsed.get("previous_activity_status")) or "unclear",
             salient_entities=self._list_text(parsed.get("salient_entities")),
@@ -165,6 +180,8 @@ Rules:
                 lines.append(
                     f"- {observation.created_at}: {observation.summary}"
                 )
+                if observation.detailed_description:
+                    lines.append(f"  Detail: {observation.detailed_description[:500]}")
                 if observation.previous_activity_status and observation.previous_activity_status != "unclear":
                     lines.append(f"  Previous status: {observation.previous_activity_status}")
                 if observation.completed_items:
@@ -209,6 +226,7 @@ Rules:
             "previous_observation": (
                 {
                     "summary": previous_observation.summary,
+                    "detailed_description": previous_observation.detailed_description,
                     "inferred_user_activity": previous_observation.inferred_user_activity,
                     "previous_activity_status": previous_observation.previous_activity_status,
                     "completed_items": previous_observation.completed_items,
@@ -224,6 +242,7 @@ Rules:
                     "app_name": item.app_name,
                     "page_hint": item.page_hint,
                     "summary": item.summary,
+                    "detailed_description": item.detailed_description,
                     "inferred_user_activity": item.inferred_user_activity,
                     "previous_activity_status": item.previous_activity_status,
                     "completed_items": item.completed_items,
@@ -242,8 +261,6 @@ Rules:
                 ],
                 tools=None,
                 image=screenshot_path,
-                temperature=0.1,
-                top_p=0.9,
             )
         text = await self._consume_stream_text(completion)
         parsed = self._parse_json_object(text)

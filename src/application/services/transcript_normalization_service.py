@@ -90,8 +90,6 @@ Rules:
                         {"role": "user", "content": "\n".join(transcript_lines)},
                     ],
                     tools=None,
-                    temperature=0.1,
-                    top_p=0.9,
                 )
             response_text = await self._consume_stream_text(completion)
             parsed = self._parse_json_object(response_text)

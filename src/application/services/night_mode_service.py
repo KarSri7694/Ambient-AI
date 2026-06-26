@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 
 from application.ports.notification_port import NotificationPort
@@ -18,7 +19,11 @@ class NightModeService:
     DEFAULT_NIGHT_PROMPT = (
         "You are an autonomous agent working through a list of night-time tasks. "
         "You have access to various tools to help you accomplish these tasks. "
-        "DO NOT use the `queue_night_task` tool here."
+        "DO NOT use the `queue_night_task` tool here. "
+        "Treat the user message as an execution brief, not a question. "
+        "When the task references a screenshot, file path, task ID, URL, or other concrete artifact, use that artifact directly. "
+        "If notifications say 'No new notifications.', ignore that line and continue the task. "
+        "Do the work first; do not ask what to do unless the task is genuinely missing the required artifact."
     )
     DEFAULT_PROACTIVE_RESEARCH_PROMPT = (
         "You are doing bounded proactive research on a topic that surfaced ambiently. "
@@ -56,7 +61,11 @@ class NightModeService:
             self.night_prompt = (
                 f"You are an autonomous agent working through a list of night-time tasks "
                 f"queued by {username}. You have access to various tools to help you accomplish "
-                f"these tasks. DO NOT use the `queue_night_task` tool here."
+                f"these tasks. DO NOT use the `queue_night_task` tool here. "
+                f"Treat the user message as an execution brief, not a question. "
+                f"When the task references a screenshot, file path, task ID, URL, or other concrete artifact, use that artifact directly. "
+                f"If notifications say 'No new notifications.', ignore that line and continue the task. "
+                f"Do the work first; do not ask what to do unless the task is genuinely missing the required artifact."
             )
         else:
             self.night_prompt = self.DEFAULT_NIGHT_PROMPT
@@ -68,6 +77,65 @@ class NightModeService:
         lines = ["New notifications:"]
         for note in notifications:
             lines.append(f"- {note.message} (Source: {note.source})")
+        return "\n".join(lines)
+
+    def _build_execution_input(self, task_desc: str, notifications_str: str) -> str:
+        return "\n".join(
+            [
+                "Execute this night task now.",
+                "",
+                "Task brief:",
+                task_desc,
+                "",
+                "Execution rules:",
+                "- Use the task brief as the source of truth.",
+                "- If the brief contains a screenshot path or file path, inspect that artifact directly.",
+                "- If the brief references prior terminal output, rely only on the concrete details copied into the brief.",
+                "- Ignore the notifications section when it says there are no new notifications.",
+                "",
+                "Notifications:",
+                notifications_str,
+            ]
+        )
+
+    def _task_metadata(self, task) -> dict:
+        raw = getattr(task, "metadata_json", None)
+        if not raw:
+            return {}
+        if isinstance(raw, dict):
+            return raw
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    def _build_passive_observer_execution_input(self, task, metadata: dict, notifications_str: str) -> str:
+        lines = [
+            "Execute this passive-observer night task now.",
+            "",
+            "Queued task:",
+            task.description,
+            "",
+            "Resolved passive observation context:",
+            f"- Observation ID: {metadata.get('source_observation_id', '')}",
+            f"- Captured at: {metadata.get('source_created_at', '')}",
+            f"- App: {metadata.get('app_name', '')}",
+            f"- Page hint: {metadata.get('page_hint', '')}",
+            f"- Summary: {metadata.get('summary', '')}",
+            f"- Detailed description: {metadata.get('detailed_description', '')}",
+            f"- Inferred user activity: {metadata.get('inferred_user_activity', '')}",
+            f"- Open loops: {', '.join(metadata.get('open_loops', [])[:4]) if isinstance(metadata.get('open_loops'), list) else ''}",
+            f"- Possible next task: {metadata.get('possible_next_task', '')}",
+            "",
+            "Execution rules:",
+            "- Treat this as durable deferred work only if it still appears unresolved now.",
+            "- If the context looks completed, expired, or no longer actionable, return a brief skip result instead of acting.",
+            "- Ignore the notifications section when it says there are no new notifications.",
+            "",
+            "Notifications:",
+            notifications_str,
+        ]
         return "\n".join(lines)
 
     async def _process_external_tasks(self, notifications_str: str, parent_run_id: str | None = None) -> int:
@@ -113,7 +181,7 @@ class NightModeService:
                         {"run_id": run.run_id, "step_id": llm_step.step_id} if run and llm_step else None,
                     ):
                         result = await self.llm_service.run_interaction(
-                            user_input=f"{task_desc}\n{notifications_str}",
+                            user_input=self._build_execution_input(task_desc, notifications_str),
                             system_prompt=self.night_prompt,
                             model=self.model,
                         )
@@ -176,6 +244,7 @@ class NightModeService:
                 run = None
                 llm_step = None
                 queue_step = None
+                metadata = self._task_metadata(task)
                 try:
                     if self.activity_ledger is not None:
                         run = self.activity_ledger.start_run(
@@ -194,6 +263,12 @@ class NightModeService:
                             entity_id=str(task.id),
                             relation="executes",
                         )
+                    execution_input = (
+                        self._build_passive_observer_execution_input(task, metadata, notifications_str)
+                        if metadata.get("task_kind") == "passive_observer_followup"
+                        else self._build_execution_input(task.description, notifications_str)
+                    )
+                    if self.activity_ledger is not None and run is not None:
                         llm_step = self.activity_ledger.start_step(
                             run.run_id,
                             step_kind="llm_interaction",
@@ -205,7 +280,7 @@ class NightModeService:
                         {"run_id": run.run_id, "step_id": llm_step.step_id} if run and llm_step else None,
                     ):
                         result = await self.llm_service.run_interaction(
-                            user_input=f"{task.description}\n{notifications_str}",
+                            user_input=execution_input,
                             system_prompt=self.night_prompt,
                             model=self.model,
                         )

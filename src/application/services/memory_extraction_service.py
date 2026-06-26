@@ -111,8 +111,6 @@ Rules:
                         {"role": "user", "content": transcript_text},
                     ],
                     tools=None,
-                    temperature=0.1,
-                    top_p=0.9,
                 )
             response_text = await self._consume_stream_text(completion)
             return self._parse_json_array(response_text)

@@ -3,6 +3,7 @@ from typing import List, Optional
 
 from core.models import (
     ConversationSession,
+    FusedContextEpisode,
     MemoryEvent,
     MemoryFact,
     MemoryReflection,
@@ -162,6 +163,10 @@ class MemoryPort(ABC):
         pass
 
     @abstractmethod
+    def get_visual_observation(self, observation_id: str) -> Optional[VisualObservation]:
+        pass
+
+    @abstractmethod
     def get_recent_visual_observations(self, limit: int = 10) -> List[VisualObservation]:
         pass
 
@@ -183,6 +188,30 @@ class MemoryPort(ABC):
 
     @abstractmethod
     def get_visual_digest(self) -> str:
+        pass
+
+    @abstractmethod
+    def upsert_fused_context_episode(self, episode: FusedContextEpisode) -> FusedContextEpisode:
+        pass
+
+    @abstractmethod
+    def get_fused_context_episode(self, episode_id: str) -> Optional[FusedContextEpisode]:
+        pass
+
+    @abstractmethod
+    def list_fused_context_episodes(
+        self,
+        statuses: Optional[List[str]] = None,
+        limit: int = 20,
+    ) -> List[FusedContextEpisode]:
+        pass
+
+    @abstractmethod
+    def save_fused_context_digest(self, content: str) -> None:
+        pass
+
+    @abstractmethod
+    def get_fused_context_digest(self) -> str:
         pass
 
     @abstractmethod

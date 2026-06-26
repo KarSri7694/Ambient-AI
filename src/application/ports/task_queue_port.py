@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import List
+from typing import Any, List, Optional
 from core.models import NightTask
 
 
@@ -12,7 +12,12 @@ class TaskQueuePort(ABC):
         pass
 
     @abstractmethod
-    def add_task(self, description: str, priority: str = "medium") -> str:
+    def add_task(
+        self,
+        description: str,
+        priority: str = "medium",
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> str:
         """Add a new task to the queue. Returns confirmation message."""
         pass
 

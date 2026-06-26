@@ -27,6 +27,7 @@ class MemoryContextBuilder:
             self._build_session_digest_section(),
             self._build_open_loop_digest_section(),
             self._build_visual_digest_section(),
+            self._build_fused_context_section(),
             semantic_memory_section,
             self._build_recent_context_section(),
             self._build_participant_memory_section(participants),
@@ -70,6 +71,12 @@ class MemoryContextBuilder:
         if not visual_digest:
             visual_digest = "_No passive visual context yet._"
         return f"## Passive Visual Context\n{visual_digest}"
+
+    def _build_fused_context_section(self) -> str:
+        fused_context = self.memory.get_fused_context_digest().strip()
+        if not fused_context:
+            fused_context = "_No fused audio/visual context yet._"
+        return f"## Fused Audio/Visual Context\n{fused_context}"
 
     def _build_participant_memory_section(
         self,

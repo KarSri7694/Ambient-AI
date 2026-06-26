@@ -14,6 +14,7 @@ from application.services.llm_interaction_service import LLMInteractionService
 from application.services.activity_ledger_service import ActivityLedgerService
 from application.services.ambient_reflection_service import AmbientReflectionService
 from application.services.agenda_scoring_service import AgendaScoringService
+from application.services.context_fusion_service import ContextFusionService
 from application.services.memory_consolidation_service import MemoryConsolidationService
 from application.services.memory_context_builder import MemoryContextBuilder
 from application.services.night_mode_service import NightModeService
@@ -57,8 +58,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-API_BASE_URL = "http://localhost:8080"
-DEFAULT_MODEL = "Qwen-3.5-9B-Fable-Distilled-Q4_K_M-Vision"
+API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8080")
+SEMANTIC_API_BASE_URL = os.getenv("SEMANTIC_API_BASE_URL", "http://localhost:8081")
+DEFAULT_MODEL = "Qwen-3.5-9B-Mythos-Distilled-Q4_K_M-Vision"
 EMBEDDING_MODEL_PATH = "EmbeddingGemma"
 RERANKER_MODEL_PATH = "JinaReranker"
 MCP_CONFIG_PATH = "mcp.json"
@@ -91,8 +93,8 @@ SCREENSHOT_QUEUE_MAXLEN = 180
 PASSIVE_OBSERVER_SSIM_THRESHOLD = float(os.getenv("PASSIVE_OBSERVER_SSIM_THRESHOLD", "0.92"))
 PASSIVE_OBSERVER_SSIM_COMPARE_COUNT = int(os.getenv("PASSIVE_OBSERVER_SSIM_COMPARE_COUNT", "4"))
 MAX_SCREENSHOTS_PER_IDLE_CYCLE = 6
-NIGHT_MODE_START_HOUR = 0
-NIGHT_MODE_END_HOUR = 6
+NIGHT_MODE_START_HOUR = 20
+NIGHT_MODE_END_HOUR = 23
 
 
 def build_available_skills_summary() -> str:
@@ -248,6 +250,7 @@ class TranscriptionService:
             facts_db_path=str(FACTS_DB_PATH),
         )
         llm_adapter = LlamaCppAdapter(base_url=API_BASE_URL)
+        semantic_llm_adapter = LlamaCppAdapter(base_url=SEMANTIC_API_BASE_URL)
         interaction_log_store = SQLiteInteractionLogAdapter(
             db_path=str(INTERACTION_LOG_DB_PATH),
         )
@@ -285,12 +288,12 @@ class TranscriptionService:
             prompts_root=str(PROMPTS_ROOT),
         )
         semantic_embedder = LlamaCppEmbeddingAdapter(
-            llm=llm_adapter,
+            llm=semantic_llm_adapter,
             model_path=EMBEDDING_MODEL_PATH,
             messages_provider=llm_service.get_context,
         )
         semantic_reranker = LlamaCppRerankerAdapter(
-            llm=llm_adapter,
+            llm=semantic_llm_adapter,
             model_path=RERANKER_MODEL_PATH,
             messages_provider=llm_service.get_context,
         )
@@ -298,6 +301,10 @@ class TranscriptionService:
             memory=memory_store,
             embedder=semantic_embedder,
             reranker=semantic_reranker,
+        )
+        context_fusion_service = ContextFusionService(
+            memory=memory_store,
+            llm_provider=logged_llm,
         )
         transcript_normalizer = TranscriptNormalizationService(llm_provider=logged_llm)
         speaker_resolution = SpeakerResolutionService(memory=memory_store)
@@ -392,6 +399,7 @@ class TranscriptionService:
             research_vault,
             memory_context_builder,
             semantic_memory_service,
+            context_fusion_service,
             transcript_normalizer,
             speaker_resolution,
             classifier,
@@ -422,6 +430,7 @@ class TranscriptionService:
         memory_store: SQLiteMemoryAdapter,
         memory_context_builder: MemoryContextBuilder,
         semantic_memory_service: SemanticMemoryService,
+        context_fusion_service: ContextFusionService,
         transcript_normalizer: TranscriptNormalizationService,
         speaker_resolution: SpeakerResolutionService,
         classifier: TranscriptClassificationService,
@@ -485,6 +494,9 @@ class TranscriptionService:
         )
         if facets:
             logger.info("Updated %s user profile facet(s).", len(facets))
+        fused_episodes = await context_fusion_service.fuse_recent_context(model=DEFAULT_MODEL)
+        if fused_episodes:
+            logger.info("Fused %s cross-modal context episode(s) from transcript state.", len(fused_episodes))
         semantic_results = await semantic_memory_service.retrieve(
             query=content,
             speaker_ids=[participant.speaker_id for participant in durable_participants.values()],
@@ -674,6 +686,7 @@ class TranscriptionService:
             research_vault,
             memory_context_builder,
             semantic_memory_service,
+            context_fusion_service,
             transcript_normalizer,
             speaker_resolution,
             classifier,
@@ -786,6 +799,7 @@ class TranscriptionService:
                                 memory_store=memory_store,
                                 memory_context_builder=memory_context_builder,
                                 semantic_memory_service=semantic_memory_service,
+                                context_fusion_service=context_fusion_service,
                                 transcript_normalizer=transcript_normalizer,
                                 speaker_resolution=speaker_resolution,
                                 classifier=classifier,
@@ -872,6 +886,13 @@ class TranscriptionService:
                                             "Updated %s visual user fact(s) from passive observation.",
                                             len(updated_facts),
                                         )
+                                with self.gpu_lock:
+                                    fused_episodes = await context_fusion_service.fuse_recent_context(model=DEFAULT_MODEL)
+                                if fused_episodes:
+                                    logger.info(
+                                        "Fused %s cross-modal context episode(s) from passive observation.",
+                                        len(fused_episodes),
+                                    )
                                 logger.info(
                                     "Processed queued screenshot for %s.",
                                     observation.app_name or observation.page_hint or "screen",

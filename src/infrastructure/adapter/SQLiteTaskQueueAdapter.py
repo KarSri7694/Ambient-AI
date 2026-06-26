@@ -1,4 +1,4 @@
-from typing import List
+from typing import Any, List, Optional
 
 import night_mode
 from application.ports.task_queue_port import TaskQueuePort
@@ -17,12 +17,18 @@ class SQLiteTaskQueueAdapter(TaskQueuePort):
                 priority=row.get("priority", "medium"),
                 status=row.get("status", "pending"),
                 created_at=row.get("created_at"),
+                metadata_json=row.get("meta_data"),
             )
             for row in rows
         ]
 
-    def add_task(self, description: str, priority: str = "medium") -> str:
-        return night_mode.add_task(description, priority)
+    def add_task(
+        self,
+        description: str,
+        priority: str = "medium",
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> str:
+        return night_mode.add_task(description, priority, metadata=metadata)
 
     def mark_task_complete(self, task_id: int, status: str = "completed") -> None:
         night_mode.mark_task_complete(task_id, status)
