@@ -1,5 +1,5 @@
-import sqlite3
 import json
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 
@@ -31,12 +31,20 @@ def _ensure_db():
     init_db()
 
 #Functions for managing night shift tasks
-def add_task(description, priority="medium"):
+def add_task(description, priority="medium", metadata=None):
     _ensure_db()
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("INSERT INTO night_queue (description, priority, status, created_at) VALUES (?, ?, ?, ?)",
-              (description, priority, "pending", str(datetime.now())))
+    c.execute(
+        "INSERT INTO night_queue (description, priority, status, created_at, meta_data) VALUES (?, ?, ?, ?, ?)",
+        (
+            description,
+            priority,
+            "pending",
+            str(datetime.now()),
+            json.dumps(metadata, ensure_ascii=False) if metadata is not None else None,
+        ),
+    )
     conn.commit()
     conn.close()
     return "Task queued."
