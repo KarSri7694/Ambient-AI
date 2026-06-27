@@ -1,231 +1,188 @@
-# 🌌 Ambient AI
+# Ambient AI
 
-**The Fully Local, Zero-Interaction Autonomous Agent.**
+**A fully local ambient agent for audio, screen context, and idle-time autonomy.**
 
----
+## Overview
+Ambient AI is a local-first agent that listens to ongoing audio, optionally observes the screen, builds context over time, and executes bounded autonomous work when appropriate.
 
-## 📖 Overview
+The current runtime is optimized around:
 
-**Ambient AI** is a fully local autonomous agent designed to *ambient* around you. Unlike traditional assistants that wait for commands, Ambient AI actively listens to your conversations and watches your screen to understand your intent and context in real-time.
+- Transcript ingestion and classification
+- Passive screen observation and follow-up queueing
+- Proactive research packaging
+- Idle-time and night-mode task execution
+- MCP-backed tool use for local automation
 
-Its core philosophy is **Zero-Interaction**, but it goes beyond simple automation. Ambient AI acts as a proactive partner:
+It is not a chat app with manual modes anymore. `src/app.py` runs the ambient runtime manager directly.
 
-- **Contextual Research:** Catches topics you discuss in passing, autonomously performs deep web research, and presents answers before you even ask.
-- **Intelligent Planning:** Generates daily to-do lists based on your previous days' context and historical conversations.
-- **Seamless Delegation:** Assign complex workflows by adding them to a **"Ambient AI Tasks"** project in Todoist — the agent picks these up and executes them during idle time.
+## Current Runtime
+The main runtime in [src/app.py](src/app.py) manages:
 
----
+- A primary llama.cpp server for the main chat/tool model via `API_BASE_URL` (default `http://localhost:8080`)
+- A separate llama.cpp server for embeddings and reranking via `SEMANTIC_API_BASE_URL` (default `http://localhost:8081`)
+- Transcript processing from the audio pipeline
+- Idle detection and ambient runtime loading/unloading
+- Optional passive screen observation when `PASSIVE_OBSERVER_ENABLED=true`
+- Night-mode execution during the configured window (`20:00-23:00` in the current code)
 
-## 🏗️ Architecture
+Key subsystems:
 
-The project follows the **Hexagonal Architecture** (Ports & Adapters) pattern, cleanly separating core logic from external dependencies.
+- `LLMInteractionService`: tool-calling interaction loop, sub-agent loading, and direct-handled tools such as `capture_screen`
+- `PassiveObserverService`: screenshot capture and visual observation persistence
+- `PassiveObserverFollowupService`: queues durable follow-up tasks from unsent observations
+- `NightModeService`: executes external tasks, queued night tasks, proactive research, queue dedupe, and reflection
+- `AmbientReflectionService`: bounded agenda/task/notification shaping
 
-```
+## Architecture
+The project follows a ports-and-adapters structure:
+
+```text
 src/
-├── core/                        # Domain models & pure logic (NO outward deps)
-│   ├── models.py                # Domain objects (ChatMessage, NightTask, etc.)
-│   └── services/
-│       └── merge_transcript.py          # Pure transcription merging logic
-├── application/                 # Depends on core only
-│   ├── ports/                   # Abstract interfaces (contracts)
-│   │   ├── LLMProvider.py       # LLM generation & streaming
-│   │   ├── modelManager.py      # Model loading/unloading
-│   │   ├── tool_bridge_port.py  # MCP tool system
-│   │   ├── notification_port.py # System notifications
-│   │   ├── task_queue_port.py   # Night task queue
-│   │   ├── task_provider_port.py# External task providers
-│   │   ├── asr_port.py          # Speech recognition
-│   │   ├── identity_port.py     # Speaker identification
-│   │   └── voice_repository_port.py # Voice embedding store
-│   └── services/                # Orchestration (depends on ports + core)
-│       ├── llm_interaction_service.py   # Streaming chat loop + tool execution
-│       └── night_mode_service.py        # Autonomous night-time processing
-├── infrastructure/
-│   └── adapter/                 # Concrete implementations
-│       ├── llamaCppAdapter.py   # llama.cpp OpenAI-compatible server
-│       ├── openVinoAdapter.py   # OpenVINO GenAI local inference
-│       ├── MCPToolAdapter.py    # MCP bridge wrapper
-│       ├── SQLiteNotificationAdapter.py
-│       ├── SQLiteTaskQueueAdapter.py
-│       ├── TodoistTaskAdapter.py
-│       ├── ASR_Adapter.py       # Whisper transcription
-│       ├── pyannoteAdapter.py   # Speaker diarization
-│       ├── ecapaVoxcelebAdapter.py # Voice identification
-│       └── SQLiteVoiceAdapter.py   # Voice embedding storage
-├── app.py                       # Composition root (entry point)
-├── server.py                    # FastAPI audio streaming server
-└── mcp.json                     # MCP server configuration
+|- core/
+|  |- models.py
+|- application/
+|  |- ports/
+|  |- services/
+|- infrastructure/
+|  |- adapter/
+|- app.py
+|- realtime_audio_input.py
+|- MCP_tools.py
+|- finance_tools.py
+|- mcp.json
 ```
 
----
+High-level storage/runtime components:
 
-## 🚀 Key Capabilities
+- SQLite-backed memory, agenda, activity ledger, interaction logs, task queue, proactive topic queue, finance DB
+- MCP servers configured through `mcp.json`
+- Local screenshot capture via `MssScreenCaptureAdapter`
 
-### 👂 The "Ear" (Audio Intelligence)
+## Key Capabilities
+### Audio
+- Real-time audio capture via `realtime_audio_input.py`
+- Transcript normalization, classification, evidence extraction, session tracking, and open-loop extraction
 
-- **Hinglish Transcription:** Fine-tuned Whisper model optimized for code-mixed audio — [Hindi2Hinglish (Oriserve)](https://huggingface.co/Oriserve/Whisper-Hindi2Hinglish-Apex)
-- **Speaker Diarization:** Real-time VAD and speaker separation using **Pyannote**
-- **Voice Identity:** Voice embedding creation using **SpeechBrain VoxCeleb** to distinguish the user from guests
+### Vision
+- Optional passive screenshot capture
+- Visual observation persistence with follow-up send-state
+- Cross-modal context fusion between transcript evidence and visual observations
+- On-demand `capture_screen` tool for the active model turn
 
-### 🧠 The "Brain" (Reasoning & Control)
+### Autonomy
+- Simple task execution for low-risk tasks
+- Proactive research queue and research vault
+- Night queue execution with semantic deduplication
+- Ambient agenda / reflection layer
 
-- **Local Inference:** Powered by **Qwen 3 VL 4B** (default) via llama.cpp
-- **Notification System:** State-aware feedback loop that updates the LLM on outcomes of previous tasks
-- **Chat Mode:** Direct interactive interface with the local LLM
-- **Night Mode:** Fully autonomous task processing during idle hours
+### Tools
+Configured MCP tools currently include:
 
-### 🛠️ The "Hands" (Tool Ecosystem)
+- Custom local MCP tools from [src/MCP_tools.py](src/MCP_tools.py)
+- Finance tools from [src/finance_tools.py](src/finance_tools.py)
+- Tavily MCP remote search
 
-Custom **MCP Bridge** enabling unlimited extensibility:
+The exact active tool surface depends on the servers listed in [mcp.json](mcp.json).
 
-| Category | Tool | Description |
-|---|---|---|
-| **Productivity** | ✅ Todoist | Extracts and adds tasks from audio context |
-| | 📅 Google Meet | Creates meetings from conversation details |
-| | 📓 Obsidian | Manages your personal knowledge base |
-| **Research** | 🌐 Tavily | Autonomous deep web search |
-| | 🕸️ Web Browsing | Full page navigation and extraction |
-| **System** | 🔌 Custom MCP | Bridge any MCP server (Filesystem, GitHub, etc.) |
-| | 📊 Live Dashboard | Visualizes agent activity in real-time |
-| | 🎙️ FastAPI Server | Stream audio notes for transcription |
+## Prerequisites
+- Python 3.11+
+- A local llama.cpp server for the main model on `http://localhost:8080`
+- A second llama.cpp server for embedding/reranking on `http://localhost:8081`
+- Node.js / npm for MCP servers that use `npx`
+- A Windows environment for the current idle detection and MSS-based screen capture path
 
----
-
-## ⚡ Getting Started
-
-### Prerequisites
-
-- **Python 3.11+**
-- **llama.cpp server** — running locally with OpenAI-compatible API (default: `http://localhost:8080`)
-- **Node.js / npm** — required for MCP server tooling (`npx`)
-- **CUDA-capable GPU** — recommended for model inference
-
-### Installation
-
-```bash
-# Clone the repository
-git clone https://github.com/your-username/ambient-ai.git
-cd ambient-ai
-
-# Create and activate virtual environment
+## Installation
+```powershell
+git clone <your-repo>
+cd ambient_ai
 python -m venv venv
-
-# Windows
-./venv/Scripts/activate.ps1
-
-# Linux / macOS
-source venv/bin/activate
-
-# Install dependencies
+.\venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
-### Configuration
+## Configuration
+Important environment variables:
 
-1. **LLM Server** — Start llama.cpp server with the model preset manager or manually:
-   ```bash
-   # The app expects the server at http://localhost:8080
-   # It will auto-load the model "Qwen3-VL-4b-Instruct-Q4_K_M" on startup
-   ```
+```powershell
+$env:API_BASE_URL="http://localhost:8080"
+$env:SEMANTIC_API_BASE_URL="http://localhost:8081"
+$env:PASSIVE_OBSERVER_ENABLED="true"   # optional
+$env:USER_DATA_DIR="D:\USER_DATA"      # optional
+```
 
-2. **MCP Tools** — Configure your MCP servers in `mcp.json`:
-   ```json
-   {
-     "mcpServers": {
-       "My MCP Server": {
-         "command": "fastmcp",
-         "args": ["run", "path/to/MCP_tools.py"],
-         "env": { "TODOIST_API_TOKEN": "your-token" }
-       }
-     }
-   }
-   ```
+Current code-level defaults in `src/app.py`:
 
-3. **Todoist** *(optional)* — Set your API token in the `TODOIST_API_TOKEN` environment variable and configure `todoist.json` with your project ID.
+- `DEFAULT_MODEL = "Qwen-3.5-9B-Mythos-Distilled-Q4_K_M-Vision"`
+- `EMBEDDING_MODEL_PATH = "EmbeddingGemma"`
+- `RERANKER_MODEL_PATH = "JinaReranker"`
+- `USER_IDLE_THRESHOLD_SECONDS = 20`
+- `NIGHT_MODE_START_HOUR = 20`
+- `NIGHT_MODE_END_HOUR = 23`
 
-4. **Night Queue Database** — Auto-initializes on first run. To manually initialize:
-   ```bash
-   python src/night_mode.py
-   ```
+### MCP Configuration
+The runtime reads MCP server definitions from [mcp.json](mcp.json).
 
-### Backend Selection
+At minimum, verify:
 
-Ambient AI supports two inference backends. Set the `LLM_BACKEND` environment variable to choose:
+- the path to `src/MCP_tools.py`
+- the path to `src/finance_tools.py`
+- any required environment variables such as `GEMINI_API_KEY`, `SERPAPI_API_KEY`, or `TODOIST_API_TOKEN`
 
-| Backend | Value | Description |
-|---|---|---|
-| **llama.cpp** *(default)* | `llamacpp` | Uses an external llama.cpp server with OpenAI-compatible API. Best for CUDA GPUs. |
-| **OpenVINO** | `openvino` | Uses Intel's OpenVINO GenAI runtime. Best for Intel GPUs, CPUs, and NPUs. No separate server needed. |
+Do not commit real secrets in `mcp.json` or related config.
 
-#### llama.cpp (default — no extra config needed)
+## Running
+Ambient AI currently expects multiple local processes.
 
-The default backend. Just start the llama.cpp server and run the app:
+### 1. Start the main llama.cpp server
+Example:
 
-```bash
+```powershell
+llama-server -m <main-model> --host 0.0.0.0 --port 8080 --slots --slot-save-path .\model_kv_states
+```
+
+### 2. Start the semantic llama.cpp server
+Example:
+
+```powershell
+llama-server -m <embedding-or-rerank-model> --host 0.0.0.0 --port 8081
+```
+
+This server is used for embeddings and reranking, not the main tool-using model.
+
+### 3. Start the ambient runtime
+```powershell
 python src/app.py
 ```
 
-#### OpenVINO
+This launches the ambient runtime manager plus the audio agent thread orchestration from `app.py`.
 
-1. **Install the runtime:**
-   ```bash
-   pip install openvino-genai
-   ```
-
-2. **Prepare a model** — You need an OpenVINO-optimized model (IR format).
-3. **Set environment variables and run:**
-   ```bash
-   # Windows (PowerShell)
-   $env:LLM_BACKEND = "openvino"
-   $env:OPENVINO_MODEL_PATH = "path/to/your/openvino-model-dir"
-   $env:OPENVINO_DEVICE = "GPU"   # Options: CPU, GPU, NPU
-   python src/app.py
-
-   # Linux / macOS
-   LLM_BACKEND=openvino OPENVINO_MODEL_PATH=path/to/model OPENVINO_DEVICE=GPU python src/app.py
-   ```
-
-| Variable | Default | Description |
-|---|---|---|
-| `LLM_BACKEND` | `llamacpp` | `llamacpp` or `openvino` |
-| `OPENVINO_MODEL_PATH` | `Qwen3-4B-int4-ov` | Path to the OpenVINO model directory |
-| `OPENVINO_DEVICE` | `GPU` | Target device: `CPU`, `GPU`, or `NPU` |
-
-### Running
-
-```bash
-# Main application (all modes)
-python src/app.py
-
-# FastAPI audio streaming server
-python src/main.py
+### 4. Start real-time audio input
+```powershell
+python src/realtime_audio_input.py
 ```
 
-On launch, you'll be presented with three modes:
+## Notes on Current Behavior
+- Passive observation is optional and controlled by `PASSIVE_OBSERVER_ENABLED`.
+- Ambient idle/night execution does not depend on passive observer being enabled.
+- Screen capture for the active model turn is available through the `capture_screen` tool.
+- Night-mode queue dedupe now keeps only semantically unique tasks before execution.
+- Passive follow-up only evaluates unsent observations and marks reviewed observations as sent.
 
-| Mode | Description |
-|---|---|
-| **1 — User Interaction** | Interactive chat with the LLM, with full tool access |
-| **2 — Transcription Automation** | Processes `.txt` files in `transcriptions/` through the LLM |
-| **3 — Night Mode** | Autonomous processing of queued tasks, Todoist tasks, and notifications |
+## Development Notes
+Useful test entry points:
 
----
+```powershell
+pytest tests/test_night_mode.py -q
+pytest tests/test_passive_observer.py -q
+pytest tests/test_llm_interaction_service.py -q
+```
 
-### 🎥Demo Video
+## Roadmap
+Near-term architecture gaps still visible in the codebase:
 
-https://github.com/user-attachments/assets/bde47b83-526b-4ff2-8b0f-3119021149a1
+- Continuous active-use ambient behavior is still weaker than idle-time behavior
+- Cross-modal context exists, but execution is still queue-heavy
+- Tool/action autonomy is still conservative for many real workflows
 
----
-
-## 🗺️ Future Roadmap
-
-- [x] **Hexagonal Architecture Refactor:** Codebase refactored using Ports and Adapters pattern
-- [ ] **GUI Agent:** Vision-based agent for direct screen control *(in progress)*
-- [ ] **Context Fusion:** Merging audio and screenshot context streams
-- [ ] **Model Fine-tuning:** Fine-tuning Qwen 3 for Ambient AI's autonomous workflows
-
----
-
-## 📄 License
-
-This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
+## License
+This project is licensed under the MIT License.
