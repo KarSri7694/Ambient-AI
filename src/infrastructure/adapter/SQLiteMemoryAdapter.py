@@ -224,6 +224,7 @@ class SQLiteMemoryAdapter(MemoryPort):
                     confidence REAL NOT NULL,
                     session_id TEXT,
                     followup_sent_at TEXT,
+                    biodata_sent_at TEXT,
                     raw_payload_json TEXT
                 )
                 """
@@ -321,6 +322,7 @@ class SQLiteMemoryAdapter(MemoryPort):
             "user_fact_hypotheses": "TEXT NOT NULL DEFAULT '[]'",
             "detailed_description": "TEXT NOT NULL DEFAULT ''",
             "followup_sent_at": "TEXT",
+            "biodata_sent_at": "TEXT",
         }
         with self._managed_connection() as conn:
             existing = {
@@ -461,6 +463,7 @@ class SQLiteMemoryAdapter(MemoryPort):
             confidence=float(row["confidence"]),
             session_id=row["session_id"],
             followup_sent_at=row["followup_sent_at"],
+            biodata_sent_at=row["biodata_sent_at"],
             raw_payload_json=row["raw_payload_json"],
         )
 
@@ -1257,8 +1260,8 @@ class SQLiteMemoryAdapter(MemoryPort):
                     app_name, window_title, page_hint, summary, detailed_description, inferred_user_activity,
                     previous_activity_status, salient_entities, completed_items, open_loops,
                     possible_next_task, suggested_research_topics, user_fact_hypotheses,
-                    confidence, session_id, followup_sent_at, raw_payload_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    confidence, session_id, followup_sent_at, biodata_sent_at, raw_payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     observation.observation_id,
@@ -1281,6 +1284,7 @@ class SQLiteMemoryAdapter(MemoryPort):
                     observation.confidence,
                     observation.session_id,
                     observation.followup_sent_at,
+                    observation.biodata_sent_at,
                     observation.raw_payload_json,
                 ),
             )
@@ -1335,6 +1339,19 @@ class SQLiteMemoryAdapter(MemoryPort):
             ).fetchall()
         return [self._visual_observation_from_row(row) for row in rows]
 
+    def get_recent_biodata_pending_visual_observations(self, limit: int = 10) -> List[VisualObservation]:
+        with self._managed_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM visual_observations
+                WHERE biodata_sent_at IS NULL OR biodata_sent_at = ''
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [self._visual_observation_from_row(row) for row in rows]
+
     def get_visual_observation(self, observation_id: str) -> Optional[VisualObservation]:
         with self._managed_connection() as conn:
             row = conn.execute(
@@ -1355,6 +1372,21 @@ class SQLiteMemoryAdapter(MemoryPort):
         with self._managed_connection() as conn:
             conn.execute(
                 f"UPDATE visual_observations SET followup_sent_at = ? WHERE observation_id IN ({placeholders})",
+                [sent_at, *normalized_ids],
+            )
+
+    def mark_visual_observations_biodata_sent(
+        self,
+        observation_ids: List[str],
+        sent_at: str,
+    ) -> None:
+        normalized_ids = [str(observation_id).strip() for observation_id in observation_ids if str(observation_id).strip()]
+        if not normalized_ids:
+            return
+        placeholders = ", ".join("?" for _ in normalized_ids)
+        with self._managed_connection() as conn:
+            conn.execute(
+                f"UPDATE visual_observations SET biodata_sent_at = ? WHERE observation_id IN ({placeholders})",
                 [sent_at, *normalized_ids],
             )
 

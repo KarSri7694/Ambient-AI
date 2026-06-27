@@ -12,56 +12,105 @@ from core.models import VisualObservation
 
 
 class PassiveObserverFollowupService:
-    """Choose one deferred follow-up directly from recent visual observations."""
+    """Turn unsent inferred visual activities into immediate or queued follow-up work."""
 
-    DURABLE_ARTIFACT_PATTERN = re.compile(
-        r"\b(draft|document|doc|spreadsheet|sheet|notebook|repo|code|pull request|pr|issue|ticket|research|comparison|compare|cart|checkout|shortlist|notes?|email|reply|proposal|slide|presentation)\b",
-        re.IGNORECASE,
-    )
-    EPHEMERAL_ACTION_PATTERN = re.compile(
-        r"\b(scroll|swipe|accept|decline|dismiss|close|like|watch|play|pause|resume video|join call|video call|call from|reply now|tap|click|open notification|see more posts|feed)\b",
-        re.IGNORECASE,
-    )
-    DURABLE_APP_HINTS = {
-        "gmail",
-        "google docs",
-        "docs",
-        "google sheets",
-        "sheets",
-        "notion",
-        "github",
-        "gitlab",
-        "visual studio code",
-        "vscode",
-        "amazon",
-        "flipkart",
-        "excel",
-        "powerpoint",
-        "word",
-        "chrome",
-    }
     FOLLOWUP_TTL_SECONDS = 2 * 60 * 60
     UNSENT_OBSERVATION_LIMIT = 20
 
-    FOLLOWUP_PROMPT = """You decide whether the ambient agent should take one deferred follow-up action from recent passive visual observations.
+    UNIQUE_ACTIVITIES_PROMPT = """You receive a list of inferred user activities extracted from passive visual observations.
 
 Return JSON only:
 {
-  "action": "nothing|queue_task",
-  "title": "short title",
-  "description": "short concrete task description",
-  "source_observation_id": "observation id or empty string",
-  "confidence": 0.0
+  "unique_activities": ["activity 1", "activity 2"]
 }
 
 Rules:
-- Prefer nothing unless there is clear durable work that would still matter later.
-- Never queue a task if the observation suggests the work is already completed.
-- Do not repeat a task that is already present in pending_tasks.
-- Choose at most one task.
-- Queue only for durable later work such as unfinished drafts, research, multi-step comparison, code changes, or document review.
-- Never queue transient UI actions such as scrolling a feed, accepting a call, clicking a button, or dismissing a popup.
-- The description must be self-contained and actionable later, without relying on hidden terminal context.
+- Return only semantically unique activities.
+- Merge duplicate or near-duplicate activities into one normalized activity string.
+- Preserve the concrete user intent.
+- Do not add commentary or any keys other than unique_activities.
+"""
+
+    USEFUL_ACTIVITIES_PROMPT = """You receive a list of unique inferred user activities.
+
+Return JSON only:
+{
+  "useful_activities": ["activity 1", "activity 2"]
+}
+
+Rules:
+- Keep only activities that would be useful for an ambient agent to act on later or now.
+- Keep the activities that might need to be reminded to the user or that the user might forget to do maybe related to work, education or personal life.
+- Remove trivial UI actions and low-value interaction such as scrolling, typing, clicking, opening tabs, navigating, dismissing popups, or similar mechanical actions.
+- Keep only activities with meaningful intent.
+- Do not add any keys other than useful_activities.
+"""
+
+    ACTIVITY_DECISION_PROMPT = """You receive an inferred user activity produced by a previous agent call together with full visual observation context. It is not a literal user command. You must infer what useful ambient action, if any, an AI agent should take from it.
+
+Return JSON only:
+{
+  "action": "nothing|queue_task|do_now",
+  "task": "concrete action for the AI agent to do or queue",
+  "user_info_updates": ["optional user facts or notes worth saving"]
+}
+
+Rules:
+- If the activity is coding or programming related, or related to git version control, just output "nothing" for action and do not queue or do_now any tasks.
+- Prefer extracting the most directly useful action from the context, not merely restating or summarizing what the user was viewing.
+- If the context suggests something the user may need to remember, track, revisit, prepare for, or not forget, strongly prefer a reminder/todo style action.
+- Interpret the activity text as a description of what the user was doing, discussing, or thinking about.
+- Use the full observation context such as app, page, summary, detailed description, and capture time to understand what the user likely needs.
+- Infer the underlying useful action, reminder, search, or saved note. Do not just repeat the activity text when a more concrete action is obvious.
+- Prefer the most actionable underlying need over generic summarization.
+- Do not default to "summarize chat" or "create a note" 
+- If the context contains uncertainty, speculation, comparison, investigation, or open questions about causes, prices, news, products, events, or decisions, consider whether a concrete research task is more useful than a summary.
+- If multiple possible actions exist, choose the single one that is most immediately useful and actionable for the user.
+- Use do_now when the agent should perform something immediately during idle time that may be of immediate use to the user.
+- Good do_now examples: setting a reminder, creating a quick todo, doing a quick search, checking a score, checking a schedule, checking a price, answering a simple question, or briefly explaining something currently on screen.
+- Use queue_task when the activity should be queued for an AI agent that will perform that task later on.
+- Good queue_task examples: research, multi-step comparison, drafting, writing follow-up, document work, code work, or any longer task that should persist beyond this moment.
+- If the activity is actionable now and the result would likely help the user immediately, prefer do_now.
+- If the activity represents durable work that should be carried out later by an AI agent, prefer queue_task.
+- Use nothing for irrelevant, unsafe, ambiguous, purely mechanical, or low-value activities.
+- When action is do_now or queue_task, task must be a short concrete instruction for the AI agent.
+- When action is nothing, task may be empty.
+- Use user_info_updates for durable user facts, interests, concerns, or reminders worth saving for later context.
+- Do not add commentary or any keys other than action, task, and user_info_updates.
+
+Examples:
+Input activity: "compare TV prices across Amazon and Flipkart"
+Output:
+{"action":"queue_task","task":"compare TV prices across Amazon and Flipkart and summarize the best options","user_info_updates":[]}
+
+Input activity: "set a reminder to call mom tonight"
+Output:
+{"action":"do_now","task":"set a reminder to call mom tonight","user_info_updates":[]}
+
+Input activity: "check today's India cricket score"
+Output:
+{"action":"do_now","task":"check today's India cricket score","user_info_updates":[]}
+
+Input activity: "write a follow-up email draft to the recruiter"
+Output:
+{"action":"queue_task","task":"draft a follow-up email to the recruiter","user_info_updates":[]}
+
+Input activity: "scrolling through Instagram feed"
+Output:
+{"action":"nothing","task":"","user_info_updates":[]}
+
+Input activity: "typing in a search box"
+Output:
+{"action":"nothing","task":"","user_info_updates":[]}
+
+Input activity: "Reviewing or replying to messages in a conversation that mentions an upcoming event the user may need to remember"
+Output:
+{"action":"do_now","task":"set a reminder about the upcoming event","user_info_updates":["User may need to remember an upcoming event mentioned in conversation."]}
+
+Input activity: "Reviewing a discussion that speculates about why a product price is increasing"
+Output:
+{"action":"queue_task","task":"research the possible reasons behind the product price increase","user_info_updates":["User may be interested in the reasons behind a recent product price increase."]}
+
 """
 
     def __init__(
@@ -79,323 +128,338 @@ Rules:
         self.activity_ledger = activity_ledger
         self.logger = logger or logging.getLogger(self.__class__.__name__)
 
+    def _build_system_prompt(self, prompt: str) -> str:
+        now = datetime.now()
+        preamble = (
+            f"Current day of week: {now.strftime('%A')}\n"
+            f"Current date: {now.strftime('%Y-%m-%d')}\n"
+            f"Current time: {now.strftime('%H:%M:%S')}\n\n"
+        )
+        return preamble + prompt
+
     async def maybe_queue_followup(self, *, model: str) -> dict:
         observations = self.memory.get_recent_unsent_visual_observations(limit=self.UNSENT_OBSERVATION_LIMIT)
-        if not observations:
-            return {"action": "nothing", "reason": "no unsent observations"}
-        source_observation = observations[0]
-        triage = self._triage_observation(source_observation, observations)
-        if not triage["eligible"]:
-            return {"action": "nothing", "reason": triage["reason"]}
+        activity_rows = self._extract_activity_rows(observations)
+        if not activity_rows:
+            return self._empty_result("no unsent inferred activities")
+
         pending_tasks = self.task_queue.get_pending_tasks()
-        payload = {
-            "recent_visual_observations": [self._observation_payload(item) for item in observations],
-            "selected_observation": self._observation_payload(source_observation),
-            "pending_tasks": [task.description for task in pending_tasks[:10]],
-            "visual_digest": self.memory.get_visual_digest(),
-            "user_info": self.memory.get_user_info(),
-            "triage": triage,
-        }
+        pending_descriptions = [str(task.description) for task in pending_tasks[:20]]
         sent_at = datetime.now().isoformat()
         self.memory.mark_visual_observations_followup_sent(
-            [item.observation_id for item in observations],
+            [row["observation_id"] for row in activity_rows],
             sent_at=sent_at,
         )
+
         with interaction_trace("passive_observer_followup"):
-            completion = await self.llm.chat_completion_stream(
+            unique_activities = await self._request_unique_activities(
                 model=model,
-                messages=[
-                    {"role": "system", "content": self.FOLLOWUP_PROMPT},
-                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False, indent=2)},
-                ],
-                tools=None,
+                activities=[row["activity"] for row in activity_rows],
             )
-        text = await self._consume_stream_text(completion)
-        parsed = self._parse_json_object(text)
-        if not isinstance(parsed, dict):
-            return {"action": "nothing"}
-        if str(parsed.get("action", "")).strip().lower() != "queue_task":
-            return {"action": "nothing"}
-        title = str(parsed.get("title", "")).strip()
-        description = str(parsed.get("description", "")).strip()
-        if not title or not description:
-            return {"action": "nothing"}
-        if self._looks_duplicate(title=title, description=description, pending_tasks=payload["pending_tasks"]):
-            return {"action": "nothing"}
-        source_observation_id = str(parsed.get("source_observation_id", "")).strip() or source_observation.observation_id
-        source_observation = self._resolve_source_observation(
-            source_observation_id=source_observation_id,
-            observations=observations,
-        )
-        metadata = self._build_task_metadata(
-            observation=source_observation,
-            title=title,
-            description=description,
-            triage=triage,
-        )
-        self.task_queue.add_task(
-            self._build_task_description(
-                title=title,
-                description=description,
-                observation=source_observation,
-            ),
-            priority="low",
-            metadata=metadata,
-        )
-        if self.activity_ledger is not None:
-            run = self.activity_ledger.queue_run(
-                source_kind="passive_observer_followup",
-                trigger_kind="ambient_inference",
-                title=title,
-                summary=description,
-                metadata={"source_observation_id": source_observation_id},
-                tags=["passive_observer", "followup"],
+            useful_activities = await self._request_useful_activities(
+                model=model,
+                activities=unique_activities,
             )
-            if source_observation_id:
-                self.activity_ledger.link_entity(
-                    run_id=run.run_id,
-                    entity_type="visual_observation",
-                    entity_id=source_observation_id,
-                    relation="derived_from",
+            grouped_rows = self._group_rows_by_activity(activity_rows)
+            useful_activities = self._ensure_reminder_candidates(
+                useful_activities=useful_activities,
+                grouped_rows=grouped_rows,
+            )
+            queued_activities: List[str] = []
+            do_now_activities: List[str] = []
+            ignored_activities: List[str] = []
+            user_info_updates: List[str] = []
+
+            for activity in useful_activities:
+                matching_rows = grouped_rows.get(self._normalize_activity(activity), [])
+                decision = await self._classify_activity(
+                    model=model,
+                    activity=activity,
+                    rows=matching_rows,
                 )
+                action = decision["action"]
+                task = decision["task"] or activity
+                user_info_updates.extend(decision["user_info_updates"])
+                if action == "queue_task":
+                    if self._looks_duplicate(activity=task, pending_tasks=pending_descriptions):
+                        ignored_activities.append(task)
+                        continue
+                    self.task_queue.add_task(
+                        self._build_task_description(activity=task, rows=matching_rows),
+                        priority="low",
+                        metadata=self._build_task_metadata(activity=activity, task=task, rows=matching_rows),
+                    )
+                    pending_descriptions.append(task)
+                    queued_activities.append(task)
+                    self._record_activity_ledger(activity=task, rows=matching_rows)
+                elif action == "do_now":
+                    do_now_activities.append(task)
+                else:
+                    ignored_activities.append(activity)
+
+            saved_user_info_updates = self._apply_user_info_updates(user_info_updates)
+
+        useful_set = {self._normalize_activity(item) for item in useful_activities}
+        for activity in unique_activities:
+            if self._normalize_activity(activity) not in useful_set:
+                ignored_activities.append(activity)
+
         return {
-            "action": "queue_task",
-            "title": title,
-            "description": description,
-            "source_observation_id": source_observation_id,
+            "processed_observation_ids": [row["observation_id"] for row in activity_rows],
+            "unique_activities": unique_activities,
+            "useful_activities": useful_activities,
+            "queued_activities": queued_activities,
+            "do_now_activities": do_now_activities,
+            "ignored_activities": ignored_activities,
+            "user_info_updates": saved_user_info_updates,
         }
 
-    def _resolve_source_observation(
-        self,
-        *,
-        source_observation_id: str,
-        observations: List[VisualObservation],
-    ) -> VisualObservation | None:
-        if source_observation_id:
-            for observation in observations:
-                if observation.observation_id == source_observation_id:
-                    return observation
-        return observations[0] if observations else None
+    def _empty_result(self, reason: str) -> dict:
+        return {
+            "processed_observation_ids": [],
+            "unique_activities": [],
+            "useful_activities": [],
+            "queued_activities": [],
+            "do_now_activities": [],
+            "ignored_activities": [],
+            "user_info_updates": [],
+            "reason": reason,
+        }
 
-    def _build_task_description(
-        self,
-        *,
-        title: str,
-        description: str,
-        observation: VisualObservation | None,
-    ) -> str:
-        lines = [f"[Passive observer] {title}", description.strip()]
-        if observation is None:
-            return "\n".join(lines)
-        lines.extend(
-            [
-                "",
-                "Passive observation context:",
-                f"- Observation ID: {observation.observation_id}",
-                f"- Captured at: {observation.created_at}",
-            ]
+    def _extract_activity_rows(self, observations: List[VisualObservation]) -> List[dict]:
+        rows: List[dict] = []
+        for observation in observations:
+            reminder_hint = self._extract_reminder_hint(observation.raw_payload_json)
+            activity = self._clean_text(observation.inferred_user_activity) or reminder_hint["reminder_context"]
+            if not activity:
+                continue
+            rows.append(
+                {
+                    "observation_id": observation.observation_id,
+                    "created_at": observation.created_at,
+                    "activity": activity,
+                    "app_name": self._clean_text(observation.app_name),
+                    "page_hint": self._clean_text(observation.page_hint),
+                    "summary": self._clean_text(observation.summary),
+                    "detailed_description": self._clean_text(observation.detailed_description),
+                    "maybe_require_a_reminder": reminder_hint["maybe_require_a_reminder"],
+                    "reminder_context": reminder_hint["reminder_context"],
+                    "observation": observation,
+                }
+            )
+        return rows
+
+    def _group_rows_by_activity(self, rows: List[dict]) -> dict[str, List[dict]]:
+        grouped: dict[str, List[dict]] = {}
+        for row in rows:
+            key = self._normalize_activity(row["activity"])
+            grouped.setdefault(key, []).append(row)
+        return grouped
+
+    async def _request_unique_activities(self, *, model: str, activities: List[str]) -> List[str]:
+        if not activities:
+            return []
+        payload = {"activities": activities}
+        completion = await self.llm.chat_completion_stream(
+            model=model,
+            messages=[
+                {"role": "system", "content": self._build_system_prompt(self.UNIQUE_ACTIVITIES_PROMPT)},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False, indent=2)},
+            ],
+            tools=None,
         )
-        if observation.app_name:
-            lines.append(f"- App: {observation.app_name}")
-        if observation.page_hint:
-            lines.append(f"- Page hint: {observation.page_hint}")
-        if observation.summary:
-            lines.append(f"- Summary: {observation.summary}")
-        if observation.detailed_description:
-            lines.append(f"- Detailed description: {observation.detailed_description}")
-        if observation.inferred_user_activity:
-            lines.append(f"- Inferred user activity: {observation.inferred_user_activity}")
-        if observation.possible_next_task:
-            lines.append(f"- Possible next task: {observation.possible_next_task}")
-        if observation.open_loops:
-            lines.append(f"- Open loops: {', '.join(observation.open_loops[:4])}")
+        parsed = self._parse_json_object(await self._consume_stream_text(completion))
+        return self._dedupe_preserve_order(self._list_text(parsed.get("unique_activities")))
+
+    async def _request_useful_activities(self, *, model: str, activities: List[str]) -> List[str]:
+        if not activities:
+            return []
+        payload = {"activities": activities}
+        completion = await self.llm.chat_completion_stream(
+            model=model,
+            messages=[
+                {"role": "system", "content": self._build_system_prompt(self.USEFUL_ACTIVITIES_PROMPT)},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False, indent=2)},
+            ],
+            tools=None,
+        )
+        parsed = self._parse_json_object(await self._consume_stream_text(completion))
+        return self._dedupe_preserve_order(self._list_text(parsed.get("useful_activities")))
+
+    async def _classify_activity(self, *, model: str, activity: str, rows: List[dict]) -> dict:
+        payload = {
+            "activity": activity,
+            "observation_context": [
+                {
+                    "observation_id": row["observation_id"],
+                    "created_at": row["created_at"],
+                    "app_name": row["app_name"],
+                    "page_hint": row["page_hint"],
+                    "summary": row["summary"],
+                    "detailed_description": row["detailed_description"],
+                    "maybe_require_a_reminder": row["maybe_require_a_reminder"],
+                    "reminder_context": row["reminder_context"],
+                }
+                for row in rows
+            ],
+        }
+        completion = await self.llm.chat_completion_stream(
+            model=model,
+            messages=[
+                {"role": "system", "content": self._build_system_prompt(self.ACTIVITY_DECISION_PROMPT)},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False, indent=2)},
+            ],
+            tools=None,
+        )
+        parsed = self._parse_json_object(await self._consume_stream_text(completion))
+        decision = self._clean_text(parsed.get("action")).lower()
+        task = self._clean_text(parsed.get("task"))
+        user_info_updates = self._list_text(parsed.get("user_info_updates"))
+        if decision not in {"nothing", "queue_task", "do_now"}:
+            decision = "nothing"
+        return {
+            "action": decision,
+            "task": task,
+            "user_info_updates": user_info_updates,
+        }
+
+    def _ensure_reminder_candidates(self, *, useful_activities: List[str], grouped_rows: dict[str, List[dict]]) -> List[str]:
+        results = list(useful_activities)
+        seen = {self._normalize_activity(item) for item in results}
+        for rows in grouped_rows.values():
+            if not rows:
+                continue
+            if not any(row["maybe_require_a_reminder"] and row["reminder_context"] for row in rows):
+                continue
+            activity = rows[0]["activity"]
+            key = self._normalize_activity(activity)
+            if key and key not in seen:
+                results.append(activity)
+                seen.add(key)
+        return results
+
+    def _build_task_description(self, *, activity: str, rows: List[dict]) -> str:
+        lines = [f"[Passive observer] {activity}", activity]
+        if not rows:
+            return "\n".join(lines)
+        lines.extend(["", "Passive observation context:"])
+        for row in rows:
+            lines.append(f"- Observation ID: {row['observation_id']}")
+            lines.append(f"- Captured at: {row['created_at']}")
         return "\n".join(lines)
 
-    def _build_task_metadata(
-        self,
-        *,
-        observation: VisualObservation | None,
-        title: str,
-        description: str,
-        triage: dict,
-    ) -> dict:
-        metadata = {
+    def _build_task_metadata(self, *, activity: str, task: str, rows: List[dict]) -> dict:
+        return {
             "task_kind": "passive_observer_followup",
-            "title": title,
-            "description": description,
-            "durability_class": triage.get("durability_class", "durable"),
-            "queue_reason": triage.get("reason", ""),
+            "activity": activity,
+            "task": task,
+            "normalized_activity": self._normalize_activity(task),
+            "source": "inferred_user_activity",
+            "source_observation_ids": [row["observation_id"] for row in rows],
             "ttl_seconds": self.FOLLOWUP_TTL_SECONDS,
         }
-        if observation is None:
-            return metadata
-        metadata.update(
-            {
-                "source_observation_id": observation.observation_id,
-                "source_created_at": observation.created_at,
-                "app_name": observation.app_name,
-                "page_hint": observation.page_hint,
-                "summary": observation.summary,
-                "detailed_description": observation.detailed_description,
-                "inferred_user_activity": observation.inferred_user_activity,
-                "previous_activity_status": observation.previous_activity_status,
-                "completed_items": observation.completed_items,
-                "open_loops": observation.open_loops,
-                "possible_next_task": observation.possible_next_task,
-                "session_id": observation.session_id,
-            }
+
+    def _record_activity_ledger(self, *, activity: str, rows: List[dict]) -> None:
+        if self.activity_ledger is None:
+            return
+        run = self.activity_ledger.queue_run(
+            source_kind="passive_observer_followup",
+            trigger_kind="ambient_inference",
+            title=activity,
+            summary=activity,
+            metadata={"source_observation_ids": [row["observation_id"] for row in rows]},
+            tags=["passive_observer", "followup"],
         )
-        return metadata
-
-    def _observation_payload(self, item: VisualObservation) -> dict:
-        return {
-            "observation_id": item.observation_id,
-            "created_at": item.created_at,
-            "app_name": item.app_name,
-            "page_hint": item.page_hint,
-            "summary": item.summary,
-            "detailed_description": item.detailed_description,
-            "inferred_user_activity": item.inferred_user_activity,
-            "previous_activity_status": item.previous_activity_status,
-            "completed_items": item.completed_items,
-            "open_loops": item.open_loops,
-            "possible_next_task": item.possible_next_task,
-        }
-
-    def _triage_observation(
-        self,
-        observation: VisualObservation,
-        observations: List[VisualObservation],
-    ) -> dict:
-        text = " ".join(
-            part
-            for part in [
-                observation.summary,
-                observation.detailed_description,
-                observation.inferred_user_activity,
-                observation.possible_next_task or "",
-                " ".join(observation.open_loops),
-            ]
-            if part
-        )
-        lowered = text.lower()
-        if observation.previous_activity_status == "completed" or observation.completed_items:
-            return {"eligible": False, "reason": "observation looks completed"}
-        if self.EPHEMERAL_ACTION_PATTERN.search(lowered):
-            return {"eligible": False, "reason": "ephemeral immediate UI action"}
-        if not observation.open_loops and not observation.possible_next_task:
-            return {"eligible": False, "reason": "no unresolved durable work"}
-
-        durable_artifact = bool(self.DURABLE_ARTIFACT_PATTERN.search(lowered)) or self._durable_app_context(observation)
-        repeated = self._has_repeated_unresolved_intent(observation, observations)
-
-        if not durable_artifact:
-            return {"eligible": False, "reason": "no durable artifact or workflow"}
-        if observation.previous_activity_status == "left_midway":
-            return {
-                "eligible": True,
-                "reason": "durable artifact left midway",
-                "durability_class": "durable",
-                "repeated": repeated,
-            }
-        if repeated:
-            return {
-                "eligible": True,
-                "reason": "durable unresolved work repeated across observations",
-                "durability_class": "durable",
-                "repeated": True,
-            }
-        if self._looks_like_draft_or_comparison(observation):
-            return {
-                "eligible": True,
-                "reason": "durable draft or comparison artifact visible",
-                "durability_class": "durable",
-                "repeated": repeated,
-            }
-        return {"eligible": False, "reason": "single observation is not durable enough"}
-
-    def _durable_app_context(self, observation: VisualObservation) -> bool:
-        values = {
-            (observation.app_name or "").strip().lower(),
-            (observation.page_hint or "").strip().lower(),
-        }
-        return any(value in self.DURABLE_APP_HINTS for value in values if value)
-
-    def _looks_like_draft_or_comparison(self, observation: VisualObservation) -> bool:
-        text = " ".join(
-            part
-            for part in [
-                observation.summary,
-                observation.detailed_description,
-                observation.inferred_user_activity,
-                observation.possible_next_task or "",
-            ]
-            if part
-        ).lower()
-        return any(
-            token in text
-            for token in (
-                "draft",
-                "reply",
-                "compare",
-                "comparison",
-                "research",
-                "review",
-                "cart",
-                "code",
-                "document",
-                "email",
+        for row in rows:
+            self.activity_ledger.link_entity(
+                run_id=run.run_id,
+                entity_type="visual_observation",
+                entity_id=row["observation_id"],
+                relation="derived_from",
             )
-        )
 
-    def _has_repeated_unresolved_intent(
-        self,
-        observation: VisualObservation,
-        observations: List[VisualObservation],
-    ) -> bool:
-        if not observation.open_loops and not observation.possible_next_task:
-            return False
-        current_terms = self._intent_terms(observation)
-        if not current_terms:
-            return False
-        matches = 0
-        for item in observations[1:]:
-            if item.previous_activity_status == "completed":
-                continue
-            if observation.session_id and item.session_id and item.session_id == observation.session_id:
-                matches += 1
-                continue
-            other_terms = self._intent_terms(item)
-            if other_terms and len(current_terms & other_terms) >= 2:
-                matches += 1
-        return matches >= 1
-
-    def _intent_terms(self, observation: VisualObservation) -> set[str]:
-        text = " ".join(
-            part
-            for part in [
-                observation.summary,
-                observation.detailed_description,
-                observation.inferred_user_activity,
-                observation.possible_next_task or "",
-                " ".join(observation.open_loops),
-            ]
-            if part
-        ).lower()
-        return {
-            token
-            for token in re.findall(r"[a-z0-9]+", text)
-            if len(token) >= 4 and token not in {"that", "with", "from", "this", "user"}
-        }
-
-    def _looks_duplicate(self, *, title: str, description: str, pending_tasks: List[str]) -> bool:
-        normalized_title = title.lower()
-        normalized_description = description.lower()
+    def _looks_duplicate(self, *, activity: str, pending_tasks: List[str]) -> bool:
+        normalized_activity = self._normalize_activity(activity)
+        if not normalized_activity:
+            return True
         for task in pending_tasks:
-            text = task.lower()
-            if normalized_title in text or normalized_description in text:
+            if normalized_activity in self._normalize_activity(task):
                 return True
         return False
+
+    def _apply_user_info_updates(self, updates: List[str]) -> List[str]:
+        deduped = self._dedupe_preserve_order(updates)
+        if not deduped:
+            return []
+        existing = self.memory.get_user_info().strip()
+        existing_lines = {
+            self._normalize_activity(line)
+            for line in existing.splitlines()
+            if self._normalize_activity(line)
+        }
+        new_updates = [item for item in deduped if self._normalize_activity(item) not in existing_lines]
+        if not new_updates:
+            return []
+        lines: List[str] = []
+        if existing:
+            lines.append(existing)
+            if not existing.endswith("\n"):
+                lines.append("")
+        lines.extend(f"- {item}" for item in new_updates)
+        content = "\n".join(lines).strip() + "\n"
+        self.memory.save_user_info(content)
+        return new_updates
+
+    def _extract_reminder_hint(self, raw_payload_json: str | None) -> dict:
+        if not raw_payload_json:
+            return {"maybe_require_a_reminder": False, "reminder_context": ""}
+        try:
+            payload = json.loads(raw_payload_json)
+        except json.JSONDecodeError:
+            return {"maybe_require_a_reminder": False, "reminder_context": ""}
+        return {
+            "maybe_require_a_reminder": self._truthy(payload.get("maybe_require_a_reminder")),
+            "reminder_context": self._clean_text(payload.get("reminder_context")),
+        }
+
+    def _dedupe_preserve_order(self, values: List[str]) -> List[str]:
+        seen: set[str] = set()
+        result: List[str] = []
+        for value in values:
+            key = self._normalize_activity(value)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            result.append(value)
+        return result
+
+    def _list_text(self, value) -> List[str]:
+        if not isinstance(value, list):
+            return []
+        results: List[str] = []
+        for item in value:
+            text = self._clean_text(item)
+            if text:
+                results.append(text)
+        return results
+
+    def _normalize_activity(self, text: str) -> str:
+        cleaned = self._clean_text(text).lower()
+        if not cleaned:
+            return ""
+        return re.sub(r"\s+", " ", cleaned)
+
+    def _clean_text(self, value) -> str:
+        if value is None:
+            return ""
+        return str(value).strip()
+
+    def _truthy(self, value) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
 
     async def _consume_stream_text(self, completion) -> str:
         parts: List[str] = []

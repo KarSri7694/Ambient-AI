@@ -24,5 +24,10 @@ class AppConfig:
     def get_bool(self, section: str, option: str, fallback: bool) -> bool:
         return self.parser.getboolean(section, option, fallback=fallback)
 
+    def get_model(self, option: str, fallback: str, section: str = "models") -> str:
+        value = self.parser.get(section, option, fallback=fallback)
+        normalized = str(value).strip()
+        return normalized or fallback
+
 
 CONFIG = AppConfig()

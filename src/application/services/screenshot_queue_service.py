@@ -36,13 +36,11 @@ class ScreenshotQueueService:
     def enqueue(self, screenshot_path: str, captured_at: str | None = None) -> Optional[ScreenshotJob]:
         candidate = self._load_similarity_image(screenshot_path)
         if candidate is not None and self._is_too_similar(candidate):
-            self._remove_file(screenshot_path)
             self.logger.info("Skipped queued screenshot because it is too similar to a recent capture: %s", screenshot_path)
             return None
 
         if len(self._queue) >= self.maxlen:
             dropped = self._queue.popleft()
-            self._remove_file(dropped.screenshot_path)
             self.logger.info("Dropped oldest queued screenshot due to queue overflow: %s", dropped.screenshot_path)
         job = ScreenshotJob(
             screenshot_path=screenshot_path,
@@ -66,12 +64,6 @@ class ScreenshotQueueService:
 
     def peek_oldest(self) -> Optional[ScreenshotJob]:
         return self._queue[0] if self._queue else None
-
-    def _remove_file(self, path: str) -> None:
-        try:
-            Path(path).unlink(missing_ok=True)
-        except OSError:
-            self.logger.debug("Failed to remove dropped screenshot file %s", path)
 
     def _load_similarity_image(self, path: str) -> Optional[np.ndarray]:
         if self.ssim_compare_count <= 0:

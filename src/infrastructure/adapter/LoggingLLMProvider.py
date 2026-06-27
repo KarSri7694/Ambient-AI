@@ -24,6 +24,7 @@ class LoggingLLMProvider(LLMProvider):
         self.provider = provider
         self.log_store = log_store
         self.current_response_path = Path(current_response_path) if current_response_path else None
+        self._current_response_state: Dict[str, Any] | None = None
         if self.current_response_path is not None:
             self.current_response_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -45,10 +46,12 @@ class LoggingLLMProvider(LLMProvider):
         interaction_id = uuid.uuid4().hex
         source = current_interaction_source()
         metadata = current_interaction_metadata()
+        interaction_run_id = metadata.get("interaction_run_id") or uuid.uuid4().hex
         self._write_current_response(
             source=source,
             model=getattr(self.provider, "currently_loaded_model", "") or "unknown",
             created_at=started_at,
+            interaction_run_id=interaction_run_id,
             response_text="",
             reasoning_text="",
             status="streaming",
@@ -60,6 +63,7 @@ class LoggingLLMProvider(LLMProvider):
                 source=source,
                 model=getattr(self.provider, "currently_loaded_model", "") or "unknown",
                 created_at=started_at,
+                interaction_run_id=interaction_run_id,
                 response_text=response,
                 reasoning_text="",
                 status="completed",
@@ -68,6 +72,7 @@ class LoggingLLMProvider(LLMProvider):
             self._log(
                 InteractionLogEntry(
                     interaction_id=interaction_id,
+                    interaction_run_id=interaction_run_id,
                     created_at=started_at,
                     completed_at=datetime.now().isoformat(),
                     source=source,
@@ -77,6 +82,7 @@ class LoggingLLMProvider(LLMProvider):
                     response_text=response,
                     duration_ms=int((perf_counter() - started) * 1000),
                     metadata_json=json.dumps(metadata, ensure_ascii=False, indent=2) if metadata else None,
+                    report_json=None,
                 )
             )
             return response
@@ -85,6 +91,7 @@ class LoggingLLMProvider(LLMProvider):
                 source=source,
                 model=getattr(self.provider, "currently_loaded_model", "") or "unknown",
                 created_at=started_at,
+                interaction_run_id=interaction_run_id,
                 response_text="",
                 reasoning_text="",
                 status="error",
@@ -94,6 +101,7 @@ class LoggingLLMProvider(LLMProvider):
             self._log(
                 InteractionLogEntry(
                     interaction_id=interaction_id,
+                    interaction_run_id=interaction_run_id,
                     created_at=started_at,
                     completed_at=datetime.now().isoformat(),
                     source=source,
@@ -103,6 +111,7 @@ class LoggingLLMProvider(LLMProvider):
                     error_text=str(exc),
                     duration_ms=int((perf_counter() - started) * 1000),
                     metadata_json=json.dumps(metadata, ensure_ascii=False, indent=2) if metadata else None,
+                    report_json=None,
                 )
             )
             raise
@@ -122,6 +131,7 @@ class LoggingLLMProvider(LLMProvider):
         interaction_id = uuid.uuid4().hex
         source = current_interaction_source()
         metadata = current_interaction_metadata()
+        interaction_run_id = metadata.get("interaction_run_id") or uuid.uuid4().hex
         response_text_parts: List[str] = []
         reasoning_text_parts: List[str] = []
         streamed_tool_calls: Dict[int, Dict[str, Any]] = {}
@@ -140,6 +150,7 @@ class LoggingLLMProvider(LLMProvider):
                 source=source,
                 model=model,
                 created_at=started_at,
+                interaction_run_id=interaction_run_id,
                 response_text="",
                 reasoning_text="",
                 status="streaming",
@@ -172,6 +183,7 @@ class LoggingLLMProvider(LLMProvider):
                             source=source,
                             model=model,
                             created_at=started_at,
+                            interaction_run_id=interaction_run_id,
                             response_text="".join(response_text_parts),
                             reasoning_text="".join(reasoning_text_parts),
                             status="streaming",
@@ -183,6 +195,7 @@ class LoggingLLMProvider(LLMProvider):
                         source=source,
                         model=model,
                         created_at=started_at,
+                        interaction_run_id=interaction_run_id,
                         response_text="".join(response_text_parts),
                         reasoning_text="".join(reasoning_text_parts),
                         status="error",
@@ -192,6 +205,7 @@ class LoggingLLMProvider(LLMProvider):
                     self._log(
                         InteractionLogEntry(
                             interaction_id=interaction_id,
+                            interaction_run_id=interaction_run_id,
                             created_at=started_at,
                             completed_at=datetime.now().isoformat(),
                             source=source,
@@ -207,6 +221,7 @@ class LoggingLLMProvider(LLMProvider):
                             error_text=str(exc),
                             duration_ms=int((perf_counter() - started) * 1000),
                             metadata_json=json.dumps(metadata, ensure_ascii=False, indent=2) if metadata else None,
+                            report_json=None,
                         )
                     )
                     raise
@@ -215,6 +230,7 @@ class LoggingLLMProvider(LLMProvider):
                         source=source,
                         model=model,
                         created_at=started_at,
+                        interaction_run_id=interaction_run_id,
                         response_text="".join(response_text_parts),
                         reasoning_text="".join(reasoning_text_parts),
                         status="completed",
@@ -223,6 +239,7 @@ class LoggingLLMProvider(LLMProvider):
                     self._log(
                         InteractionLogEntry(
                             interaction_id=interaction_id,
+                            interaction_run_id=interaction_run_id,
                             created_at=started_at,
                             completed_at=datetime.now().isoformat(),
                             source=source,
@@ -237,6 +254,7 @@ class LoggingLLMProvider(LLMProvider):
                             else None,
                             duration_ms=int((perf_counter() - started) * 1000),
                             metadata_json=json.dumps(metadata, ensure_ascii=False, indent=2) if metadata else None,
+                            report_json=None,
                         )
                     )
 
@@ -246,6 +264,7 @@ class LoggingLLMProvider(LLMProvider):
                 source=source,
                 model=model,
                 created_at=started_at,
+                interaction_run_id=interaction_run_id,
                 response_text="".join(response_text_parts),
                 reasoning_text="".join(reasoning_text_parts),
                 status="error",
@@ -255,6 +274,7 @@ class LoggingLLMProvider(LLMProvider):
             self._log(
                 InteractionLogEntry(
                     interaction_id=interaction_id,
+                    interaction_run_id=interaction_run_id,
                     created_at=started_at,
                     completed_at=datetime.now().isoformat(),
                     source=source,
@@ -265,6 +285,7 @@ class LoggingLLMProvider(LLMProvider):
                     error_text=str(exc),
                     duration_ms=int((perf_counter() - started) * 1000),
                     metadata_json=json.dumps(metadata, ensure_ascii=False, indent=2) if metadata else None,
+                    report_json=None,
                 )
             )
             raise
@@ -272,12 +293,20 @@ class LoggingLLMProvider(LLMProvider):
     def _log(self, entry: InteractionLogEntry) -> None:
         self.log_store.insert(entry)
 
+    def attach_report(self, interaction_run_id: str, report: Dict[str, Any]) -> None:
+        report_json = json.dumps(report, ensure_ascii=False, indent=2)
+        self.log_store.attach_report(interaction_run_id, report_json)
+        if self._current_response_state and self._current_response_state.get("interaction_run_id") == interaction_run_id:
+            self._current_response_state["report"] = report
+            self._flush_current_response_state()
+
     def _write_current_response(
         self,
         *,
         source: str,
         model: str,
         created_at: str,
+        interaction_run_id: str | None,
         response_text: str,
         reasoning_text: str,
         status: str,
@@ -286,17 +315,40 @@ class LoggingLLMProvider(LLMProvider):
     ) -> None:
         if self.current_response_path is None:
             return
+        self._current_response_state = {
+            "status": status,
+            "created_at": created_at,
+            "source": source,
+            "model": model,
+            "metadata": dict(metadata),
+            "error_text": error_text,
+            "reasoning_text": reasoning_text,
+            "response_text": response_text,
+            "interaction_run_id": interaction_run_id,
+            "report": None,
+        }
+        self._flush_current_response_state()
+
+    def _flush_current_response_state(self) -> None:
+        if self.current_response_path is None or self._current_response_state is None:
+            return
+        state = self._current_response_state
         lines = [
-            f"status: {status}",
-            f"created_at: {created_at}",
-            f"source: {source}",
-            f"model: {model}",
+            f"status: {state['status']}",
+            f"created_at: {state['created_at']}",
+            f"source: {state['source']}",
+            f"model: {state['model']}",
         ]
-        if metadata:
-            lines.append(f"metadata: {json.dumps(metadata, ensure_ascii=False)}")
-        if error_text:
-            lines.extend(["", "## Error", error_text])
-        if reasoning_text:
-            lines.extend(["", "## Reasoning", reasoning_text])
-        lines.extend(["", "## Response", response_text or ""])
+        if state.get("interaction_run_id"):
+            lines.append(f"interaction_run_id: {state['interaction_run_id']}")
+        if state["metadata"]:
+            lines.append(f"metadata: {json.dumps(state['metadata'], ensure_ascii=False)}")
+        report = state.get("report")
+        if report and report.get("report_to_user"):
+            lines.extend(["", "## Report To User", report["report_to_user"]])
+        if state.get("error_text"):
+            lines.extend(["", "## Error", state["error_text"]])
+        if state.get("reasoning_text"):
+            lines.extend(["", "## Reasoning", state["reasoning_text"]])
+        lines.extend(["", "## Response", state.get("response_text") or ""])
         self.current_response_path.write_text("\n".join(lines), encoding="utf-8")

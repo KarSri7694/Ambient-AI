@@ -7,12 +7,15 @@ import time
 from typing import Optional
 
 from application.services.passive_observer_followup_service import PassiveObserverFollowupService
+from application.services.llm_interaction_service import LLMInteractionService
 from application.services.passive_observer_service import PassiveObserverService
 from application.services.screenshot_queue_service import ScreenshotQueueService
 from application.services.system_idle_service import SystemIdleService
+from application.services.user_bio_data_service import UserBioDataService
 from audio_agent import AudioAgentService
 from infrastructure.adapter.llamaCppAdapter import LlamaCppAdapter
 from infrastructure.adapter.LoggingLLMProvider import LoggingLLMProvider
+from infrastructure.adapter.MCPToolAdapter import MCPToolAdapter
 from infrastructure.adapter.MSSScreenCaptureAdapter import MssScreenCaptureAdapter
 from infrastructure.adapter.SQLiteInteractionLogAdapter import SQLiteInteractionLogAdapter
 from infrastructure.adapter.SQLiteMemoryAdapter import SQLiteMemoryAdapter
@@ -34,12 +37,17 @@ logger = logging.getLogger(__name__)
 
 API_BASE_URL = CONFIG.get_str("runtime", "api_base_url", "http://localhost:8080")
 DEFAULT_MODEL = CONFIG.get_str("runtime", "default_model", "Qwen-3.5-9B-Mythos-Distilled-Q4_K_M-Vision")
+PASSIVE_OBSERVER_MODEL = CONFIG.get_model("passive_observer_model", DEFAULT_MODEL)
+PASSIVE_FOLLOWUP_MODEL = CONFIG.get_model("passive_followup_model", DEFAULT_MODEL)
+USER_BIODATA_MODEL = CONFIG.get_model("user_biodata_model", DEFAULT_MODEL)
+FOLLOWUP_EXECUTION_MODEL = CONFIG.get_model("followup_execution_model", DEFAULT_MODEL)
+REPORTER_MODEL = CONFIG.get_model("reporter_model", DEFAULT_MODEL)
 USER_DATA_DIR = Path(CONFIG.get_str("runtime", "user_data_dir", "D:\\USER_DATA"))
 PROJECT_ROOT = Path(__file__).parent.parent
 MEMORY_ROOT = USER_DATA_DIR / "memory"
 MEMORY_DB_PATH = USER_DATA_DIR / "database" / "memory.db"
 INTERACTION_LOG_DB_PATH = USER_DATA_DIR / "database" / "interaction_logs.db"
-CURRENT_RESPONSE_PATH = USER_DATA_DIR / "database" / "current_llm_response.md"
+CURRENT_RESPONSE_PATH = PROJECT_ROOT / "database" / "current_llm_response.md"
 VOICE_DB_PATH = USER_DATA_DIR / "database" / "voice_database.db"
 PASSIVE_OBSERVER_ROOT = USER_DATA_DIR / "passive_observer"
 PASSIVE_OBSERVER_ENABLED = CONFIG.get_bool("passive_observer", "enabled", False)
@@ -52,6 +60,7 @@ LOG_API_ENABLED = CONFIG.get_bool("log_api", "enabled", True)
 LOG_API_HOST = CONFIG.get_str("log_api", "host", "0.0.0.0")
 LOG_API_PORT = CONFIG.get_int("log_api", "port", 8765)
 LOG_API_BUFFER_SIZE = CONFIG.get_int("log_api", "buffer_size", 2000)
+MCP_CONFIG_PATH = CONFIG.get_str("runtime", "mcp_config_path", "mcp.json")
 
 configure_runtime_log_streaming(max_entries=LOG_API_BUFFER_SIZE)
 
@@ -66,7 +75,15 @@ def ensure_runtime_databases() -> None:
 
 
 class AmbientRuntime:
-    def __init__(
+    FOLLOWUP_EXECUTION_PROMPT = (
+        "You are an ambient assistant executing a queued follow-up task. "
+        "Treat the user message as an execution brief, not as a question. "
+        "Use the available tools when needed. "
+        "Do not ask the user for clarification if the brief provides enough context to act. "
+        "When the task is complete, state the concrete result."
+    )
+
+    def __init__(   
         self,
         transcription_queue: queue.Queue,
         gpu_lock: Optional[threading.Lock] = None,
@@ -78,13 +95,25 @@ class AmbientRuntime:
         self.audio_active_event = audio_active_event or threading.Event()
         self.llm_active_event = llm_active_event or threading.Event()
 
-    async def _ensure_llm_ready(self, llm_adapter: LlamaCppAdapter) -> None:
-        await llm_adapter.load_model(DEFAULT_MODEL)
+    async def _ensure_llm_ready(
+        self,
+        llm_adapter: LlamaCppAdapter,
+        model_name: str,
+    ) -> None:
+        await llm_adapter.load_model(model_name)
         self.llm_active_event.set()
 
     async def _release_llm(self, llm_adapter: LlamaCppAdapter) -> None:
         await llm_adapter.unload_model()
         self.llm_active_event.clear()
+
+    async def _initialize_mcp_tools(
+        self,
+        tool_bridge: MCPToolAdapter,
+        llm_service: LLMInteractionService,
+    ) -> None:
+        await tool_bridge.start_servers(MCP_CONFIG_PATH)
+        await llm_service.initialize_tools()
 
     async def _ensure_runtime(
         self,
@@ -92,11 +121,11 @@ class AmbientRuntime:
         llm_adapter: LlamaCppAdapter,
         services_initialized: bool,
         reason: str,
+        model_name: str,
     ) -> bool:
-        if services_initialized:
-            return True
-        logger.info("Loading ambient runtime: %s", reason)
-        await self._ensure_llm_ready(llm_adapter)
+        if not services_initialized:
+            logger.info("Loading ambient runtime: %s", reason)
+        await self._ensure_llm_ready(llm_adapter, model_name)
         return True
 
     async def _release_runtime(
@@ -123,6 +152,12 @@ class AmbientRuntime:
             log_store=interaction_log_store,
             current_response_path=str(CURRENT_RESPONSE_PATH),
         )
+        tool_bridge = MCPToolAdapter()
+        llm_service = LLMInteractionService(
+            llm_provider=logged_llm,
+            tool_bridge=tool_bridge,
+            reporter_model=REPORTER_MODEL,
+        )
         memory_store = SQLiteMemoryAdapter(
             db_path=str(MEMORY_DB_PATH),
             memory_root=str(MEMORY_ROOT),
@@ -134,6 +169,14 @@ class AmbientRuntime:
                 task_queue=task_queue,
                 llm_provider=logged_llm,
                 activity_ledger=None,
+            )
+            if PASSIVE_OBSERVER_ENABLED
+            else None
+        )
+        user_biodata_service = (
+            UserBioDataService(
+                memory=memory_store,
+                llm_provider=logged_llm,
             )
             if PASSIVE_OBSERVER_ENABLED
             else None
@@ -162,8 +205,12 @@ class AmbientRuntime:
         )
         return (
             llm_adapter,
+            tool_bridge,
+            llm_service,
             memory_store,
+            task_queue,
             passive_followup,
+            user_biodata_service,
             system_idle_service,
             screenshot_queue,
             passive_observer,
@@ -172,8 +219,12 @@ class AmbientRuntime:
     async def run_loop(self):
         (
             llm_adapter,
+            tool_bridge,
+            llm_service,
             memory_store,
+            task_queue,
             passive_followup,
+            user_biodata_service,
             system_idle_service,
             screenshot_queue,
             passive_observer,
@@ -186,6 +237,7 @@ class AmbientRuntime:
         services_initialized = False
 
         try:
+            await self._initialize_mcp_tools(tool_bridge, llm_service)
             logger.info("Starting reduced ambient runtime manager.")
 
             while True:
@@ -272,11 +324,12 @@ class AmbientRuntime:
                                 llm_adapter=llm_adapter,
                                 services_initialized=services_initialized,
                                 reason="processing queued passive-observer screenshots",
+                                model_name=PASSIVE_OBSERVER_MODEL,
                             )
                             with self.gpu_lock:
                                 observation = await passive_observer.process_screenshot(
                                     screenshot_path=job.screenshot_path,
-                                    model=DEFAULT_MODEL,
+                                    model=PASSIVE_OBSERVER_MODEL,
                                     recent_context=memory_store.get_recent_context(),
                                     captured_at=job.captured_at,
                                 )
@@ -287,30 +340,78 @@ class AmbientRuntime:
                                 )
                         except Exception:
                             logger.exception("Queued passive observer screenshot processing failed.")
-                        finally:
-                            try:
-                                Path(job.screenshot_path).unlink(missing_ok=True)
-                            except OSError:
-                                logger.debug("Failed to remove processed screenshot %s", job.screenshot_path)
                         processed_screenshots += 1
 
                 if user_idle_now and now - last_idle_cycle_at >= idle_cycle_interval:
                     try:
+                        if user_biodata_service is not None:
+                            services_initialized = await self._ensure_runtime(
+                                llm_adapter=llm_adapter,
+                                services_initialized=services_initialized,
+                                reason="updating user biodata from passive observations",
+                                model_name=USER_BIODATA_MODEL,
+                            )
+                            with self.gpu_lock:
+                                biodata_result = await user_biodata_service.update_biodata(model=USER_BIODATA_MODEL)
+                            logger.info(
+                                "User BioData update processed %s observations and appended %s entries.",
+                                len(biodata_result.get("processed_observation_ids", [])),
+                                len(biodata_result.get("entries", [])),
+                            )
                         if passive_followup is not None:
                             services_initialized = await self._ensure_runtime(
                                 llm_adapter=llm_adapter,
                                 services_initialized=services_initialized,
                                 reason="running passive observer follow-up",
+                                model_name=PASSIVE_FOLLOWUP_MODEL,
                             )
                             with self.gpu_lock:
-                                followup_result = await passive_followup.maybe_queue_followup(model=DEFAULT_MODEL)
-                            if followup_result.get("action") == "queue_task":
-                                logger.info(
-                                    "Passive observer queued deferred task: %s",
-                                    followup_result.get("title", ""),
+                                followup_result = await passive_followup.maybe_queue_followup(model=PASSIVE_FOLLOWUP_MODEL)
+                            logger.info(
+                                "Passive observer follow-up processed %s observations, %s unique activities, %s useful activities, %s queued, %s do-now.",
+                                len(followup_result.get("processed_observation_ids", [])),
+                                len(followup_result.get("unique_activities", [])),
+                                len(followup_result.get("useful_activities", [])),
+                                len(followup_result.get("queued_activities", [])),
+                                len(followup_result.get("do_now_activities", [])),
+                            )
+                            for activity in followup_result.get("do_now_activities", []):
+                                logger.info("Executing passive follow-up do-now activity: %s", activity)
+                                services_initialized = await self._ensure_runtime(
+                                    llm_adapter=llm_adapter,
+                                    services_initialized=services_initialized,
+                                    reason="executing passive follow-up do-now activity",
+                                    model_name=FOLLOWUP_EXECUTION_MODEL,
                                 )
-                            else:
-                                logger.info("Passive observer idle follow-up found no task to queue.")
+                                with self.gpu_lock:
+                                    result = await llm_service.run_interaction(
+                                        user_input=activity,
+                                        system_prompt=self.FOLLOWUP_EXECUTION_PROMPT,
+                                        model=FOLLOWUP_EXECUTION_MODEL,
+                                        report_policy="auto_surface",
+                                    )
+                                logger.info("Do-now activity completed with result: %s", result[:500])
+                                llm_service.reset_context()
+                        pending_tasks = task_queue.get_pending_tasks()
+                        if pending_tasks:
+                            task = pending_tasks[0]
+                            logger.info("Executing queued follow-up task ID %s with tool-enabled LLM interaction.", task.id)
+                            services_initialized = await self._ensure_runtime(
+                                llm_adapter=llm_adapter,
+                                services_initialized=services_initialized,
+                                reason="executing queued follow-up task",
+                                model_name=FOLLOWUP_EXECUTION_MODEL,
+                            )
+                            with self.gpu_lock:
+                                result = await llm_service.run_interaction(
+                                    user_input=task.description,
+                                    system_prompt=self.FOLLOWUP_EXECUTION_PROMPT,
+                                    model=FOLLOWUP_EXECUTION_MODEL,
+                                    report_policy="auto_surface",
+                                )
+                            logger.info("Queued follow-up task %s completed with result: %s", task.id, result[:500])
+                            task_queue.mark_task_complete(task.id)
+                            llm_service.reset_context()
                     except Exception:
                         logger.exception("Idle follow-up cycle failed.")
                     last_idle_cycle_at = now
@@ -330,6 +431,7 @@ class AmbientRuntime:
                     services_initialized=services_initialized,
                     reason="application shutdown",
                 )
+            await tool_bridge.cleanup()
 
     def start_service(self):
         loop = asyncio.new_event_loop()
@@ -346,6 +448,7 @@ if __name__ == "__main__":
             host=LOG_API_HOST,
             port=LOG_API_PORT,
             max_entries=LOG_API_BUFFER_SIZE,
+            report_store=SQLiteInteractionLogAdapter(db_path=str(INTERACTION_LOG_DB_PATH)),
         )
         logger.info("Runtime log server started at http://%s:%s/logs", LOG_API_HOST, LOG_API_PORT)
 

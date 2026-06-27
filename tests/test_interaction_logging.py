@@ -81,6 +81,52 @@ class InteractionLoggingTests(unittest.TestCase):
             self.assertIn('"role": "user"', rows[0].messages_json)
             self.assertEqual(rows[0].response_text, "hello world")
             self.assertEqual(json.loads(rows[0].metadata_json)["kind"], "test")
+            self.assertIsNotNone(rows[0].interaction_run_id)
+
+    def test_attach_report_persists_and_updates_markdown(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "interaction_logs.db"
+            response_path = Path(tmpdir) / "current_llm_response.md"
+            store = SQLiteInteractionLogAdapter(str(db_path))
+            provider = LoggingLLMProvider(
+                FakeLLMProvider(),
+                store,
+                current_response_path=str(response_path),
+            )
+
+            async def _run():
+                with interaction_trace("unit_test_source", {"kind": "test"}):
+                    stream = await provider.chat_completion_stream(
+                        model="test-model",
+                        messages=[{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}],
+                        tools=None,
+                    )
+                    async for _ in stream:
+                        pass
+                    rows = store.list_recent(limit=1)
+                    run_id = rows[0].interaction_run_id
+                    provider.attach_report(
+                        run_id,
+                        {
+                            "should_surface_to_user": True,
+                            "report_to_user": "Searched and found the latest result.",
+                            "category": "search_result",
+                            "tools_used": ["web_search"],
+                            "status": "completed",
+                        },
+                    )
+
+            asyncio.run(_run())
+
+            reports = store.list_recent_reports(limit=5)
+            self.assertEqual(len(reports), 1)
+            report_payload = json.loads(reports[0].report_json)
+            self.assertEqual(report_payload["category"], "search_result")
+            self.assertIn("Searched and found", report_payload["report_to_user"])
+
+            markdown = response_path.read_text(encoding="utf-8")
+            self.assertIn("## Report To User", markdown)
+            self.assertIn("Searched and found the latest result.", markdown)
 
 
 if __name__ == "__main__":

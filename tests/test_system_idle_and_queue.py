@@ -70,7 +70,7 @@ class SystemIdleAndQueueTests(unittest.TestCase):
             queue.enqueue(str(second), captured_at="2026-06-25T10:00:10")
             queue.enqueue(str(third), captured_at="2026-06-25T10:00:20")
 
-            self.assertFalse(first.exists())
+            self.assertTrue(first.exists())
             self.assertEqual(queue.size(), 2)
             oldest = queue.dequeue()
             newest = queue.dequeue()
@@ -91,7 +91,7 @@ class SystemIdleAndQueueTests(unittest.TestCase):
 
             self.assertIsNotNone(first_job)
             self.assertIsNone(duplicate_job)
-            self.assertFalse(duplicate.exists())
+            self.assertTrue(duplicate.exists())
             self.assertEqual(queue.size(), 1)
 
     def test_screenshot_queue_accepts_different_recent_image(self):

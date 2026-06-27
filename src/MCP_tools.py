@@ -103,10 +103,10 @@ def get_current_datetime():
     return datetime.datetime.now().isoformat()
 
 @mcp.tool
-def add_task(content :Annotated[str, "The content of the task to be added"] ,
+def add_task(content :Annotated[str, "The content of the reminder/to-do to be added"] ,
              due_datetime : Annotated[str, "Due date and time in YYYY-MM-DDTHH:MM:SS format"] ):
     """
-    Add a task or reminder to Todoist with an optional due date. 
+    Add a reminder or to-do task to Todoist with an optional due date. 
     If due date is not given, add the due datetime of 5 hours from the current date and time   
     """
     api = TodoistAPI(TODOIST_API_TOKEN)
@@ -288,8 +288,7 @@ def powershell_terminal(
         "del ",
         "rmdir ",
         "format ",
-        "git reset",
-        "git checkout --",
+        "git",
     ]
     normalized = command.lower()
     if any(token in normalized for token in blocked_tokens):

@@ -34,6 +34,7 @@ class SQLiteInteractionLogAdapter:
                 """
                 CREATE TABLE IF NOT EXISTS interaction_logs (
                     interaction_id TEXT PRIMARY KEY,
+                    interaction_run_id TEXT,
                     created_at TEXT NOT NULL,
                     completed_at TEXT,
                     source TEXT NOT NULL,
@@ -46,10 +47,12 @@ class SQLiteInteractionLogAdapter:
                     tool_calls_json TEXT,
                     error_text TEXT,
                     duration_ms INTEGER,
-                    metadata_json TEXT
+                    metadata_json TEXT,
+                    report_json TEXT
                 )
                 """
             )
+            self._ensure_columns(conn)
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_interaction_logs_created_at
@@ -62,19 +65,34 @@ class SQLiteInteractionLogAdapter:
                 ON interaction_logs (source, created_at DESC)
                 """
             )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_interaction_logs_run_id
+                ON interaction_logs (interaction_run_id, created_at DESC)
+                """
+            )
+
+    def _ensure_columns(self, conn: sqlite3.Connection) -> None:
+        rows = conn.execute("PRAGMA table_info(interaction_logs)").fetchall()
+        existing = {row["name"] for row in rows}
+        if "interaction_run_id" not in existing:
+            conn.execute("ALTER TABLE interaction_logs ADD COLUMN interaction_run_id TEXT")
+        if "report_json" not in existing:
+            conn.execute("ALTER TABLE interaction_logs ADD COLUMN report_json TEXT")
 
     def insert(self, entry: InteractionLogEntry) -> None:
         with self._managed_connection() as conn:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO interaction_logs (
-                    interaction_id, created_at, completed_at, source, model, messages_json,
+                    interaction_id, interaction_run_id, created_at, completed_at, source, model, messages_json,
                     tools_json, image_path, response_text, reasoning_text, tool_calls_json,
-                    error_text, duration_ms, metadata_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    error_text, duration_ms, metadata_json, report_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     entry.interaction_id,
+                    entry.interaction_run_id,
                     entry.created_at,
                     entry.completed_at,
                     entry.source,
@@ -88,7 +106,25 @@ class SQLiteInteractionLogAdapter:
                     entry.error_text,
                     entry.duration_ms,
                     entry.metadata_json,
+                    entry.report_json,
                 ),
+            )
+
+    def attach_report(self, interaction_run_id: str, report_json: str) -> None:
+        with self._managed_connection() as conn:
+            conn.execute(
+                """
+                UPDATE interaction_logs
+                SET report_json = ?
+                WHERE interaction_id = (
+                    SELECT interaction_id
+                    FROM interaction_logs
+                    WHERE interaction_run_id = ?
+                    ORDER BY created_at DESC, rowid DESC
+                    LIMIT 1
+                )
+                """,
+                (report_json, interaction_run_id),
             )
 
     def list_recent(self, limit: int = 50, source: Optional[str] = None) -> List[InteractionLogEntry]:
@@ -103,9 +139,24 @@ class SQLiteInteractionLogAdapter:
             rows = conn.execute(query, params).fetchall()
         return [self._from_row(row) for row in rows]
 
+    def list_recent_reports(self, limit: int = 50) -> List[InteractionLogEntry]:
+        with self._managed_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM interaction_logs
+                WHERE report_json IS NOT NULL AND TRIM(report_json) <> ''
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [self._from_row(row) for row in rows]
+
     def _from_row(self, row: sqlite3.Row) -> InteractionLogEntry:
         return InteractionLogEntry(
             interaction_id=row["interaction_id"],
+            interaction_run_id=row["interaction_run_id"],
             created_at=row["created_at"],
             completed_at=row["completed_at"],
             source=row["source"],
@@ -119,4 +170,5 @@ class SQLiteInteractionLogAdapter:
             error_text=row["error_text"],
             duration_ms=row["duration_ms"],
             metadata_json=row["metadata_json"],
+            report_json=row["report_json"],
         )

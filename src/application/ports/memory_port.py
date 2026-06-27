@@ -183,6 +183,18 @@ class MemoryPort(ABC):
         pass
 
     @abstractmethod
+    def get_recent_biodata_pending_visual_observations(self, limit: int = 10) -> List[VisualObservation]:
+        pass
+
+    @abstractmethod
+    def mark_visual_observations_biodata_sent(
+        self,
+        observation_ids: List[str],
+        sent_at: str,
+    ) -> None:
+        pass
+
+    @abstractmethod
     def upsert_visual_session(self, session: VisualSession) -> VisualSession:
         pass
 

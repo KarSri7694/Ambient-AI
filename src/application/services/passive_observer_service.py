@@ -18,61 +18,25 @@ class PassiveObserverService:
 
     OBSERVER_PROMPT = """You are the passive visual observer for an ambient personal agent.
 
-Look at the current screenshot, compare it with the previous observation summary if provided, and infer what the user is doing now. Return JSON only:
+Look at the current screenshot, and return JSON only with exactly these fields:
 {
-  "app_name": "short app/site name",
-  "window_title": "short visible title if inferable",
-  "page_hint": "short page/screen hint",
+  "app_page": "short app/site and page/screen description combined into one line",
   "summary": "1-2 sentence concrete summary of what is on screen",
-  "detailed_description": "information-rich detail about what is visible, what options/items are in focus, and what the user appears to be evaluating",
+  "detailed_description": "information-rich detail about what is visible",
   "inferred_user_activity": "what the user seems to be doing or trying to do",
-  "previous_activity_status": "new|continued|completed|left_midway|unclear",
-  "salient_entities": ["entity1", "entity2"],
-  "visible_targets": ["products/mods/files/pages/options currently in focus"],
-  "selection_context": ["filters, sort, tabs, categories, version, search query, platform, price range, size, color, etc."],
-  "decision_factors": ["attributes that seem to matter such as compatibility, brand, style, rating, price, version, feature"],
-  "comparison_axes": ["what appears to be compared across choices"],
-  "artifact_state": "browsing|comparing|drafting|editing|reviewing|configuring|finalizing|unclear",
-  "completed_items": ["things that now look done compared with previous observation"],
-  "open_loops": ["unfinished thing the user may return to"],
-  "possible_next_task": "most likely next thing the user would want done later",
-  "user_fact_hypotheses": [
-    {
-      "category": "current_interest|shopping_intent|entertainment_preference|workflow_habit|device_interest|research_interest|temporary_context",
-      "title": "short dedupe title",
-      "summary": "short user fact hypothesis",
-      "confidence": 0.0,
-      "scope": "temporary|emerging|durable",
-      "evidence_strength": "weak|medium|strong"
-    }
-  ],
-  "suggested_research_topics": ["optional subtle topic to research later"],
-  "confidence": 0.0,
-  "worth_noting": true
+  "maybe_require_a_reminder": "true or false, if the user might need a reminder about something on screen",
+  "reminder_context": "if maybe_require_a_reminder is true, provide a short description of what the reminder should be about"
 }
 
 Rules:
-- Be concrete, not poetic.
+- Return only those six fields. Do not add any other keys.
+- When the screen contains a chat or messaging interface, extract all the visible information most importantly infer if the user made any commitments or decisions, or something of importance is told to the user.  
 - Prefer visible facts over speculation.
-- When the screen is relevant, capture as much useful visible detail as possible.
-- Use detailed_description to be information-rich: mention specific products, mods, filters, selected options, search terms, compatibility/version hints, prices, ratings, categories, site sections, and comparison cues when visible.
-- Include every useful visible clue that would help a later agent mimic the user's browsing or decision process.
-- Use the provided screenshot timestamp to ground what the user was doing and when.
-- Use previous_activity_status to say whether the last observed activity appears complete, still continuing, or left midway.
-- Use completed_items only when the current screenshot makes earlier activity look done.
-- Use open_loops only for unresolved intent that would still matter later, not the next immediate click or gesture.
-- possible_next_task should be a single durable later follow-up on an artifact or workflow, not a transient UI action.
-- Bad examples for open_loops/possible_next_task: "scroll more", "accept call", "click next", "continue feed", "dismiss popup".
-- Good examples: "finish draft reply", "resume code change", "compare shortlisted products", "review saved research topic".
-- For modding/game pages, include game name, mod type, compatibility/version hints, category, loader/framework hints, and any visible installation or requirements clues.
-- For shopping pages, include product type, filters, size/color/brand/rating/price clues, sorting, and the attributes that seem to drive comparison.
-- Infer small user-fact hypotheses conservatively from visible behavior.
-- Single-session preference guesses should usually remain temporary.
-- Use wording like "may be interested in" or "currently looking for" unless repeated evidence is visually obvious.
-- Use suggested_research_topics only when the screen indicates something worth following up later.
-- confidence must be between 0 and 1.
-- If the screen is relevant, prefer high recall over brevity.
-- If the screen is idle, blank, locked, or not useful, set worth_noting to false and keep fields minimal.
+- Use app_page as a compact combined label such as "Amazon.in / TV product listing page" or "VS Code / Python file editor".
+- Make detailed_description high recall when the screen is relevant: mention visible products, filters, prices, ratings, titles, tabs, files, buttons, text, and comparison cues.
+- Include every useful visible clue that would help a later agent understand what is on screen.
+- Use the provided screenshot timestamp only as context for when the observation was captured.
+- If the screen is idle, blank, locked, or not useful, keep the four fields minimal and factual.
 """
 
     def __init__(
@@ -95,6 +59,15 @@ Rules:
         screenshot_path = self._capture_path()
         return str(Path(self.screen_capture.capture_screenshot(str(screenshot_path))))
 
+    def _build_system_prompt(self, prompt: str) -> str:
+        now = datetime.now()
+        preamble = (
+            f"Current day of week: {now.strftime('%A')}\n"
+            f"Current date: {now.strftime('%Y-%m-%d')}\n"
+            f"Current time: {now.strftime('%H:%M:%S')}\n\n"
+        )
+        return preamble + prompt
+
     async def process_screenshot(
         self,
         *,
@@ -109,28 +82,30 @@ Rules:
             recent_context=recent_context,
             captured_at=captured_at,
         )
-        if not parsed or not self._truthy(parsed.get("worth_noting", True)):
+        if not parsed:
             return None
+
+        app_name, page_hint = self._split_app_page(self._opt_text(parsed.get("app_page")))
 
         observation = VisualObservation(
             observation_id=uuid.uuid4().hex,
             screenshot_path=screenshot_path,
             created_at=captured_at or datetime.now().isoformat(),
             observation_type="screen",
-            app_name=self._opt_text(parsed.get("app_name")),
-            window_title=self._opt_text(parsed.get("window_title")),
-            page_hint=self._opt_text(parsed.get("page_hint")),
+            app_name=app_name,
+            window_title=None,
+            page_hint=page_hint,
             summary=self._opt_text(parsed.get("summary")) or "Passive observation captured.",
             detailed_description=self._opt_text(parsed.get("detailed_description")) or "",
             inferred_user_activity=self._opt_text(parsed.get("inferred_user_activity")) or "",
-            previous_activity_status=self._opt_text(parsed.get("previous_activity_status")) or "unclear",
-            salient_entities=self._list_text(parsed.get("salient_entities")),
-            completed_items=self._list_text(parsed.get("completed_items")),
-            open_loops=self._list_text(parsed.get("open_loops")),
-            possible_next_task=self._opt_text(parsed.get("possible_next_task")),
-            suggested_research_topics=self._list_text(parsed.get("suggested_research_topics")),
-            user_fact_hypotheses=self._list_dicts(parsed.get("user_fact_hypotheses")),
-            confidence=self._num(parsed.get("confidence"), 0.0),
+            previous_activity_status="unclear",
+            salient_entities=[],
+            completed_items=[],
+            open_loops=[],
+            possible_next_task=None,
+            suggested_research_topics=[],
+            user_fact_hypotheses=[],
+            confidence=0.0,
             raw_payload_json=json.dumps(parsed, ensure_ascii=False, indent=2),
         )
         session = self._attach_to_session(observation)
@@ -256,7 +231,7 @@ Rules:
             completion = await self.llm.chat_completion_stream(
                 model=model,
                 messages=[
-                    {"role": "system", "content": self.OBSERVER_PROMPT},
+                    {"role": "system", "content": self._build_system_prompt(self.OBSERVER_PROMPT)},
                     {"role": "user", "content": json.dumps(payload, ensure_ascii=False, indent=2)},
                 ],
                 tools=None,
@@ -370,6 +345,15 @@ Rules:
         if value in values:
             return list(values)
         return [*values, value]
+
+    def _split_app_page(self, value: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+        if not value:
+            return None, None
+        for separator in (" / ", " | ", " - "):
+            if separator in value:
+                left, right = value.split(separator, 1)
+                return self._opt_text(left), self._opt_text(right)
+        return value, None
 
     def _list_text(self, value) -> List[str]:
         if not isinstance(value, list):

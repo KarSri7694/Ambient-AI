@@ -85,6 +85,7 @@ class NightModeService:
                         user_input=f"{task.description}\n{notifications_str}",
                         system_prompt=self.night_prompt,
                         model=self.model,
+                        report_policy="auto_surface",
                     )
                     self.task_queue.mark_task_complete(task.id)
 
@@ -98,6 +99,7 @@ class NightModeService:
                         user_input=f"{task_desc}\n{notifications_str}",
                         system_prompt=self.night_prompt,
                         model=self.model,
+                        report_policy="auto_surface",
                     )
                     self.task_provider.complete_task(ext_task["id"])
             except Exception as e:
@@ -113,6 +115,7 @@ class NightModeService:
                     user_input=notifications_str,
                     system_prompt=self.night_prompt,
                     model=self.model,
+                    report_policy="auto_surface",
                 )
 
             if idle_count >= self.MAX_IDLE_CYCLES:

@@ -352,6 +352,7 @@ class VisualObservation:
     confidence: float = 0.0
     session_id: Optional[str] = None
     followup_sent_at: Optional[str] = None
+    biodata_sent_at: Optional[str] = None
     raw_payload_json: Optional[str] = None
 
 
@@ -439,6 +440,7 @@ class SemanticMemoryResult:
 class InteractionLogEntry:
     """One persisted LLM interaction request/response pair."""
     interaction_id: str
+    interaction_run_id: Optional[str]
     created_at: str
     completed_at: Optional[str]
     source: str
@@ -452,6 +454,7 @@ class InteractionLogEntry:
     error_text: Optional[str] = None
     duration_ms: Optional[int] = None
     metadata_json: Optional[str] = None
+    report_json: Optional[str] = None
 
 
 @dataclass(frozen=True)

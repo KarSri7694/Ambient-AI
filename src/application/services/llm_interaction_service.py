@@ -3,12 +3,17 @@ import logging
 import re
 import uuid
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 from application.ports.LLMProvider import LLMProvider
 from application.ports.tool_bridge_port import ToolBridgePort
+from application.services.interaction_trace import (
+    current_interaction_metadata,
+    current_interaction_source,
+    interaction_trace,
+)
 from utils.kv_state_handling import KVStateControl
 
 
@@ -17,6 +22,7 @@ class AgentFrame:
     messages: List[Dict[str, Any]] = field(default_factory=list)
     model: Optional[str] = None
     depth: int = 0
+
 
 class LLMInteractionService:
     """
@@ -33,7 +39,7 @@ class LLMInteractionService:
     PARENT_DIR = Path(__file__).parent.parent.parent.parent
     kv_state_dir = PARENT_DIR / "model_kv_states"
     kv_control = KVStateControl(kv_state_dir)
-    
+
     AGENT_PROMPT = (
         "You are a deployed sub-agent working on a delegated task.\n"
         "\n"
@@ -48,13 +54,37 @@ class LLMInteractionService:
         "- When the task is complete, immediately call restore_previous_agent exactly once.\n"
         "- In message_to_agent, return only the concrete result of the delegated task, with no extra planning.\n"
     )
-    
-    def __init__(self, llm_provider: LLMProvider, tool_bridge: ToolBridgePort):
+    REPORTER_PROMPT = (
+        "You decide whether the result of an ambient agent execution should be surfaced to the user.\n"
+        "\n"
+        "Return JSON only:\n"
+        "{\n"
+        '  "should_surface_to_user": true,\n'
+        '  "report_to_user": "short user-facing summary",\n'
+        '  "category": "action_taken|search_result|task_created|reminder_created|ambient_finding|error"\n'
+        "}\n"
+        "\n"
+        "Rules:\n"
+        "- Surface only outcomes that are directly useful or relevant to the user.\n"
+        "- Surface when the agent searched something, created a reminder/task, changed something on the user's behalf, or found something likely relevant.\n"
+        "- Do not surface internal bookkeeping, low-value no-op completions, or generic acknowledgements.\n"
+        "- report_to_user must be concise, concrete, and written for the user.\n"
+        "- If the outcome should not be surfaced, return should_surface_to_user false and an empty report_to_user.\n"
+        "- Do not include any keys other than should_surface_to_user, report_to_user, and category.\n"
+    )
+
+    def __init__(
+        self,
+        llm_provider: LLMProvider,
+        tool_bridge: ToolBridgePort,
+        reporter_model: Optional[str] = None,
+    ):
         self.llm = llm_provider
         self.tool_bridge = tool_bridge
         self.logger = logging.getLogger(self.__class__.__name__)
         self._tools: Optional[List[Dict[str, Any]]] = None
         self._frame_stack: List[AgentFrame] = [AgentFrame()]
+        self.reporter_model = reporter_model
 
     @property
     def _frame(self) -> AgentFrame:
@@ -111,14 +141,16 @@ class LLMInteractionService:
                 except json.JSONDecodeError:
                     value = raw_value
                 args[key] = value
-            recovered_calls.append({
-                "id": f"call_{uuid.uuid4().hex[:24]}",
-                "type": "function",
-                "function": {
-                    "name": tool_name,
-                    "arguments": json.dumps(args),
-                },
-            })
+            recovered_calls.append(
+                {
+                    "id": f"call_{uuid.uuid4().hex[:24]}",
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": json.dumps(args),
+                    },
+                }
+            )
         return recovered_calls
 
     def _remove_qwen_xml_tool_calls(self, text: str) -> str:
@@ -176,6 +208,15 @@ class LLMInteractionService:
                 filtered_tools.append(tool)
         return filtered_tools
 
+    def _build_system_prompt(self, system_prompt: str) -> str:
+        now = datetime.now()
+        preamble = (
+            f"Current day of week: {now.strftime('%A')}\n"
+            f"Current date: {now.strftime('%Y-%m-%d')}\n"
+            f"Current time: {now.strftime('%H:%M:%S')}\n\n"
+        )
+        return preamble + system_prompt
+
     async def run_interaction(
         self,
         user_input: str,
@@ -184,6 +225,7 @@ class LLMInteractionService:
         image_path: str = "",
         agent_depth: int = 0,
         allowed_tool_names: Optional[set[str]] = None,
+        report_policy: str = "silent",
     ) -> str:
         """
         Run a full LLM interaction: send user input, stream response,
@@ -191,71 +233,100 @@ class LLMInteractionService:
 
         Returns the final assistant text response.
         """
-        self._frame.model = model
-        self._frame.depth = agent_depth
-        if not self._frame.messages:
-            self._frame.messages.append({"role": "system", "content": system_prompt})
-        self._frame.messages.append({"role": "user", "content": user_input})
+        current_source = current_interaction_source()
+        source_name = current_source if current_source != "unknown" else "ambient_execution"
+        existing_metadata = current_interaction_metadata()
+        interaction_run_id = existing_metadata.get("interaction_run_id") or uuid.uuid4().hex
+        tools_used: List[str] = []
 
-        iteration = 0
+        with interaction_trace(source_name, {"interaction_run_id": interaction_run_id}):
+            self._frame.model = model
+            self._frame.depth = agent_depth
+            if not self._frame.messages:
+                self._frame.messages.append(
+                    {"role": "system", "content": self._build_system_prompt(system_prompt)}
+                )
+            self._frame.messages.append({"role": "user", "content": user_input})
 
-        while iteration < self.MAX_ITERATIONS:
-            iteration += 1
-            self.logger.info(
-                f"--- Iteration {iteration} (agent depth {agent_depth}/{self.MAX_AGENT_DEPTH}) ---"
+            iteration = 0
+            assistant_text = ""
+
+            while iteration < self.MAX_ITERATIONS:
+                iteration += 1
+                self.logger.info(
+                    "--- Iteration %s (agent depth %s/%s) ---",
+                    iteration,
+                    agent_depth,
+                    self.MAX_AGENT_DEPTH,
+                )
+
+                completion = await self.llm.chat_completion_stream(
+                    model=model,
+                    messages=self._frame.messages,
+                    tools=self._tools_for_agent_depth(
+                        agent_depth, allowed_tool_names=allowed_tool_names
+                    ),
+                    image=image_path if iteration == 1 else "",
+                )
+
+                assistant_text, tool_calls = await self._consume_stream(completion)
+
+                if not tool_calls:
+                    self._frame.messages.append({"role": "assistant", "content": assistant_text})
+                    self.logger.info("Model finished (no more tool calls)")
+                    await self._attach_user_report(
+                        report_policy=report_policy,
+                        interaction_run_id=interaction_run_id,
+                        model=model,
+                        user_input=user_input,
+                        final_response=assistant_text,
+                        tools_used=tools_used,
+                        source_name=source_name,
+                    )
+                    return assistant_text
+
+                self._frame.messages.append(
+                    {
+                        "role": "assistant",
+                        "content": assistant_text if assistant_text else None,
+                        "tool_calls": tool_calls,
+                    }
+                )
+
+                tool_results = await self._execute_tool_calls(
+                    tool_calls,
+                    agent_depth=agent_depth,
+                    allowed_tool_names=allowed_tool_names,
+                )
+                tools_used.extend(name for name, _ in tool_results)
+                if any(name in self.TERMINAL_TOOL_NAMES for name, _ in tool_results):
+                    self.logger.info("Terminal tool executed; ending interaction loop.")
+                    terminal_result = "\n".join(result for _, result in tool_results)
+                    await self._attach_user_report(
+                        report_policy=report_policy,
+                        interaction_run_id=interaction_run_id,
+                        model=model,
+                        user_input=user_input,
+                        final_response=terminal_result,
+                        tools_used=tools_used,
+                        source_name=source_name,
+                    )
+                    return terminal_result
+
+            self.logger.warning(
+                "Reached maximum iterations: (%s). Stopping.",
+                self.MAX_ITERATIONS,
             )
-
-            completion = await self.llm.chat_completion_stream(
+            await self._attach_user_report(
+                report_policy=report_policy,
+                interaction_run_id=interaction_run_id,
                 model=model,
-                messages=self._frame.messages,
-                tools=self._tools_for_agent_depth(agent_depth, allowed_tool_names=allowed_tool_names),
-                image=image_path if iteration == 1 else "",
+                user_input=user_input,
+                final_response=assistant_text,
+                tools_used=tools_used,
+                source_name=source_name,
             )
-
-            assistant_text, tool_calls = await self._consume_stream(completion)
-
-            # If NO tool calls were made, the model is done
-            if not tool_calls:
-                self._frame.messages.append({"role": "assistant", "content": assistant_text})
-                self.logger.info("✓ Model finished (no more tool calls)")
-                return assistant_text
-
-            # Record assistant message with tool calls
-            self._frame.messages.append({
-                "role": "assistant",
-                "content": assistant_text if assistant_text else None,
-                "tool_calls": tool_calls,
-            })
-
-            # Execute each tool call
-            tool_results = await self._execute_tool_calls(
-                tool_calls,
-                agent_depth=agent_depth,
-                allowed_tool_names=allowed_tool_names,
-            )
-            if any(name in self.TERMINAL_TOOL_NAMES for name, _ in tool_results):
-                self.logger.info("Terminal tool executed; ending interaction loop.")
-                # if tool_results[0][0] == "save_state":
-                #     result = tool_results[0][1]
-                #     filename = result.split("State save requested successfully: ")[-1].strip().split(".bin")[0]+".json"
-                #     with open((self.kv_state_dir / filename).absolute(), "w") as f:
-                #         json.dump(self._messages, f)
-                #     self.logger.info(f"Conversation state saved to {filename}")
-                # if tool_results[0][0] == "restore_state":
-                #     result = tool_results[0][1]
-                #     filename = result.split("State restoration requested successfully: ")[-1].strip().split(".bin")[0]+".json"
-                #     with open((self.kv_state_dir / filename).absolute(), "r") as f:
-                #         messages = json.load(f)
-                #     self.reset_context()
-                #     self.restore_context(messages)
-                #     self.logger.info(f"Conversation state restored from {filename}")
-                
-                return "\n".join(result for _, result in tool_results)
-
-        self.logger.warning(
-            f"Reached maximum iterations: ({self.MAX_ITERATIONS}). Stopping."
-        )
-        return assistant_text
+            return assistant_text
 
     async def _consume_stream(self, completion) -> tuple[str, List[Dict]]:
         """
@@ -270,32 +341,27 @@ class LLMInteractionService:
         async for chunk in completion:
             delta = chunk.choices[0].delta
 
-            # Standard content (the final answer text)
             if delta.content:
                 raw_assistant_text += delta.content
                 content = self._strip_think_tags(delta.content)
                 if content:
-                    print(content, end="", flush=True)
                     assistant_text += content
 
-            # Reasoning content (thinking / chain-of-thought)
             reasoning = getattr(delta, "reasoning_content", None)
             if reasoning:
                 raw_reasoning_text += reasoning
-                cleaned_reasoning = self._strip_think_tags(reasoning)
-                if cleaned_reasoning:
-                    print(f"\033[93m{cleaned_reasoning}\033[0m", end="", flush=True)
 
-            # Tool calls
             if delta.tool_calls:
                 for tc_delta in delta.tool_calls:
                     index = tc_delta.index
                     while len(tool_calls) <= index:
-                        tool_calls.append({
-                            "id": "",
-                            "type": "function",
-                            "function": {"name": "", "arguments": ""},
-                        })
+                        tool_calls.append(
+                            {
+                                "id": "",
+                                "type": "function",
+                                "function": {"name": "", "arguments": ""},
+                            }
+                        )
                     if tc_delta.id:
                         tool_calls[index]["id"] = tc_delta.id
                     if tc_delta.function.name:
@@ -315,7 +381,6 @@ class LLMInteractionService:
                     len(tool_calls),
                 )
         assistant_text = self._remove_qwen_xml_tool_calls(assistant_text).strip()
-        print()  # newline after stream
         return assistant_text, tool_calls
 
     async def _execute_tool_calls(
@@ -326,7 +391,7 @@ class LLMInteractionService:
     ) -> List[tuple[str, str]]:
         """
         Execute tool calls, append results to history, and return the tool outputs.
-        Returns: 
+        Returns:
             Tuple of (tool_name, tool_result) for each executed tool.
         """
         tool_results: List[tuple[str, str]] = []
@@ -335,21 +400,25 @@ class LLMInteractionService:
             tool_args_str = tool_call["function"]["arguments"]
             tool_id = tool_call["id"]
 
-            self.logger.info(f"Calling tool: {tool_name}")
-            self.logger.info(f"Arguments: {tool_args_str}")
+            self.logger.info("Calling tool: %s", tool_name)
+            self.logger.info("Arguments: %s", tool_args_str)
 
             try:
                 tool_args = json.loads(tool_args_str) if tool_args_str else {}
                 if allowed_tool_names is not None and tool_name not in allowed_tool_names:
-                    response_content = f"Error: tool '{tool_name}' is not allowed in this interaction."
+                    response_content = (
+                        f"Error: tool '{tool_name}' is not allowed in this interaction."
+                    )
                     self.logger.warning(response_content)
                     tool_results.append((tool_name, response_content))
-                    self._frame.messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_id,
-                        "name": tool_name,
-                        "content": response_content,
-                    })
+                    self._frame.messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_id,
+                            "name": tool_name,
+                            "content": response_content,
+                        }
+                    )
                     continue
                 if tool_name == "load_agent":
                     if agent_depth >= self.MAX_AGENT_DEPTH:
@@ -359,12 +428,14 @@ class LLMInteractionService:
                         )
                         self.logger.warning(response_content)
                         tool_results.append((tool_name, response_content))
-                        self._frame.messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_id,
-                            "name": tool_name,
-                            "content": response_content,
-                        })
+                        self._frame.messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool_id,
+                                "name": tool_name,
+                                "content": response_content,
+                            }
+                        )
                         continue
                     parent_model_name = self.llm.get_current_model() or self._frame.model
                     model_name = tool_args.get("model_name")
@@ -376,12 +447,14 @@ class LLMInteractionService:
                         )
                         self.logger.warning(response_content)
                         tool_results.append((tool_name, response_content))
-                        self._frame.messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_id,
-                            "name": tool_name,
-                            "content": response_content,
-                        })
+                        self._frame.messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool_id,
+                                "name": tool_name,
+                                "content": response_content,
+                            }
+                        )
                         continue
                     if available_model_names and model_name not in available_model_names:
                         response_content = (
@@ -391,12 +464,14 @@ class LLMInteractionService:
                         )
                         self.logger.warning(response_content)
                         tool_results.append((tool_name, response_content))
-                        self._frame.messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_id,
-                            "name": tool_name,
-                            "content": response_content,
-                        })
+                        self._frame.messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool_id,
+                                "name": tool_name,
+                                "content": response_content,
+                            }
+                        )
                         continue
                     saved_parent_kv_state = await self.llm.save_and_unload(self._frame.messages)
                     await self.llm.load_model(model_name)
@@ -408,6 +483,7 @@ class LLMInteractionService:
                             model=model_name,
                             agent_depth=agent_depth + 1,
                             allowed_tool_names=allowed_tool_names,
+                            report_policy="silent",
                         )
                     finally:
                         self._pop_frame()
@@ -426,33 +502,144 @@ class LLMInteractionService:
                             await self.llm.load_model(parent_model_name)
                     response_content = child_result
                 elif tool_name == "restore_previous_agent":
-                    response_content = f"Agent task completed. Restoring previous agent."
+                    response_content = "Agent task completed. Restoring previous agent."
                     kv_state_file = await self.llm.load_and_restore()
                     messages_path = kv_state_file.with_suffix(".json")
                     if messages_path.exists():
-                        with open(messages_path, "r") as f:
+                        with open(messages_path, "r", encoding="utf-8") as f:
                             messages = json.load(f)
-                        target_frame = self._frame_stack[-2] if len(self._frame_stack) > 1 else self._frame
+                        target_frame = (
+                            self._frame_stack[-2] if len(self._frame_stack) > 1 else self._frame
+                        )
                         target_frame.messages = list(messages)
-                        target_frame.messages.append({
-                            "role": "assistant",
-                            "content": f"[Sub-Agent] Deployed sub-agent has worked on the given task and returned the following result: {tool_args.get('message_to_agent', '')}."
-                        })
-                        self.logger.info(f"Conversation state restored from {messages_path.name}")
+                        target_frame.messages.append(
+                            {
+                                "role": "assistant",
+                                "content": "[Sub-Agent] Deployed sub-agent has worked on the given task and returned the following result: "
+                                + tool_args.get("message_to_agent", ""),
+                            }
+                        )
+                        self.logger.info("Conversation state restored from %s", messages_path.name)
                     else:
-                        self.logger.warning(f"No conversation state file found at {messages_path}. Context not restored.")
+                        self.logger.warning(
+                            "No conversation state file found at %s. Context not restored.",
+                            messages_path,
+                        )
                 else:
                     response_content = await self.tool_bridge.execute_tool(tool_name, tool_args)
-                self.logger.info(f"   Result: {response_content}")
             except Exception as e:
-                self.logger.error(f"   Error: {e}")
                 response_content = f"Error: {str(e)}"
             tool_results.append((tool_name, response_content))
 
-            self._frame.messages.append({
-                "role": "tool",
-                "tool_call_id": tool_id,
-                "name": tool_name,
-                "content": response_content,
-            })
+            self._frame.messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_id,
+                    "name": tool_name,
+                    "content": response_content,
+                }
+            )
         return tool_results
+
+    async def _attach_user_report(
+        self,
+        *,
+        report_policy: str,
+        interaction_run_id: str,
+        model: str,
+        user_input: str,
+        final_response: str,
+        tools_used: List[str],
+        source_name: str,
+    ) -> None:
+        if report_policy != "auto_surface":
+            return
+        report = await self._build_user_report(
+            model=model,
+            user_input=user_input,
+            final_response=final_response,
+            tools_used=tools_used,
+            source_name=source_name,
+        )
+        if not report or not report.get("should_surface_to_user"):
+            return
+        if hasattr(self.llm, "attach_report"):
+            self.llm.attach_report(interaction_run_id, report)
+
+    async def _build_user_report(
+        self,
+        *,
+        model: str,
+        user_input: str,
+        final_response: str,
+        tools_used: List[str],
+        source_name: str,
+    ) -> Optional[Dict[str, Any]]:
+        payload = {
+            "task_brief": user_input,
+            "final_response": final_response,
+            "tools_used": list(dict.fromkeys(tools_used)),
+            "source": source_name,
+        }
+        report_text = await self._run_json_prompt(
+            model=self.reporter_model or model,
+            system_prompt=self.REPORTER_PROMPT,
+            user_payload=payload,
+        )
+        parsed = self._safe_parse_json(report_text)
+        if not isinstance(parsed, dict):
+            return None
+        report = {
+            "should_surface_to_user": bool(parsed.get("should_surface_to_user")),
+            "report_to_user": str(parsed.get("report_to_user") or "").strip(),
+            "category": str(parsed.get("category") or "action_taken").strip() or "action_taken",
+            "source": source_name,
+            "tools_used": list(dict.fromkeys(tools_used)),
+            "created_at": datetime.now().isoformat(),
+            "status": "completed",
+        }
+        if not report["should_surface_to_user"] or not report["report_to_user"]:
+            return None
+        return report
+
+    async def _run_json_prompt(
+        self,
+        *,
+        model: str,
+        system_prompt: str,
+        user_payload: Dict[str, Any],
+    ) -> str:
+        provider = getattr(self.llm, "provider", self.llm)
+        completion = await provider.chat_completion_stream(
+            model=model,
+            messages=[
+                {"role": "system", "content": self._build_system_prompt(system_prompt)},
+                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False, indent=2)},
+            ],
+            tools=None,
+            image="",
+        )
+        text_parts: List[str] = []
+        async for chunk in completion:
+            delta = chunk.choices[0].delta
+            if getattr(delta, "content", None):
+                text_parts.append(delta.content)
+        return "".join(text_parts).strip()
+
+    def _safe_parse_json(self, text: str) -> Optional[Dict[str, Any]]:
+        if not text:
+            return None
+        candidate = text.strip()
+        if candidate.startswith("```"):
+            candidate = re.sub(r"^```(?:json)?\s*", "", candidate)
+            candidate = re.sub(r"\s*```$", "", candidate)
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            match = re.search(r"\{[\s\S]*\}", candidate)
+            if not match:
+                return None
+            try:
+                return json.loads(match.group(0))
+            except json.JSONDecodeError:
+                return None
