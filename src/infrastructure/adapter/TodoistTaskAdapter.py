@@ -10,6 +10,9 @@ class TodoistTaskAdapter(TaskProviderPort):
     def __init__(self):
         self._helper = TodoistHelper()
 
+    def is_enabled(self) -> bool:
+        return self._helper.is_enabled()
+
     def get_tasks(self) -> List[Dict]:
         return self._helper.get_tasks()
 

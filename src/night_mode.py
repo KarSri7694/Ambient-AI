@@ -3,7 +3,11 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 
-DB_FILE = "database/night_queue.db"
+from config import CONFIG
+
+
+USER_DATA_DIR = Path(CONFIG.get_str("runtime", "user_data_dir", "D:\\USER_DATA"))
+DB_FILE = str(USER_DATA_DIR / "database" / "night_queue.db")
 
 def init_db():
     Path(DB_FILE).parent.mkdir(parents=True, exist_ok=True)
@@ -106,7 +110,7 @@ def mark_notification_read(notification_id):
     c.execute("UPDATE system_notifications SET read=1 WHERE id=?", (notification_id,))
     conn.commit()
     conn.close()
-_ensure_db()
 
 if __name__ == "__main__":
+    _ensure_db()
     print("Database initialized.")

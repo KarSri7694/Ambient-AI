@@ -11,6 +11,7 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
 
 from infrastructure.adapter.SQLiteInteractionLogAdapter import SQLiteInteractionLogAdapter
+from infrastructure.adapter.SQLiteTaskQueueAdapter import SQLiteTaskQueueAdapter
 
 
 class RuntimeLogBuffer:
@@ -93,6 +94,7 @@ def configure_runtime_log_streaming(max_entries: int = 2000) -> RuntimeLogBuffer
 def create_runtime_log_app(
     log_buffer: RuntimeLogBuffer,
     report_store: SQLiteInteractionLogAdapter | None = None,
+    task_store: SQLiteTaskQueueAdapter | None = None,
 ) -> FastAPI:
     app = FastAPI(title="Ambient Runtime Logs")
 
@@ -115,9 +117,7 @@ def create_runtime_log_app(
 
     @app.get("/api/reports")
     def get_reports(limit: int = Query(default=50, ge=1, le=200)) -> dict[str, Any]:
-        if report_store is None:
-            return {"reports": [], "count": 0}
-        rows = report_store.list_recent_reports(limit=limit)
+        rows = report_store.list_recent_reports(limit=limit) if report_store is not None else []
         reports: list[dict[str, Any]] = []
         for row in rows:
             try:
@@ -135,7 +135,26 @@ def create_runtime_log_app(
                     "report": report,
                 }
             )
-        return {"reports": reports, "count": len(reports)}
+        queued_tasks = []
+        if task_store is not None:
+            for task in task_store.get_pending_tasks():
+                metadata = {}
+                if getattr(task, "metadata_json", None):
+                    try:
+                        metadata = json.loads(task.metadata_json)
+                    except json.JSONDecodeError:
+                        metadata = {}
+                queued_tasks.append(
+                    {
+                        "id": task.id,
+                        "description": task.description,
+                        "priority": task.priority,
+                        "created_at": task.created_at,
+                        "status": task.status,
+                        "metadata": metadata,
+                    }
+                )
+        return {"reports": reports, "queued_tasks": queued_tasks, "count": len(reports)}
 
     @app.get("/reports", response_class=HTMLResponse)
     @app.get("/", response_class=HTMLResponse)
@@ -176,7 +195,7 @@ def create_runtime_log_app(
       min-height: 100vh;
     }
     .shell {
-      max-width: 980px;
+      max-width: 1180px;
       margin: 0 auto;
       padding: 20px 14px 40px;
     }
@@ -240,13 +259,28 @@ def create_runtime_log_app(
       color: var(--muted);
       box-shadow: var(--shadow);
     }
-    .report-card, .log-card {
+    .reports-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.7fr) minmax(280px, 0.9fr);
+      gap: 16px;
+      align-items: start;
+    }
+    .report-card, .log-card, .task-card, .task-panel {
       background: var(--panel-strong);
       border: 1px solid rgba(64,50,36,0.08);
       border-radius: 24px;
       padding: 18px;
       box-shadow: var(--shadow);
       margin-bottom: 14px;
+    }
+    .task-panel {
+      position: sticky;
+      top: 126px;
+    }
+    .panel-title {
+      font-size: 1rem;
+      font-weight: 700;
+      margin: 0 0 12px;
     }
     .report-top {
       display: flex;
@@ -277,6 +311,13 @@ def create_runtime_log_app(
     .chip.category-reminder_created { background: #fff5df; color: #8d6200; }
     .chip.category-ambient_finding { background: #f8ebff; color: #7e4ea8; }
     .chip.category-error { background: #fde8e8; color: var(--err); }
+    .report-title {
+      font-size: 1.08rem;
+      font-weight: 700;
+      line-height: 1.35;
+      margin: 0 0 10px;
+      word-break: break-word;
+    }
     .report-text {
       font-size: 1.02rem;
       line-height: 1.55;
@@ -293,10 +334,33 @@ def create_runtime_log_app(
       color: var(--text);
       font-weight: 600;
     }
+    .task-card {
+      margin-bottom: 12px;
+      background: rgba(255,255,255,0.82);
+    }
+    .task-text {
+      font-size: 0.96rem;
+      line-height: 1.45;
+      margin: 0 0 10px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
     .log-card {
       font-family: Consolas, "SFMono-Regular", monospace;
       white-space: pre-wrap;
       word-break: break-word;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      padding: 5px 9px;
+      background: var(--accent-soft);
+      color: #7b452f;
+      font-size: 0.76rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
     }
     .log-line {
       padding-bottom: 10px;
@@ -314,9 +378,11 @@ def create_runtime_log_app(
     .log-level-DEBUG { color: #275d8f; }
     @media (max-width: 640px) {
       .shell { padding: 16px 10px 32px; }
-      .report-card, .log-card, .empty { border-radius: 18px; padding: 16px; }
+      .report-card, .log-card, .empty, .task-card, .task-panel { border-radius: 18px; padding: 16px; }
       .title { font-size: 1.18rem; }
       .report-text { font-size: 0.98rem; }
+      .reports-grid { grid-template-columns: 1fr; }
+      .task-panel { position: static; }
     }
   </style>
 </head>
@@ -332,8 +398,17 @@ def create_runtime_log_app(
   </header>
   <main class="shell">
     <section id="reportsSection" class="section active">
-      <div id="reportsEmpty" class="empty">No user-relevant agent reports yet.</div>
-      <div id="reports"></div>
+      <div class="reports-grid">
+        <div>
+          <div id="reportsEmpty" class="empty">No user-relevant agent reports yet.</div>
+          <div id="reports"></div>
+        </div>
+        <aside class="task-panel">
+          <h2 class="panel-title">Queued Tasks</h2>
+          <div id="tasksEmpty" class="empty">No queued tasks right now.</div>
+          <div id="queuedTasks"></div>
+        </aside>
+      </div>
     </section>
     <section id="logsSection" class="section">
       <div id="logs"></div>
@@ -345,6 +420,8 @@ def create_runtime_log_app(
     const logs = document.getElementById("logs");
     const reports = document.getElementById("reports");
     const reportsEmpty = document.getElementById("reportsEmpty");
+    const queuedTasks = document.getElementById("queuedTasks");
+    const tasksEmpty = document.getElementById("tasksEmpty");
     const status = document.getElementById("status");
     const tabs = Array.from(document.querySelectorAll(".tab"));
     const sections = {
@@ -381,9 +458,6 @@ def create_runtime_log_app(
         const card = document.createElement("article");
         card.className = "report-card";
         const chips = [];
-        if (report.category) {
-          chips.push(`<span class="chip category-${report.category}">${report.category.replaceAll("_", " ")}</span>`);
-        }
         if (report.status) {
           chips.push(`<span class="chip">${report.status}</span>`);
         }
@@ -395,24 +469,52 @@ def create_runtime_log_app(
             <div class="chips">${chips.join("")}</div>
             <div class="meta">${new Date(item.created_at).toLocaleString()}</div>
           </div>
-          <p class="report-text">${report.report_to_user || ""}</p>
+          <h2 class="report-title">${report.title || ""}</h2>
+          <p class="report-text">${report.summary || ""}</p>
           <div class="meta">
             <div><strong>Source:</strong> ${item.source || "unknown"}</div>
             <div><strong>Model:</strong> ${item.model || "unknown"}</div>
             <div><strong>Tools:</strong> ${tools}</div>
+            <div><strong>Artifact:</strong> ${report.artifact_path || ""}</div>
           </div>
         `;
         reports.appendChild(card);
       }
     }
 
+    function renderQueuedTasks(items) {
+      queuedTasks.innerHTML = "";
+      tasksEmpty.style.display = items.length ? "none" : "block";
+      for (const item of items) {
+        const card = document.createElement("article");
+        card.className = "task-card";
+        const createdAt = item.created_at ? new Date(item.created_at).toLocaleString() : "unknown";
+        card.innerHTML = `
+          <div class="report-top">
+            <span class="badge">${item.priority || "medium"}</span>
+            <div class="meta">${createdAt}</div>
+          </div>
+          <p class="task-text">${item.description || ""}</p>
+          <div class="meta">
+            <div><strong>Status:</strong> ${item.status || "pending"}</div>
+            <div><strong>ID:</strong> ${item.id ?? ""}</div>
+          </div>
+        `;
+        queuedTasks.appendChild(card);
+      }
+    }
+
     async function pollReports() {
       const res = await fetch(`/api/reports?limit=50`, { cache: "no-store" });
       const payload = await res.json();
-      const serialized = JSON.stringify(payload.reports || []);
+      const serialized = JSON.stringify({
+        reports: payload.reports || [],
+        queued_tasks: payload.queued_tasks || [],
+      });
       if (serialized !== latestReportKey) {
         latestReportKey = serialized;
         renderReports(payload.reports || []);
+        renderQueuedTasks(payload.queued_tasks || []);
       }
     }
 
@@ -452,6 +554,7 @@ def start_runtime_log_server(
     port: int = 8765,
     max_entries: int = 2000,
     report_store: SQLiteInteractionLogAdapter | None = None,
+    task_store: SQLiteTaskQueueAdapter | None = None,
 ) -> RuntimeLogBuffer:
     global _SERVER_THREAD
     log_buffer = configure_runtime_log_streaming(max_entries=max_entries)
@@ -459,7 +562,7 @@ def start_runtime_log_server(
         if _SERVER_THREAD is not None and _SERVER_THREAD.is_alive():
             return log_buffer
 
-        app = create_runtime_log_app(log_buffer, report_store=report_store)
+        app = create_runtime_log_app(log_buffer, report_store=report_store, task_store=task_store)
 
         def _serve() -> None:
             config = uvicorn.Config(

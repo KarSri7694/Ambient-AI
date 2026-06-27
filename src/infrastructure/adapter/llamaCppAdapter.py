@@ -32,12 +32,13 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
 
     async def load_model(self, model_name: str, unload_previous: bool = True) -> None:
         """Load a model through the llama.cpp server model-management endpoint."""
-        if self.currently_loaded_model == model_name:
+        loaded_model = self._sync_loaded_model_state()
+        if loaded_model == model_name:
             self.logger.info(f"Model {model_name} is already loaded.")
             self._wait_for_model_status(model_name, expected_status="loaded")
             return
 
-        if unload_previous and self.currently_loaded_model is not None:
+        if unload_previous and loaded_model is not None:
             await self.unload_model()
 
         model = {"model": model_name}
@@ -57,24 +58,21 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
 
     async def unload_model(self) -> None:
         """Unload the currently tracked model from the llama.cpp server."""
-        if self.currently_loaded_model is None:
-            self.currently_loaded_model = self.get_current_model() or self._discover_loaded_model()
-        if self.currently_loaded_model is None:
+        loaded_model = self._sync_loaded_model_state()
+        if loaded_model is None:
             return
-        model = {"model": self.currently_loaded_model}
+        model = {"model": loaded_model}
         response = requests.post(f"{self.base_url}/models/unload", json=model)
         if response.status_code == 200:
-            self.logger.info(f"Successfully unloaded model: {self.currently_loaded_model}")
-            unloaded_model = self.currently_loaded_model
-            self.currently_loaded_model = None
-            self.kv_state.update_shared_state(currently_loaded_model=None)
+            self.logger.info(f"Successfully unloaded model: {loaded_model}")
+            unloaded_model = loaded_model
+            self._set_loaded_model_state(None)
             self._wait_for_model_status(unloaded_model, expected_status="unloaded")
         elif response.status_code == 400 and "model is not running" in response.text.lower():
-            self.logger.info(f"Model {self.currently_loaded_model} is not running.")
-            self.currently_loaded_model = None
-            self.kv_state.update_shared_state(currently_loaded_model=None)
+            self.logger.info(f"Model {loaded_model} is not running.")
+            self._set_loaded_model_state(None)
         else:
-            self.logger.error(f"Failed to unload model: {self.currently_loaded_model}. Response: {response.text}")
+            self.logger.error(f"Failed to unload model: {loaded_model}. Response: {response.text}")
 
     def get_current_model(self) -> Optional[str]:
         """Return the model name this adapter currently tracks as loaded."""
@@ -82,26 +80,46 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
 
     def _discover_loaded_model(self) -> Optional[str]:
         """Query the llama.cpp API for the currently loaded model, if any."""
-        try:
-            models = self._fetch_models()
-        except requests.RequestException as exc:
-            self.logger.warning("Failed to query loaded llama.cpp models: %s", exc)
-            return None
-
-        for model in models:
-            if model.get("status", {}).get("value") == "loaded":
-                model_id = model.get("id")
-                if model_id:
-                    self.currently_loaded_model = model_id
-                    self.kv_state.update_shared_state(currently_loaded_model=model_id)
-                    return model_id
-        return None
+        return self._sync_loaded_model_state()
 
     def _fetch_models(self) -> List[Dict[str, Any]]:
         response = requests.get(f"{self.api_uri_v1}/models", timeout=10)
         response.raise_for_status()
         payload = response.json()
         return payload.get("data", [])
+
+    def _set_loaded_model_state(self, model_name: Optional[str]) -> None:
+        self.currently_loaded_model = model_name
+        self.kv_state.update_shared_state(currently_loaded_model=model_name)
+
+    def _sync_loaded_model_state(self) -> Optional[str]:
+        try:
+            models = self._fetch_models()
+        except requests.RequestException as exc:
+            self.logger.warning("Failed to query loaded llama.cpp models: %s", exc)
+            return self.currently_loaded_model or self.kv_state.read_shared_state().get("currently_loaded_model")
+
+        loaded_ids = [
+            model.get("id")
+            for model in models
+            if model.get("status", {}).get("value") == "loaded" and model.get("id")
+        ]
+        if not loaded_ids:
+            self._set_loaded_model_state(None)
+            return None
+
+        chosen = None
+        if self.currently_loaded_model in loaded_ids:
+            chosen = self.currently_loaded_model
+        else:
+            shared_model = self.kv_state.read_shared_state().get("currently_loaded_model")
+            if shared_model in loaded_ids:
+                chosen = shared_model
+            else:
+                chosen = loaded_ids[0]
+
+        self._set_loaded_model_state(chosen)
+        return chosen
 
     def _get_model_metadata(self, model_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
         target = model_name or self.currently_loaded_model or self.get_current_model()

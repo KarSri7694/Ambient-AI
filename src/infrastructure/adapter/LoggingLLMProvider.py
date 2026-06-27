@@ -344,8 +344,13 @@ class LoggingLLMProvider(LLMProvider):
         if state["metadata"]:
             lines.append(f"metadata: {json.dumps(state['metadata'], ensure_ascii=False)}")
         report = state.get("report")
-        if report and report.get("report_to_user"):
-            lines.extend(["", "## Report To User", report["report_to_user"]])
+        if report:
+            if report.get("title"):
+                lines.extend(["", "## Report Title", report["title"]])
+            if report.get("summary"):
+                lines.extend(["", "## Report Summary", report["summary"]])
+            if report.get("artifact_path"):
+                lines.extend(["", "## Report Artifact", report["artifact_path"]])
         if state.get("error_text"):
             lines.extend(["", "## Error", state["error_text"]])
         if state.get("reasoning_text"):

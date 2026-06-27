@@ -185,6 +185,81 @@ def test_get_current_model_reads_shared_state_when_instance_is_empty(monkeypatch
     assert adapter.get_current_model() == "shared-model"
 
 
+def test_sync_loaded_model_state_prefers_server_loaded_model_over_stale_cache(monkeypatch):
+    adapter = LlamaCppAdapter.__new__(LlamaCppAdapter)
+    adapter.logger = logging.getLogger("test")
+    adapter.currently_loaded_model = "Qwen-3.5-9B"
+    shared_state = {"currently_loaded_model": "Qwen-3.5-9B"}
+
+    class FakeKVState:
+        def read_shared_state(self):
+            return dict(shared_state)
+
+        def update_shared_state(self, **kwargs):
+            shared_state.update(kwargs)
+
+    adapter.kv_state = FakeKVState()
+    monkeypatch.setattr(
+        adapter,
+        "_fetch_models",
+        lambda: [
+            {"id": "Qwen-3.5-4B", "status": {"value": "loaded"}},
+            {"id": "Qwen-3.5-9B", "status": {"value": "unloaded"}},
+        ],
+    )
+
+    loaded = adapter._sync_loaded_model_state()
+
+    assert loaded == "Qwen-3.5-4B"
+    assert adapter.currently_loaded_model == "Qwen-3.5-4B"
+    assert shared_state["currently_loaded_model"] == "Qwen-3.5-4B"
+
+
+def test_unload_model_uses_server_loaded_model_when_cache_is_stale(monkeypatch):
+    adapter = LlamaCppAdapter.__new__(LlamaCppAdapter)
+    adapter.logger = logging.getLogger("test")
+    adapter.base_url = "http://localhost:8080"
+    adapter.api_uri_v1 = "http://localhost:8080/v1"
+    adapter.currently_loaded_model = "Qwen-3.5-9B"
+    shared_state = {"currently_loaded_model": "Qwen-3.5-9B"}
+
+    class FakeKVState:
+        def read_shared_state(self):
+            return dict(shared_state)
+
+        def update_shared_state(self, **kwargs):
+            shared_state.update(kwargs)
+
+    adapter.kv_state = FakeKVState()
+    monkeypatch.setattr(
+        adapter,
+        "_fetch_models",
+        lambda: [
+            {"id": "Qwen-3.5-4B", "status": {"value": "loaded"}},
+            {"id": "Qwen-3.5-9B", "status": {"value": "unloaded"}},
+        ],
+    )
+    monkeypatch.setattr(adapter, "_wait_for_model_status", lambda *args, **kwargs: None)
+
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+        text = "ok"
+
+    def fake_post(url, json=None, timeout=None):
+        calls.append((url, json))
+        return FakeResponse()
+
+    monkeypatch.setattr("infrastructure.adapter.llamaCppAdapter.requests.post", fake_post)
+
+    asyncio.run(adapter.unload_model())
+
+    assert calls == [("http://localhost:8080/models/unload", {"model": "Qwen-3.5-4B"})]
+    assert adapter.currently_loaded_model is None
+    assert shared_state["currently_loaded_model"] is None
+
+
 def test_kv_state_stack_is_lifo(monkeypatch):
     adapter = LlamaCppAdapter.__new__(LlamaCppAdapter)
     adapter.logger = logging.getLogger("test")

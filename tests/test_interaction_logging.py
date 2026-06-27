@@ -108,9 +108,9 @@ class InteractionLoggingTests(unittest.TestCase):
                     provider.attach_report(
                         run_id,
                         {
-                            "should_surface_to_user": True,
-                            "report_to_user": "Searched and found the latest result.",
-                            "category": "search_result",
+                            "title": "Latest Search Result",
+                            "summary": "Searched and found the latest result.",
+                            "artifact_path": str(Path(tmpdir) / "artifacts" / "Latest_Search_Result.md"),
                             "tools_used": ["web_search"],
                             "status": "completed",
                         },
@@ -121,11 +121,13 @@ class InteractionLoggingTests(unittest.TestCase):
             reports = store.list_recent_reports(limit=5)
             self.assertEqual(len(reports), 1)
             report_payload = json.loads(reports[0].report_json)
-            self.assertEqual(report_payload["category"], "search_result")
-            self.assertIn("Searched and found", report_payload["report_to_user"])
+            self.assertEqual(report_payload["title"], "Latest Search Result")
+            self.assertIn("Searched and found", report_payload["summary"])
 
             markdown = response_path.read_text(encoding="utf-8")
-            self.assertIn("## Report To User", markdown)
+            self.assertIn("## Report Title", markdown)
+            self.assertIn("Latest Search Result", markdown)
+            self.assertIn("## Report Summary", markdown)
             self.assertIn("Searched and found the latest result.", markdown)
 
 

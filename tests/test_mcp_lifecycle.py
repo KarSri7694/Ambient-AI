@@ -1,6 +1,7 @@
 import asyncio
 import queue
 import sys
+import tempfile
 import types
 from pathlib import Path
 
@@ -50,7 +51,12 @@ class _FakeLLMProvider:
         self.reports = []
 
     async def chat_completion_stream(self, *args, **kwargs):
-        self.calls.append(kwargs.get("model") or (args[0] if args else None))
+        self.calls.append(
+            {
+                "model": kwargs.get("model") or (args[0] if args else None),
+                "messages": kwargs.get("messages") or (args[1] if len(args) > 1 else None),
+            }
+        )
 
         class _Delta:
             def __init__(self, content):
@@ -67,7 +73,7 @@ class _FakeLLMProvider:
                 self.choices = [_Choice(_Delta(content))]
 
         response = (
-            '{"should_surface_to_user": true, "report_to_user": "Created a reminder.", "category": "reminder_created"}'
+            '{"title": "Reminder Created", "summary": "Created a reminder.", "detailed_report": "A very detailed report about the reminder creation."}'
             if len(self.calls) > 1
             else "created reminder successfully"
         )
@@ -177,22 +183,57 @@ def test_ambient_runtime_separates_mcp_lifetime_from_model_lifetime():
 
 def test_llm_interaction_service_uses_reporter_model_override():
     provider = _FakeLLMProvider()
-    service = LLMInteractionService(
-        llm_provider=provider,
-        tool_bridge=_FakeToolBridge(),
-        reporter_model="reporter-model",
-    )
-
-    result = asyncio.run(
-        service.run_interaction(
-            user_input="set a reminder for tomorrow",
-            system_prompt="Do the task.",
-            model="execution-model",
-            report_policy="auto_surface",
+    with tempfile.TemporaryDirectory() as tmpdir:
+        service = LLMInteractionService(
+            llm_provider=provider,
+            tool_bridge=_FakeToolBridge(),
+            reporter_model="reporter-model",
+            artifact_root=tmpdir,
         )
-    )
 
-    assert result == "created reminder successfully"
-    assert provider.calls == ["execution-model", "reporter-model"]
-    assert provider.reports
-    assert provider.reports[0][1]["category"] == "reminder_created"
+        result = asyncio.run(
+            service.run_interaction(
+                user_input="set a reminder for tomorrow",
+                system_prompt="Do the task.",
+                model="execution-model",
+                report_policy="auto_surface",
+            )
+        )
+
+        assert result == "created reminder successfully"
+        assert [call["model"] for call in provider.calls] == ["execution-model", "reporter-model"]
+        assert provider.reports
+        report = provider.reports[0][1]
+        assert report["title"] == "Reminder Created"
+        assert report["summary"] == "Created a reminder."
+        artifact_path = Path(report["artifact_path"])
+        assert artifact_path.exists()
+        assert "A very detailed report" in artifact_path.read_text(encoding="utf-8")
+        second_messages = provider.calls[1]["messages"]
+        user_payload = next(msg["content"] for msg in second_messages if msg["role"] == "user")
+        assert "interaction_history" in user_payload
+
+
+def test_llm_interaction_service_same_model_report_uses_compact_payload():
+    provider = _FakeLLMProvider()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        service = LLMInteractionService(
+            llm_provider=provider,
+            tool_bridge=_FakeToolBridge(),
+            reporter_model="execution-model",
+            artifact_root=tmpdir,
+        )
+        asyncio.run(
+            service.run_interaction(
+                user_input="check the latest update",
+                system_prompt="Do the task.",
+                model="execution-model",
+                report_policy="auto_surface",
+            )
+        )
+
+        assert [call["model"] for call in provider.calls] == ["execution-model", "execution-model"]
+        second_messages = provider.calls[1]["messages"]
+        user_payload = next(msg["content"] for msg in second_messages if msg["role"] == "user")
+        assert "task_brief" in user_payload
+        assert "interaction_history" not in user_payload

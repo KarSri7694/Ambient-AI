@@ -1,3 +1,4 @@
+import copy
 import json
 import logging
 import re
@@ -55,22 +56,20 @@ class LLMInteractionService:
         "- In message_to_agent, return only the concrete result of the delegated task, with no extra planning.\n"
     )
     REPORTER_PROMPT = (
-        "You decide whether the result of an ambient agent execution should be surfaced to the user.\n"
+        "Create a user-facing report for an ambient agent execution.\n"
         "\n"
         "Return JSON only:\n"
         "{\n"
-        '  "should_surface_to_user": true,\n'
-        '  "report_to_user": "short user-facing summary",\n'
-        '  "category": "action_taken|search_result|task_created|reminder_created|ambient_finding|error"\n'
+        '  "title": "short clear title",\n'
+        '  "summary": "short summary for dashboard display",\n'
+        '  "detailed_report": "highly detailed markdown-ready report that misses nothing important"\n'
         "}\n"
         "\n"
         "Rules:\n"
-        "- Surface only outcomes that are directly useful or relevant to the user.\n"
-        "- Surface when the agent searched something, created a reminder/task, changed something on the user's behalf, or found something likely relevant.\n"
-        "- Do not surface internal bookkeeping, low-value no-op completions, or generic acknowledgements.\n"
-        "- report_to_user must be concise, concrete, and written for the user.\n"
-        "- If the outcome should not be surfaced, return should_surface_to_user false and an empty report_to_user.\n"
-        "- Do not include any keys other than should_surface_to_user, report_to_user, and category.\n"
+        "- Write for the user, not for developers.\n"
+        "- summary must be concise and directly useful.\n"
+        "- detailed_report must be highly detailed and miss nothing important from the task outcome.\n"
+        "- Do not add any keys other than title, summary, and detailed_report.\n"
     )
 
     def __init__(
@@ -78,6 +77,7 @@ class LLMInteractionService:
         llm_provider: LLMProvider,
         tool_bridge: ToolBridgePort,
         reporter_model: Optional[str] = None,
+        artifact_root: Optional[str] = None,
     ):
         self.llm = llm_provider
         self.tool_bridge = tool_bridge
@@ -85,6 +85,8 @@ class LLMInteractionService:
         self._tools: Optional[List[Dict[str, Any]]] = None
         self._frame_stack: List[AgentFrame] = [AgentFrame()]
         self.reporter_model = reporter_model
+        self.artifact_root = Path(artifact_root) if artifact_root else (self.PARENT_DIR / "artifacts")
+        self.artifact_root.mkdir(parents=True, exist_ok=True)
 
     @property
     def _frame(self) -> AgentFrame:
@@ -561,7 +563,7 @@ class LLMInteractionService:
             tools_used=tools_used,
             source_name=source_name,
         )
-        if not report or not report.get("should_surface_to_user"):
+        if not report:
             return
         if hasattr(self.llm, "attach_report"):
             self.llm.attach_report(interaction_run_id, report)
@@ -575,31 +577,52 @@ class LLMInteractionService:
         tools_used: List[str],
         source_name: str,
     ) -> Optional[Dict[str, Any]]:
-        payload = {
-            "task_brief": user_input,
-            "final_response": final_response,
-            "tools_used": list(dict.fromkeys(tools_used)),
-            "source": source_name,
-        }
-        report_text = await self._run_json_prompt(
-            model=self.reporter_model or model,
-            system_prompt=self.REPORTER_PROMPT,
-            user_payload=payload,
-        )
+        report_model = self.reporter_model or model
+        deduped_tools = list(dict.fromkeys(tools_used))
+        if report_model != model:
+            report_text = await self._run_history_report_prompt(
+                model=report_model,
+                task_model=model,
+                source_name=source_name,
+                tool_names=deduped_tools,
+            )
+        else:
+            payload = {
+                "task_brief": user_input,
+                "final_response": final_response,
+                "tools_used": deduped_tools,
+                "source": source_name,
+            }
+            report_text = await self._run_json_prompt(
+                model=report_model,
+                system_prompt=self.REPORTER_PROMPT,
+                user_payload=payload,
+            )
         parsed = self._safe_parse_json(report_text)
         if not isinstance(parsed, dict):
             return None
+        title = str(parsed.get("title") or "").strip()
+        summary = str(parsed.get("summary") or "").strip()
+        detailed_report = str(parsed.get("detailed_report") or "").strip()
+        if not title or not summary or not detailed_report:
+            return None
+        artifact_path = self._save_report_artifact(
+            title=title,
+            summary=summary,
+            detailed_report=detailed_report,
+        )
         report = {
-            "should_surface_to_user": bool(parsed.get("should_surface_to_user")),
-            "report_to_user": str(parsed.get("report_to_user") or "").strip(),
-            "category": str(parsed.get("category") or "action_taken").strip() or "action_taken",
+            "title": title,
+            "summary": summary,
+            "artifact_path": str(artifact_path),
+            "artifact_filename": artifact_path.name,
             "source": source_name,
-            "tools_used": list(dict.fromkeys(tools_used)),
+            "tools_used": deduped_tools,
             "created_at": datetime.now().isoformat(),
             "status": "completed",
+            "task_model": model,
+            "report_model": report_model,
         }
-        if not report["should_surface_to_user"] or not report["report_to_user"]:
-            return None
         return report
 
     async def _run_json_prompt(
@@ -625,6 +648,75 @@ class LLMInteractionService:
             if getattr(delta, "content", None):
                 text_parts.append(delta.content)
         return "".join(text_parts).strip()
+
+    async def _run_history_report_prompt(
+        self,
+        *,
+        model: str,
+        task_model: str,
+        source_name: str,
+        tool_names: List[str],
+    ) -> str:
+        provider = getattr(self.llm, "provider", self.llm)
+        messages = [
+            {"role": "system", "content": self._build_system_prompt(self.REPORTER_PROMPT)},
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "report_request": {
+                            "source": source_name,
+                            "task_model": task_model,
+                            "report_model": model,
+                            "tools_used": tool_names,
+                        },
+                        "interaction_history": copy.deepcopy(self._frame.messages),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            },
+        ]
+        completion = await provider.chat_completion_stream(
+            model=model,
+            messages=messages,
+            tools=None,
+            image="",
+        )
+        text_parts: List[str] = []
+        async for chunk in completion:
+            delta = chunk.choices[0].delta
+            if getattr(delta, "content", None):
+                text_parts.append(delta.content)
+        return "".join(text_parts).strip()
+
+    def _save_report_artifact(self, *, title: str, summary: str, detailed_report: str) -> Path:
+        safe_title = self._sanitize_artifact_name(title)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        candidate = self.artifact_root / f"{safe_title}_{timestamp}.md"
+        suffix = 1
+        while candidate.exists():
+            candidate = self.artifact_root / f"{safe_title}_{timestamp}_{suffix}.md"
+            suffix += 1
+        content = "\n".join(
+            [
+                f"# {title}",
+                "",
+                "## Summary",
+                summary,
+                "",
+                "## Detailed Report",
+                detailed_report,
+                "",
+            ]
+        )
+        candidate.write_text(content, encoding="utf-8")
+        return candidate
+
+    def _sanitize_artifact_name(self, title: str) -> str:
+        cleaned = re.sub(r"[^\w\s-]", "", title, flags=re.UNICODE)
+        cleaned = re.sub(r"\s+", "_", cleaned.strip())
+        return cleaned[:80] or "report"
 
     def _safe_parse_json(self, text: str) -> Optional[Dict[str, Any]]:
         if not text:

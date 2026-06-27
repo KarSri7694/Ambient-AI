@@ -1,58 +1,92 @@
-from todoist_api_python.api import TodoistAPI
-import os
 import json
+import logging
+import os
 from pathlib import Path
 
-TODOIST_API_TOKEN = os.getenv("TODOIST_API_TOKEN")
-api = TodoistAPI(TODOIST_API_TOKEN)
-TODOIST_CONFIG_PATH = Path("todoist.json")
-DEFAULT_PROJECT_NAME = "Ambient AI Tasks"
+from todoist_api_python.api import TodoistAPI
 
-data = None
+from config import CONFIG
+
+
+TODOIST_CONFIG_PATH = Path(CONFIG.get_str("todoist", "project_state_path", "todoist.json"))
+DEFAULT_PROJECT_NAME = CONFIG.get_str("todoist", "project_name", "Ambient AI Tasks")
+MCP_CONFIG_PATH = Path(CONFIG.get_str("runtime", "mcp_config_path", "mcp.json"))
+
 
 class TodoistHelper:
     """Helper class for Todoist operations."""
-    
+
     def __init__(self):
-        global data
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self.api_token = self._resolve_api_token()
+        self.api = TodoistAPI(self.api_token) if self.api_token else None
         if TODOIST_CONFIG_PATH.exists():
-            data = json.loads(TODOIST_CONFIG_PATH.read_text(encoding="utf-8"))
+            self.data = json.loads(TODOIST_CONFIG_PATH.read_text(encoding="utf-8"))
         else:
-            data = {"Project": DEFAULT_PROJECT_NAME, "Project ID": ""}
-        if not data.get("Project"):
-            data["Project"] = DEFAULT_PROJECT_NAME
+            self.data = {"Project": DEFAULT_PROJECT_NAME, "Project ID": ""}
+        if not self.data.get("Project"):
+            self.data["Project"] = DEFAULT_PROJECT_NAME
+
+    def is_enabled(self) -> bool:
+        return self.api is not None
+
+    def _resolve_api_token(self) -> str:
+        config_token = CONFIG.get_str("todoist", "api_token", "").strip()
+        if config_token:
+            return config_token
+
+        env_token = os.environ.get("TODOIST_API_TOKEN", "").strip()
+        if env_token:
+            return env_token
+
+        if MCP_CONFIG_PATH.exists():
+            try:
+                payload = json.loads(MCP_CONFIG_PATH.read_text(encoding="utf-8"))
+                for server in payload.get("mcpServers", {}).values():
+                    env_map = server.get("env", {}) or {}
+                    token = str(env_map.get("TODOIST_API_TOKEN", "")).strip()
+                    if token and not token.startswith("%"):
+                        return token
+            except Exception as exc:
+                self.logger.warning("Failed to read Todoist token from %s: %s", MCP_CONFIG_PATH, exc)
+
+        return ""
 
     def update_project_id(self, new_id):
         """Update the project ID in the todoist.json file."""
-        data['Project ID'] = new_id
-        TODOIST_CONFIG_PATH.write_text(json.dumps(data), encoding="utf-8")
+        self.data["Project ID"] = new_id
+        TODOIST_CONFIG_PATH.write_text(json.dumps(self.data), encoding="utf-8")
 
     def _ensure_project_id(self):
-        project_id = data.get("Project ID", "").strip()
+        if self.api is None:
+            return ""
+        project_id = self.data.get("Project ID", "").strip()
         if project_id:
             return project_id
 
-        project_name = data.get("Project", DEFAULT_PROJECT_NAME)
+        project_name = self.data.get("Project", DEFAULT_PROJECT_NAME)
         try:
-            projects = api.get_projects()
+            projects = self.api.get_projects()
             for project in projects:
                 if getattr(project, "name", "") == project_name:
                     self.update_project_id(project.id)
                     return project.id
-            project = api.add_project(name=project_name)
+            project = self.api.add_project(name=project_name)
             self.update_project_id(project.id)
             return project.id
-        except Exception as e:
-            print(f"Error ensuring Todoist project '{project_name}': {e}")
+        except Exception as exc:
+            self.logger.warning("Error ensuring Todoist project '%s': %s", project_name, exc)
             return ""
-            
+
     def get_tasks(self):
-        """Fetch tasks from the specified Todoist project."""
+        """Fetch tasks from the configured Todoist project."""
+        if self.api is None:
+            return []
         try:
             project_id = self._ensure_project_id()
             if not project_id:
                 return []
-            tasks = api.get_tasks(project_id=project_id)
+            tasks = self.api.get_tasks(project_id=project_id)
             normalized_tasks = []
             for task in self._flatten_task_items(tasks):
                 content = getattr(task, "content", None)
@@ -61,8 +95,8 @@ class TodoistHelper:
                     continue
                 normalized_tasks.append({"content": content, "id": task_id})
             return normalized_tasks
-        except Exception as e:
-            print(f"Error fetching tasks: {e}")
+        except Exception as exc:
+            self.logger.warning("Error fetching Todoist tasks: %s", exc)
             return []
 
     def _flatten_task_items(self, tasks):
@@ -72,13 +106,15 @@ class TodoistHelper:
             else:
                 yield task
 
-    def complete_task(self,task_id):
+    def complete_task(self, task_id):
         """Mark a task as complete by its ID."""
+        if self.api is None:
+            return
         try:
-            api.complete_task(task_id)
-            print(f"Task {task_id} marked as complete.")
-        except Exception as e:
-            print(f"Error completing task {task_id}: {e}")
+            self.api.complete_task(task_id)
+        except Exception as exc:
+            self.logger.warning("Error completing Todoist task %s: %s", task_id, exc)
+
 
 if __name__ == "__main__":
     todoist_helper = TodoistHelper()
