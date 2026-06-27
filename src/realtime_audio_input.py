@@ -11,6 +11,7 @@ import torch
 from collections import deque
 from typing import Any
 import logging
+from config import CONFIG
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,7 +26,7 @@ class RealTimeAudioInputService:
         channels: int = 1,
         chunk: int = 512,
         pre_roll_ms: int = 400,
-        uploads_dir: str = os.environ.get("USER_DATA_DIR", "D:\\USER_DATA") + "\\uploads",
+        uploads_dir: str = CONFIG.get_str("realtime_audio", "uploads_dir", "D:\\USER_DATA\\uploads"),
         threshold: float = 0.7,
         min_silence_duration_ms: int = 2000,
         input_device_index: int | None = None,

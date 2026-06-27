@@ -10,10 +10,8 @@ SRC_ROOT = REPO_ROOT / "src"
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(SRC_ROOT))
 
-from application.services.memory_context_builder import MemoryContextBuilder
 from application.services.passive_observer_followup_service import PassiveObserverFollowupService
 from application.services.passive_observer_service import PassiveObserverService
-from application.services.visual_user_fact_service import VisualUserFactService
 from core.models import VisualObservation
 from infrastructure.adapter.SQLiteMemoryAdapter import SQLiteMemoryAdapter
 
@@ -94,8 +92,8 @@ class FakeTaskQueue:
     def get_pending_tasks(self):
         return list(self.items)
 
-    def add_task(self, description: str, priority: str = "medium") -> str:
-        task = type("Task", (), {"description": description, "priority": priority})()
+    def add_task(self, description: str, priority: str = "medium", metadata=None) -> str:
+        task = type("Task", (), {"description": description, "priority": priority, "metadata": metadata})()
         self.items.append(task)
         return "queued"
 
@@ -129,9 +127,15 @@ class PassiveObserverTests(unittest.TestCase):
                         "window_title": "Amazon cart",
                         "page_hint": "cart",
                         "summary": "Amazon cart is open with a product comparison in progress.",
+                        "detailed_description": "Amazon cart shows laptop stand listings with comparison context, including visible product cards, pricing, ratings, and the user's focus on narrowing options before purchase.",
                         "inferred_user_activity": "reviewing items before purchase",
                         "previous_activity_status": "left_midway",
                         "salient_entities": ["amazon", "cart", "laptop stand"],
+                        "visible_targets": ["laptop stands", "product cards"],
+                        "selection_context": ["amazon cart", "comparison flow"],
+                        "decision_factors": ["price", "rating", "design"],
+                        "comparison_axes": ["price vs rating vs design"],
+                        "artifact_state": "comparing",
                         "completed_items": [],
                         "open_loops": ["cart review left unfinished"],
                         "possible_next_task": "continue comparing laptop stands",
@@ -168,11 +172,13 @@ class PassiveObserverTests(unittest.TestCase):
         self.assertEqual(len(persisted), 1)
         self.assertEqual(persisted[0].app_name, "Amazon")
         self.assertEqual(persisted[0].page_hint, "cart")
+        self.assertIn("pricing, ratings", persisted[0].detailed_description)
         self.assertEqual(persisted[0].previous_activity_status, "left_midway")
         self.assertEqual(persisted[0].possible_next_task, "continue comparing laptop stands")
         self.assertEqual(persisted[0].user_fact_hypotheses[0]["title"], "looking for laptop stand")
         self.assertEqual(len(self.memory.list_visual_sessions(statuses=["open"], limit=5)), 1)
         self.assertIn("cart review left unfinished", self.memory.get_visual_digest())
+        self.assertIn("pricing, ratings", self.memory.get_visual_digest())
 
     def test_observer_allows_repeated_capture_processing(self):
         llm = FakeVisualLLM(
@@ -304,19 +310,6 @@ class PassiveObserverTests(unittest.TestCase):
 
         self.assertIsNone(observation)
 
-    def test_prompt_builder_includes_visual_digest(self):
-        self.memory.save_visual_digest("# Passive Visual Context\n\n- Amazon cart review\n")
-        self.memory.save_user_info("# USER_INFO\n\n- User likes strategy games.\n")
-        builder = MemoryContextBuilder(self.memory, str(self.prompts_dir))
-        prompt = builder.build_prompt(
-            base_prompt_filename="AGENT.md",
-            skills_summary="Skill summary",
-            participants=[],
-        )
-        self.assertIn("Passive Visual Context", prompt)
-        self.assertIn("Amazon cart review", prompt)
-        self.assertIn("User likes strategy games.", prompt)
-
     def test_followup_service_queues_task_from_open_loop(self):
         observer_llm = FakeVisualLLM(
             [
@@ -324,6 +317,7 @@ class PassiveObserverTests(unittest.TestCase):
                     {
                         "app_name": "Gmail",
                         "summary": "A draft email is open.",
+                        "detailed_description": "Gmail compose view is open with an unfinished reply draft and editable message body visible.",
                         "inferred_user_activity": "writing an email reply",
                         "previous_activity_status": "left_midway",
                         "salient_entities": ["gmail", "email"],
@@ -367,56 +361,128 @@ class PassiveObserverTests(unittest.TestCase):
         self.assertEqual(result["action"], "queue_task")
         self.assertEqual(len(task_queue.items), 1)
         self.assertIn("Complete email reply draft", task_queue.items[0].description)
+        self.assertIn("Passive observation context:", task_queue.items[0].description)
+        self.assertIn("Detailed description:", task_queue.items[0].description)
+        self.assertIn("Inferred user activity:", task_queue.items[0].description)
+        self.assertEqual(task_queue.items[0].metadata["task_kind"], "passive_observer_followup")
+        self.assertEqual(task_queue.items[0].metadata["source_observation_id"], observation.observation_id)
+        self.assertIn("unfinished reply draft", task_queue.items[0].metadata["detailed_description"])
+        persisted = self.memory.get_visual_observation(observation.observation_id)
+        self.assertIsNotNone(persisted)
+        self.assertTrue(persisted.followup_sent_at)
 
-    def test_visual_user_fact_service_promotes_repeated_visual_interest(self):
-        service = VisualUserFactService(memory=self.memory)
-        first = VisualObservation(
-            observation_id="obs-1",
-            screenshot_path="shot1.png",
-            created_at="2026-06-24T10:00:00",
-            summary="Amazon is open with mobile phones.",
-            inferred_user_activity="comparing mobile phones",
-            user_fact_hypotheses=[
-                {
-                    "category": "device_interest",
-                    "title": "interested in mobile phones",
-                    "summary": "User may be interested in buying a mobile phone.",
-                    "confidence": 1.0,
-                    "scope": "temporary",
-                    "evidence_strength": "strong",
-                }
-            ],
-            session_id="session-a",
-        )
-        second = VisualObservation(
-            observation_id="obs-2",
-            screenshot_path="shot2.png",
+    def test_followup_service_only_sends_unsent_observations(self):
+        older = VisualObservation(
+            observation_id="obs-sent",
+            screenshot_path="sent.png",
             created_at="2026-06-25T10:00:00",
-            summary="Amazon is open with more phone listings.",
-            inferred_user_activity="researching smartphones again",
-            user_fact_hypotheses=[
-                {
-                    "category": "device_interest",
-                    "title": "interested in mobile phones",
-                    "summary": "User may be interested in buying a mobile phone.",
-                    "confidence": 1.0,
-                    "scope": "temporary",
-                    "evidence_strength": "strong",
-                }
-            ],
-            session_id="session-b",
+            app_name="Amazon",
+            summary="Earlier shopping observation.",
+            inferred_user_activity="comparing products",
+            open_loops=["compare products"],
+            possible_next_task="continue comparing products",
+            followup_sent_at="2026-06-25T10:05:00",
+            confidence=0.7,
+        )
+        newer = VisualObservation(
+            observation_id="obs-unsent",
+            screenshot_path="unsent.png",
+            created_at="2026-06-25T10:10:00",
+            app_name="Amazon",
+            summary="Current shopping observation.",
+            detailed_description="Product comparison page is still open.",
+            inferred_user_activity="comparing shortlisted products",
+            previous_activity_status="left_midway",
+            open_loops=["compare shortlisted products"],
+            possible_next_task="continue the product comparison",
+            confidence=0.8,
+        )
+        self.memory.append_visual_observation(older)
+        self.memory.append_visual_observation(newer)
+
+        llm = FakeVisualLLM(
+            [
+                json.dumps(
+                    {
+                        "action": "nothing",
+                        "title": "",
+                        "description": "",
+                        "source_observation_id": "",
+                        "confidence": 0.2,
+                    }
+                )
+            ]
+        )
+        followup = PassiveObserverFollowupService(
+            memory=self.memory,
+            task_queue=FakeTaskQueue(),
+            llm_provider=llm,
         )
 
-        first_updates = service.update_from_observation(first)
-        second_updates = service.update_from_observation(second)
+        result = asyncio.run(followup.maybe_queue_followup(model="test-model"))
 
-        self.assertEqual(first_updates[0].status, "emerging")
-        self.assertEqual(second_updates[0].status, "durable")
-        stored = self.memory.get_visual_user_fact("device-interest-interested-in-mobile-phones")
-        self.assertIsNotNone(stored)
-        self.assertEqual(stored.status, "durable")
-        self.assertIn("mobile phone", self.memory.get_user_info().lower())
+        self.assertEqual(result["action"], "nothing")
+        payload = llm.calls[0]["payload"]
+        sent_ids = [item["observation_id"] for item in payload["recent_visual_observations"]]
+        self.assertEqual(sent_ids, ["obs-unsent"])
+        persisted_unsent = self.memory.get_visual_observation("obs-unsent")
+        persisted_sent = self.memory.get_visual_observation("obs-sent")
+        self.assertIsNotNone(persisted_unsent)
+        self.assertTrue(persisted_unsent.followup_sent_at)
+        self.assertEqual(persisted_sent.followup_sent_at, "2026-06-25T10:05:00")
 
+    def test_followup_service_rejects_ephemeral_feed_scroll(self):
+        observation = VisualObservation(
+            observation_id="obs-scroll",
+            screenshot_path="scroll.png",
+            created_at="2026-06-25T10:00:00",
+            app_name="Instagram",
+            page_hint="feed",
+            summary="Instagram feed is open.",
+            inferred_user_activity="scrolling the Instagram feed",
+            previous_activity_status="continued",
+            open_loops=["scroll more through the feed"],
+            possible_next_task="scroll further down the feed to see more posts",
+            confidence=0.8,
+        )
+        self.memory.append_visual_observation(observation)
+
+        task_queue = FakeTaskQueue()
+        followup = PassiveObserverFollowupService(
+            memory=self.memory,
+            task_queue=task_queue,
+            llm_provider=FakeVisualLLM([]),
+        )
+        result = asyncio.run(followup.maybe_queue_followup(model="test-model"))
+
+        self.assertEqual(result["action"], "nothing")
+        self.assertEqual(len(task_queue.items), 0)
+
+    def test_followup_service_rejects_ephemeral_call_accept(self):
+        observation = VisualObservation(
+            observation_id="obs-call",
+            screenshot_path="call.png",
+            created_at="2026-06-25T10:00:00",
+            app_name="WhatsApp",
+            summary="Incoming video call from Milli is visible.",
+            inferred_user_activity="deciding whether to accept a WhatsApp video call",
+            previous_activity_status="new",
+            open_loops=["accept the WhatsApp video call from Milli"],
+            possible_next_task="click Accept to join the video call from Milli",
+            confidence=0.85,
+        )
+        self.memory.append_visual_observation(observation)
+
+        task_queue = FakeTaskQueue()
+        followup = PassiveObserverFollowupService(
+            memory=self.memory,
+            task_queue=task_queue,
+            llm_provider=FakeVisualLLM([]),
+        )
+        result = asyncio.run(followup.maybe_queue_followup(model="test-model"))
+
+        self.assertEqual(result["action"], "nothing")
+        self.assertEqual(len(task_queue.items), 0)
 
 if __name__ == "__main__":
     unittest.main()

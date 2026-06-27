@@ -18,6 +18,7 @@ from infrastructure.adapter.ecapaVoxcelebAdapter import EcapaVoxcelebAdapter
 from infrastructure.adapter.SQLiteVoiceAdapter import SQLiteVoiceAdapter
 from application.services.system_idle_service import SystemIdleService
 from core.models import DiarizationResult, TranscriptionResult
+from config import CONFIG
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -28,19 +29,18 @@ logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(levelname)s - %
 
 current_dir = Path(__file__).parent
 project_root = current_dir.parent
-os.chdir(project_root)
 
-USER_DATA_DIR = Path(os.getenv("USER_DATA_DIR", str("D:\\USER_DATA")))
-UPLOAD_DIR = USER_DATA_DIR / "uploads"
-VOICE_DB = "database/voice_database.db"
-TRANSCRIPTIONS_DIR = USER_DATA_DIR / "transcriptions"
-HIN2HINGLISH = "Hin2Hinglish-ct2/"
-CLEANED_AUDIO_DIR = USER_DATA_DIR / "cleaned_audio"
-TEMP_AUDIO_DIR = USER_DATA_DIR / "temp_audio"
-USER_IDLE_THRESHOLD_SECONDS = 20
+USER_DATA_DIR = Path(CONFIG.get_str("runtime", "user_data_dir", "D:\\USER_DATA"))
+UPLOAD_DIR = Path(CONFIG.get_str("audio", "uploads_dir", str(USER_DATA_DIR / "uploads")))
+VOICE_DB = CONFIG.get_str("audio", "voice_db", "database/voice_database.db")
+TRANSCRIPTIONS_DIR = Path(CONFIG.get_str("audio", "transcriptions_dir", str(USER_DATA_DIR / "transcriptions")))
+HIN2HINGLISH = CONFIG.get_str("audio", "hin2hinglish_model", "Hin2Hinglish-ct2/")
+CLEANED_AUDIO_DIR = Path(CONFIG.get_str("audio", "cleaned_audio_dir", str(USER_DATA_DIR / "cleaned_audio")))
+TEMP_AUDIO_DIR = Path(CONFIG.get_str("audio", "temp_audio_dir", str(USER_DATA_DIR / "temp_audio")))
+USER_IDLE_THRESHOLD_SECONDS = CONFIG.get_int("audio", "user_idle_threshold_seconds", 20)
 
-HF_TOKEN = os.getenv("HF_TOKEN", None)
-MIN_TIME_THRESHOLD = 0.2 #seconds
+HF_TOKEN = CONFIG.get_str("audio", "hf_token", "").strip() or None
+MIN_TIME_THRESHOLD = CONFIG.get_float("audio", "min_time_threshold", 0.2)
 
 if not UPLOAD_DIR.exists():
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -164,13 +164,13 @@ class AudioAgent:
             return
         
         transcript_name = f"transcript_{datetime.now().strftime('%d%m%Y_%H%M%S')}.txt"
-        transcript_path = os.path.join(TRANSCRIPTIONS_DIR, transcript_name)
+        transcript_path = TRANSCRIPTIONS_DIR / transcript_name
         with open(transcript_path, "w", encoding="utf-8") as f:
             for entry in final_transcript:
                 f.write(f"[{entry[0]:.4f} - {entry[1]:.4f}] -> {entry[2]}: {entry[3]}\n")
 
         logging.info(f"Final transcript for-{diarization_result[0].audio_file} saved to {transcript_name}")
-        self.transcription_queue.put(transcript_path)
+        self.transcription_queue.put(str(transcript_path))
     
     def unload_model(self, attr_name: str):
         '''
@@ -208,7 +208,7 @@ class Handler(FileSystemEventHandler):
         self.processing_queue.put(event.src_path)
 
 class AudioAgentService:
-    def __init__(self, upload_dir: str = UPLOAD_DIR, voice_db: str = VOICE_DB, gpu_lock: threading.Lock = None, audio_active_event: threading.Event = None, llm_active_event: threading.Event= None):
+    def __init__(self, upload_dir: str = str(UPLOAD_DIR), voice_db: str = VOICE_DB, gpu_lock: threading.Lock = None, audio_active_event: threading.Event = None, llm_active_event: threading.Event= None):
         self.upload_dir = upload_dir
         self.voice_db = voice_db
         self.transcription_queue = queue.Queue()
@@ -266,7 +266,7 @@ class AudioAgentService:
     
     def start_service(self):
         observer = Observer()
-        observer.schedule(Handler(self.processing_queue), UPLOAD_DIR, recursive=False)
+        observer.schedule(Handler(self.processing_queue), str(UPLOAD_DIR), recursive=False)
         self.worker_thread.start()
         observer.start()
         

@@ -361,25 +361,31 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         If `image` is provided, it is attached to the final user message as a
         base64 data URL for multimodal models.
         """
-        # If an image is provided, we need to inject it into the content of the LAST message.
-        # This assumes the last message is from the 'user' and text-only.
         copy_messages = copy.deepcopy(messages)
-        if image and copy_messages and copy_messages[-1]["role"] == "user":
+        if image and copy_messages:
             import base64
             with open(image, "rb") as f:
                 base64_image = base64.b64encode(f.read()).decode("utf-8")
-            
-            last_message = copy_messages[-1]
-            text_content = last_message["content"]
-            
-            # format content as list for multimodal
-            last_message["content"] = [
-                {"type": "text", "text": text_content},
-                {
+
+            target_message = None
+            for message in reversed(copy_messages):
+                if message.get("role") == "user":
+                    target_message = message
+                    break
+
+            if target_message is not None:
+                content = target_message.get("content", "")
+                image_part = {
                     "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{base64_image}"}
+                    "image_url": {"url": f"data:image/png;base64,{base64_image}"},
                 }
-            ]
+                if isinstance(content, list):
+                    target_message["content"] = list(content) + [image_part]
+                else:
+                    target_message["content"] = [
+                        {"type": "text", "text": str(content)},
+                        image_part,
+                    ]
 
         kwargs: Dict[str, Any] = {
             "model": model,

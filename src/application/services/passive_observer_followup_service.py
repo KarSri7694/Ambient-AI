@@ -1,12 +1,12 @@
 import json
 import logging
 import re
-from typing import List
+from datetime import datetime
+from typing import Any, List
 
 from application.ports.LLMProvider import LLMProvider
 from application.ports.memory_port import MemoryPort
 from application.ports.task_queue_port import TaskQueuePort
-from application.services.activity_ledger_service import ActivityLedgerService
 from application.services.interaction_trace import interaction_trace
 from core.models import VisualObservation
 
@@ -41,6 +41,7 @@ class PassiveObserverFollowupService:
         "chrome",
     }
     FOLLOWUP_TTL_SECONDS = 2 * 60 * 60
+    UNSENT_OBSERVATION_LIMIT = 20
 
     FOLLOWUP_PROMPT = """You decide whether the ambient agent should take one deferred follow-up action from recent passive visual observations.
 
@@ -69,7 +70,7 @@ Rules:
         memory: MemoryPort,
         task_queue: TaskQueuePort,
         llm_provider: LLMProvider,
-        activity_ledger: ActivityLedgerService | None = None,
+        activity_ledger: Any = None,
         logger: logging.Logger | None = None,
     ):
         self.memory = memory
@@ -79,9 +80,9 @@ Rules:
         self.logger = logger or logging.getLogger(self.__class__.__name__)
 
     async def maybe_queue_followup(self, *, model: str) -> dict:
-        observations = self.memory.get_recent_visual_observations(limit=5)
+        observations = self.memory.get_recent_unsent_visual_observations(limit=self.UNSENT_OBSERVATION_LIMIT)
         if not observations:
-            return {"action": "nothing"}
+            return {"action": "nothing", "reason": "no unsent observations"}
         source_observation = observations[0]
         triage = self._triage_observation(source_observation, observations)
         if not triage["eligible"]:
@@ -95,6 +96,11 @@ Rules:
             "user_info": self.memory.get_user_info(),
             "triage": triage,
         }
+        sent_at = datetime.now().isoformat()
+        self.memory.mark_visual_observations_followup_sent(
+            [item.observation_id for item in observations],
+            sent_at=sent_at,
+        )
         with interaction_trace("passive_observer_followup"):
             completion = await self.llm.chat_completion_stream(
                 model=model,

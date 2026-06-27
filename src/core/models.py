@@ -351,6 +351,7 @@ class VisualObservation:
     user_fact_hypotheses: List[Dict[str, str]] = field(default_factory=list)
     confidence: float = 0.0
     session_id: Optional[str] = None
+    followup_sent_at: Optional[str] = None
     raw_payload_json: Optional[str] = None
 
 
