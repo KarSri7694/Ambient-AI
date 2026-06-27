@@ -68,8 +68,10 @@ class LLMInteractionService:
             raise RuntimeError("Cannot pop root agent frame.")
         return self._frame_stack.pop()
 
-    async def initialize_tools(self) -> None:
-        """Fetch available tools from the tool bridge."""
+    async def initialize_tools(self, force_refresh: bool = False) -> None:
+        """Fetch available tools from the tool bridge and cache them."""
+        if self._tools is not None and not force_refresh:
+            return
         self._tools = await self.tool_bridge.get_all_tools()
 
     def reset_context(self) -> None:

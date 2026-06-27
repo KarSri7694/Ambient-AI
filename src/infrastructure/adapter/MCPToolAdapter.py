@@ -20,11 +20,15 @@ class MCPToolAdapter(ToolBridgePort):
         self._exit_stack: Optional[AsyncExitStack] = None
 
     async def start_servers(self, config_path: str) -> None:
-        self._exit_stack = AsyncExitStack()
+        if self._sessions:
+            self.logger.info("MCP servers already connected; reusing existing sessions.")
+            return
 
         if config_path == "":
-                self.logger.info("No MCP config path provided, skipping server startup.")
-                return
+            self.logger.info("No MCP config path provided, skipping server startup.")
+            return
+
+        self._exit_stack = AsyncExitStack()
         with open(config_path, "r") as f:
             config = json.load(f)
 
@@ -46,6 +50,7 @@ class MCPToolAdapter(ToolBridgePort):
 
     async def get_all_tools(self) -> List[Dict[str, Any]]:
         all_tools: List[Dict[str, Any]] = []
+        self._tool_server_map.clear()
         for server_name, session in self._sessions.items():
             try:
                 mcp_tools = await session.list_tools()
