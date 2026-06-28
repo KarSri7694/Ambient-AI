@@ -8,6 +8,8 @@ from core.models import (
     MemoryFact,
     MemoryReflection,
     OpenLoop,
+    SemanticMemoryChunk,
+    SemanticMemoryResult,
     SpeakerRecord,
     TranscriptEvidence,
     UserProfileFacet,
@@ -261,4 +263,43 @@ class MemoryPort(ABC):
 
     @abstractmethod
     def get_user_info(self) -> str:
+        pass
+
+    @abstractmethod
+    def save_working_memory(self, content: str) -> None:
+        pass
+
+    @abstractmethod
+    def get_working_memory(self) -> str:
+        pass
+
+    @abstractmethod
+    def upsert_semantic_chunk(
+        self,
+        *,
+        source_type: str,
+        source_id: str,
+        source_ref: str,
+        content: str,
+        speaker_id: Optional[str] = None,
+        metadata_json: str = "{}",
+    ) -> SemanticMemoryChunk:
+        pass
+
+    @abstractmethod
+    def get_chunks_missing_embeddings(self, limit: int = 100) -> List[SemanticMemoryChunk]:
+        pass
+
+    @abstractmethod
+    def update_embedding(self, chunk_id: str, embedding: List[float]) -> None:
+        pass
+
+    @abstractmethod
+    def vector_search(
+        self,
+        query_embedding: List[float],
+        *,
+        limit: int = 30,
+        speaker_ids: Optional[List[str]] = None,
+    ) -> List[SemanticMemoryResult]:
         pass

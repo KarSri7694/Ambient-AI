@@ -18,9 +18,9 @@ class LLMProvider(ABC):
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
         image: str = "",
-        temperature: float = 0.7,
-        top_p: float = 0.95,
-        top_k: int = 0,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
     ) -> Iterator:
         """
         Create a streaming chat completion.

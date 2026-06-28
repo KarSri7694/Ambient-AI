@@ -231,9 +231,9 @@ class OpenVinoAdapter(LLMProvider, ModelManager):
         tools: Optional[List[Dict[str, Any]]] = None,
         image: str = "",
         max_tokens: int = 32000,
-        temperature: float = 0.7,
-        top_p: float = 0.95,
-        top_k: int = 0,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
     ) -> Iterator[_ChunkShim]:
         """Streaming chat completion.
 
@@ -243,15 +243,19 @@ class OpenVinoAdapter(LLMProvider, ModelManager):
                 reasonable (≤2048) avoids over-reserving GPU KV buffers.
             top_k: Top-k sampling filter (0 = disabled).
         """
-        raw_stream = _ov.stream_chat_completion_with_tools(
-            messages=messages,
-            tools=tools,
-            model=model,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            max_tokens=max_tokens,
-            image=image or None,
-        )
+        kwargs: Dict[str, Any] = {
+            "messages": messages,
+            "tools": tools,
+            "model": model,
+            "max_tokens": max_tokens,
+            "image": image or None,
+        }
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+        if top_p is not None:
+            kwargs["top_p"] = top_p
+        if top_k is not None:
+            kwargs["top_k"] = top_k
+        raw_stream = _ov.stream_chat_completion_with_tools(**kwargs)
         for chunk_dict in raw_stream:
             yield _dict_to_chunk(chunk_dict)

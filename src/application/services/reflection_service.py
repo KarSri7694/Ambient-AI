@@ -8,11 +8,12 @@ from typing import Any, Dict, List, Optional
 from application.ports.LLMProvider import LLMProvider
 from application.ports.memory_port import MemoryPort
 from application.ports.task_queue_port import TaskQueuePort
+from application.services.semantic_memory_service import SemanticMemoryService
 from application.services.interaction_trace import interaction_trace
 
 
 class ReflectionService:
-    """Maintains USER_INFO.md and derives bounded proactive tasks from it."""
+    """Maintains durable user info, trims temporary memory, and derives proactive tasks."""
 
     CLEANUP_PROMPT = """You maintain USER_INFO.md as a concise durable profile.
 
@@ -25,6 +26,18 @@ Rules:
 - Preserve durable facts, interests, concerns, commitments, preferences, and reminders.
 - Do not invent new facts.
 - Keep it compact and useful for future agent reasoning.
+- If the input is already clean, return the cleaned equivalent without commentary.
+"""
+
+    MEMORY_CLEANUP_PROMPT = """You maintain MEMORY.md as concise temporary working memory.
+
+Return markdown only.
+
+Rules:
+- Keep short-lived reminders, ongoing concerns, current plans, recent active topics, and open temporary context.
+- Remove duplicates, clutter, stale filler, and repeated restatements.
+- Do not convert temporary memory into broad long-term profile claims.
+- Preserve useful unresolved or recent items.
 - If the input is already clean, return the cleaned equivalent without commentary.
 """
 
@@ -43,7 +56,8 @@ Return JSON only:
 
 Rules:
 - Generate between 5 and 10 tasks unless the profile is too sparse, then return fewer.
-- Use the cleaned user profile as the main source of truth.
+- Use the cleaned user profile as the main stable source of truth.
+- Use cleaned working memory as temporary supporting context.
 - Avoid duplicates of currently pending tasks.
 - Avoid repeating tasks that were already generated in previous reflection runs.
 - Prefer concrete actions the agent can realistically perform later.
@@ -57,6 +71,7 @@ Rules:
         memory: MemoryPort,
         task_queue: TaskQueuePort,
         llm_provider: LLMProvider,
+        semantic_memory: SemanticMemoryService | None = None,
         history_path: str,
         cadence_mode: str = "daily",
         interval_hours: int = 24,
@@ -66,6 +81,7 @@ Rules:
         self.memory = memory
         self.task_queue = task_queue
         self.llm = llm_provider
+        self.semantic_memory = semantic_memory
         self.history_path = Path(history_path)
         self.cadence_mode = (cadence_mode or "daily").strip().lower()
         self.interval_hours = max(1, int(interval_hours))
@@ -99,24 +115,27 @@ Rules:
         now = now or datetime.now()
         history = history or self._load_history()
         original_user_info = self.memory.get_user_info().strip()
-        if not original_user_info:
+        original_working_memory = self.memory.get_working_memory().strip()
+        if not original_user_info and not original_working_memory:
             self._record_run(
                 history=history,
                 run_payload={
                     "generated_at": now.isoformat(),
                     "mode": self.cadence_mode,
                     "user_info_digest": "",
+                    "working_memory_digest": "",
                     "generated_tasks": [],
                     "queued_tasks": [],
                     "skipped_tasks": [],
-                    "reason": "empty_user_info",
+                    "reason": "empty_memory",
                 },
                 last_run_at=now.isoformat(),
             )
             return {
                 "ran": True,
-                "reason": "empty_user_info",
+                "reason": "empty_memory",
                 "cleaned_user_info_changed": False,
+                "cleaned_working_memory_changed": False,
                 "generated_tasks": [],
                 "queued_tasks": [],
                 "skipped_tasks": [],
@@ -128,11 +147,21 @@ Rules:
         if cleaned_changed:
             self.memory.save_user_info(cleaned_user_info + "\n")
 
+        cleaned_working_memory = await self._cleanup_working_memory(
+            model=model,
+            working_memory=original_working_memory,
+        )
+        cleaned_working_memory = cleaned_working_memory.strip() or original_working_memory
+        cleaned_memory_changed = cleaned_working_memory != original_working_memory
+        if cleaned_memory_changed:
+            self.memory.save_working_memory(cleaned_working_memory + "\n")
+
         pending_tasks = self.task_queue.get_pending_tasks()
         pending_descriptions = [task.description for task in pending_tasks]
         generated_tasks = await self._generate_tasks(
             model=model,
             cleaned_user_info=cleaned_user_info,
+            cleaned_working_memory=cleaned_working_memory,
             pending_tasks=pending_descriptions,
             history=history,
         )
@@ -176,6 +205,7 @@ Rules:
             "generated_at": now.isoformat(),
             "mode": self.cadence_mode,
             "user_info_digest": self._digest(cleaned_user_info),
+            "working_memory_digest": self._digest(cleaned_working_memory),
             "generated_tasks": generated_tasks[: self.max_generated_tasks],
             "queued_tasks": queued_tasks,
             "skipped_tasks": skipped_tasks,
@@ -185,6 +215,7 @@ Rules:
             "ran": True,
             "reason": "completed",
             "cleaned_user_info_changed": cleaned_changed,
+            "cleaned_working_memory_changed": cleaned_memory_changed,
             "generated_tasks": generated_tasks[: self.max_generated_tasks],
             "queued_tasks": queued_tasks,
             "skipped_tasks": skipped_tasks,
@@ -207,14 +238,17 @@ Rules:
         *,
         model: str,
         cleaned_user_info: str,
+        cleaned_working_memory: str,
         pending_tasks: List[str],
         history: dict,
     ) -> List[dict]:
         payload = {
             "cleaned_user_info": cleaned_user_info,
+            "cleaned_working_memory": cleaned_working_memory,
             "pending_tasks": pending_tasks,
             "previously_generated_tasks": self._recent_generated_tasks(history),
             "max_tasks": self.max_generated_tasks,
+            "semantic_context": self._semantic_context(cleaned_user_info, cleaned_working_memory),
         }
         with interaction_trace("reflection_service_generation"):
             completion = await self.llm.chat_completion_stream(
@@ -227,6 +261,20 @@ Rules:
             )
         parsed = self._parse_json_object(await self._consume_stream_text(completion))
         return self._normalize_tasks(parsed.get("tasks"))
+
+    async def _cleanup_working_memory(self, *, model: str, working_memory: str) -> str:
+        if not working_memory.strip():
+            return ""
+        with interaction_trace("reflection_service_memory_cleanup"):
+            completion = await self.llm.chat_completion_stream(
+                model=model,
+                messages=[
+                    {"role": "system", "content": self._build_system_prompt(self.MEMORY_CLEANUP_PROMPT)},
+                    {"role": "user", "content": working_memory},
+                ],
+                tools=None,
+            )
+        return (await self._consume_stream_text(completion)).strip()
 
     def _is_due(self, history: dict, now: datetime) -> bool:
         mode = self.cadence_mode
@@ -323,6 +371,23 @@ Rules:
             )
         return results
 
+    def _semantic_context(self, cleaned_user_info: str, cleaned_working_memory: str) -> List[dict]:
+        if self.semantic_memory is None:
+            return []
+        query = " ".join(
+            part
+            for part in [
+                cleaned_user_info,
+                cleaned_working_memory,
+                "proactive tasks based on user interests commitments reminders and current concerns",
+            ]
+            if part
+        ).strip()
+        if not query:
+            return []
+        results = self.semantic_memory.retrieve(query=query, limit=10, rerank_limit=6)
+        return self.semantic_memory.format_context(results)
+
     def _parse_json_object(self, response_text: str) -> dict:
         text = response_text.strip()
         start = text.find("{")
@@ -338,6 +403,8 @@ Rules:
     async def _consume_stream_text(self, completion) -> str:
         parts: List[str] = []
         async for chunk in completion:
+            if not getattr(chunk, "choices", None):
+                continue
             delta = chunk.choices[0].delta
             if delta.content:
                 parts.append(delta.content)

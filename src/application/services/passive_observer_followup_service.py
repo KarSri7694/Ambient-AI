@@ -1,12 +1,14 @@
 import json
 import logging
 import re
+import hashlib
 from datetime import datetime
 from typing import Any, List
 
 from application.ports.LLMProvider import LLMProvider
 from application.ports.memory_port import MemoryPort
 from application.ports.task_queue_port import TaskQueuePort
+from application.services.semantic_memory_service import SemanticMemoryService
 from application.services.interaction_trace import interaction_trace
 from core.models import VisualObservation
 
@@ -52,6 +54,7 @@ Return JSON only:
 {
   "action": "nothing|queue_task|do_now",
   "task": "concrete action for the AI agent to do or queue",
+  "memory_updates": ["optional temporary memory or reminder notes"],
   "user_info_updates": ["optional user facts or notes worth saving"]
 }
 
@@ -75,41 +78,42 @@ Rules:
 - Use nothing for irrelevant, unsafe, ambiguous, purely mechanical, or low-value activities.
 - When action is do_now or queue_task, task must be a short concrete instruction for the AI agent.
 - When action is nothing, task may be empty.
-- Use user_info_updates for durable user facts, interests, concerns, or reminders worth saving for later context.
-- Do not add commentary or any keys other than action, task, and user_info_updates.
+- Use memory_updates for short-term facts, active concerns, upcoming items, temporary reminders, or recent context that may matter for a while but should not become stable profile data yet.
+- Use user_info_updates only for durable user facts, repeated interests, habits, stable preferences, or long-term concerns worth saving in the user's profile.
+- Do not add commentary or any keys other than action, task, memory_updates, and user_info_updates.
 
 Examples:
 Input activity: "compare TV prices across Amazon and Flipkart"
 Output:
-{"action":"queue_task","task":"compare TV prices across Amazon and Flipkart and summarize the best options","user_info_updates":[]}
+{"action":"queue_task","task":"compare TV prices across Amazon and Flipkart and summarize the best options","memory_updates":[],"user_info_updates":[]}
 
 Input activity: "set a reminder to call mom tonight"
 Output:
-{"action":"do_now","task":"set a reminder to call mom tonight","user_info_updates":[]}
+{"action":"do_now","task":"set a reminder to call mom tonight","memory_updates":["User wants to remember calling mom tonight."],"user_info_updates":[]}
 
 Input activity: "check today's India cricket score"
 Output:
-{"action":"do_now","task":"check today's India cricket score","user_info_updates":[]}
+{"action":"do_now","task":"check today's India cricket score","memory_updates":[],"user_info_updates":[]}
 
 Input activity: "write a follow-up email draft to the recruiter"
 Output:
-{"action":"queue_task","task":"draft a follow-up email to the recruiter","user_info_updates":[]}
+{"action":"queue_task","task":"draft a follow-up email to the recruiter","memory_updates":[],"user_info_updates":[]}
 
 Input activity: "scrolling through Instagram feed"
 Output:
-{"action":"nothing","task":"","user_info_updates":[]}
+{"action":"nothing","task":"","memory_updates":[],"user_info_updates":[]}
 
 Input activity: "typing in a search box"
 Output:
-{"action":"nothing","task":"","user_info_updates":[]}
+{"action":"nothing","task":"","memory_updates":[],"user_info_updates":[]}
 
 Input activity: "Reviewing or replying to messages in a conversation that mentions an upcoming event the user may need to remember"
 Output:
-{"action":"do_now","task":"set a reminder about the upcoming event","user_info_updates":["User may need to remember an upcoming event mentioned in conversation."]}
+{"action":"do_now","task":"set a reminder about the upcoming event","memory_updates":["User may need to remember an upcoming event mentioned in conversation."],"user_info_updates":[]}
 
 Input activity: "Reviewing a discussion that speculates about why a product price is increasing"
 Output:
-{"action":"queue_task","task":"research the possible reasons behind the product price increase","user_info_updates":["User may be interested in the reasons behind a recent product price increase."]}
+{"action":"queue_task","task":"research the possible reasons behind the product price increase","memory_updates":["User is currently concerned about a recent product price increase."],"user_info_updates":["User tracks pricing changes before making decisions."]}
 
 """
 
@@ -119,12 +123,14 @@ Output:
         memory: MemoryPort,
         task_queue: TaskQueuePort,
         llm_provider: LLMProvider,
+        semantic_memory: SemanticMemoryService | None = None,
         activity_ledger: Any = None,
         logger: logging.Logger | None = None,
     ):
         self.memory = memory
         self.task_queue = task_queue
         self.llm = llm_provider
+        self.semantic_memory = semantic_memory
         self.activity_ledger = activity_ledger
         self.logger = logger or logging.getLogger(self.__class__.__name__)
 
@@ -168,6 +174,7 @@ Output:
             queued_activities: List[str] = []
             do_now_activities: List[str] = []
             ignored_activities: List[str] = []
+            memory_updates: List[str] = []
             user_info_updates: List[str] = []
 
             for activity in useful_activities:
@@ -179,6 +186,7 @@ Output:
                 )
                 action = decision["action"]
                 task = decision["task"] or activity
+                memory_updates.extend(decision["memory_updates"])
                 user_info_updates.extend(decision["user_info_updates"])
                 if action == "queue_task":
                     if self._looks_duplicate(activity=task, pending_tasks=pending_descriptions):
@@ -197,6 +205,7 @@ Output:
                 else:
                     ignored_activities.append(activity)
 
+            saved_memory_updates = self._apply_memory_updates(memory_updates)
             saved_user_info_updates = self._apply_user_info_updates(user_info_updates)
 
         useful_set = {self._normalize_activity(item) for item in useful_activities}
@@ -211,6 +220,7 @@ Output:
             "queued_activities": queued_activities,
             "do_now_activities": do_now_activities,
             "ignored_activities": ignored_activities,
+            "memory_updates": saved_memory_updates,
             "user_info_updates": saved_user_info_updates,
         }
 
@@ -222,6 +232,7 @@ Output:
             "queued_activities": [],
             "do_now_activities": [],
             "ignored_activities": [],
+            "memory_updates": [],
             "user_info_updates": [],
             "reason": reason,
         }
@@ -302,6 +313,7 @@ Output:
                 }
                 for row in rows
             ],
+            "semantic_context": self._semantic_context(activity=activity, rows=rows),
         }
         completion = await self.llm.chat_completion_stream(
             model=model,
@@ -314,12 +326,14 @@ Output:
         parsed = self._parse_json_object(await self._consume_stream_text(completion))
         decision = self._clean_text(parsed.get("action")).lower()
         task = self._clean_text(parsed.get("task"))
+        memory_updates = self._list_text(parsed.get("memory_updates"))
         user_info_updates = self._list_text(parsed.get("user_info_updates"))
         if decision not in {"nothing", "queue_task", "do_now"}:
             decision = "nothing"
         return {
             "action": decision,
             "task": task,
+            "memory_updates": memory_updates,
             "user_info_updates": user_info_updates,
         }
 
@@ -408,7 +422,51 @@ Output:
         lines.extend(f"- {item}" for item in new_updates)
         content = "\n".join(lines).strip() + "\n"
         self.memory.save_user_info(content)
+        for item in new_updates:
+            self._index_note(note=item, source_type="user_info_note", bucket="user_info")
         return new_updates
+
+    def _apply_memory_updates(self, updates: List[str]) -> List[str]:
+        deduped = self._dedupe_preserve_order(updates)
+        if not deduped:
+            return []
+        existing = self.memory.get_working_memory().strip()
+        existing_lines = {
+            self._normalize_activity(line)
+            for line in existing.splitlines()
+            if self._normalize_activity(line)
+        }
+        new_updates = [item for item in deduped if self._normalize_activity(item) not in existing_lines]
+        if not new_updates:
+            return []
+        lines: List[str] = []
+        if existing:
+            lines.append(existing)
+            if not existing.endswith("\n"):
+                lines.append("")
+        lines.extend(f"- {item}" for item in new_updates)
+        self.memory.save_working_memory("\n".join(lines).strip() + "\n")
+        for item in new_updates:
+            self._index_note(note=item, source_type="working_memory_note", bucket="memory")
+        return new_updates
+
+    def _index_note(self, *, note: str, source_type: str, bucket: str) -> None:
+        clean_note = self._clean_text(note)
+        if not clean_note:
+            return
+        stable_id = hashlib.sha1(f"{source_type}:{clean_note.lower()}".encode("utf-8")).hexdigest()
+        self.memory.upsert_semantic_chunk(
+            source_type=source_type,
+            source_id=stable_id,
+            source_ref=source_type,
+            content=clean_note,
+            metadata_json=json.dumps(
+                {
+                    "bucket": bucket,
+                    "stored_at": datetime.now().isoformat(),
+                }
+            ),
+        )
 
     def _extract_reminder_hint(self, raw_payload_json: str | None) -> dict:
         if not raw_payload_json:
@@ -464,6 +522,8 @@ Output:
     async def _consume_stream_text(self, completion) -> str:
         parts: List[str] = []
         async for chunk in completion:
+            if not getattr(chunk, "choices", None):
+                continue
             delta = chunk.choices[0].delta
             if delta.content:
                 parts.append(delta.content)
@@ -480,3 +540,27 @@ Output:
         except json.JSONDecodeError:
             self.logger.warning("Passive observer follow-up response was not valid JSON.")
             return {}
+    def _semantic_context(self, *, activity: str, rows: List[dict]) -> List[dict]:
+        if self.semantic_memory is None:
+            return []
+        query = " ".join(
+            [
+                activity,
+                *[
+                    " ".join(
+                        part
+                        for part in [
+                            row.get("summary", ""),
+                            row.get("detailed_description", ""),
+                            row.get("reminder_context", ""),
+                        ]
+                        if part
+                    )
+                    for row in rows
+                ],
+            ]
+        ).strip()
+        if not query:
+            return []
+        results = self.semantic_memory.retrieve(query=query, limit=8, rerank_limit=5)
+        return self.semantic_memory.format_context(results)

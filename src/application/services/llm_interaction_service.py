@@ -341,6 +341,8 @@ class LLMInteractionService:
         tool_calls: List[Dict] = []
 
         async for chunk in completion:
+            if not getattr(chunk, "choices", None):
+                continue
             delta = chunk.choices[0].delta
 
             if delta.content:
@@ -644,6 +646,8 @@ class LLMInteractionService:
         )
         text_parts: List[str] = []
         async for chunk in completion:
+            if not getattr(chunk, "choices", None):
+                continue
             delta = chunk.choices[0].delta
             if getattr(delta, "content", None):
                 text_parts.append(delta.content)
@@ -685,6 +689,8 @@ class LLMInteractionService:
         )
         text_parts: List[str] = []
         async for chunk in completion:
+            if not getattr(chunk, "choices", None):
+                continue
             delta = chunk.choices[0].delta
             if getattr(delta, "content", None):
                 text_parts.append(delta.content)

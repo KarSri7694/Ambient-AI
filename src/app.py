@@ -10,14 +10,17 @@ from application.services.passive_observer_followup_service import PassiveObserv
 from application.services.reflection_service import ReflectionService
 from application.services.llm_interaction_service import LLMInteractionService
 from application.services.passive_observer_service import PassiveObserverService
+from application.services.semantic_memory_service import SemanticMemoryService
 from application.services.screenshot_queue_service import ScreenshotQueueService
 from application.services.system_idle_service import SystemIdleService
 from application.services.user_bio_data_service import UserBioDataService
 from audio_agent import AudioAgentService
+from infrastructure.adapter.LlamaCppSemanticAdapter import LlamaCppSemanticAdapter
 from infrastructure.adapter.llamaCppAdapter import LlamaCppAdapter
 from infrastructure.adapter.LoggingLLMProvider import LoggingLLMProvider
 from infrastructure.adapter.MCPToolAdapter import MCPToolAdapter
 from infrastructure.adapter.MSSScreenCaptureAdapter import MssScreenCaptureAdapter
+from infrastructure.adapter.SQLiteBenchmarkAdapter import SQLiteBenchmarkAdapter
 from infrastructure.adapter.SQLiteInteractionLogAdapter import SQLiteInteractionLogAdapter
 from infrastructure.adapter.SQLiteMemoryAdapter import SQLiteMemoryAdapter
 from infrastructure.adapter.SQLiteTaskQueueAdapter import SQLiteTaskQueueAdapter
@@ -51,6 +54,7 @@ PROJECT_ROOT = Path(__file__).parent.parent
 MEMORY_ROOT = USER_DATA_DIR / "memory"
 MEMORY_DB_PATH = USER_DATA_DIR / "database" / "memory.db"
 INTERACTION_LOG_DB_PATH = USER_DATA_DIR / "database" / "interaction_logs.db"
+BENCHMARK_DB_PATH = Path(CONFIG.get_str("benchmarking", "db_path", str(PROJECT_ROOT / "database" / "benchmarking.db")))
 CURRENT_RESPONSE_PATH = PROJECT_ROOT / "database" / "current_llm_response.md"
 ARTIFACTS_ROOT = USER_DATA_DIR / "artifacts"
 VOICE_DB_PATH = USER_DATA_DIR / "database" / "voice_database.db"
@@ -76,6 +80,14 @@ REFLECTION_HISTORY_PATH = CONFIG.get_str(
     "history_path",
     str(USER_DATA_DIR / "reflection" / "reflection_history.json"),
 )
+SEMANTIC_MEMORY_ENABLED = CONFIG.get_bool("semantic_memory", "enabled", True)
+EMBEDDING_API_BASE_URL = CONFIG.get_str("semantic_memory", "embedding_api_base_url", "http://localhost:8081")
+EMBEDDING_MODEL = CONFIG.get_model("embedding_model", "", section="semantic_memory")
+RERANKER_API_BASE_URL = CONFIG.get_str("semantic_memory", "reranker_api_base_url", EMBEDDING_API_BASE_URL)
+RERANKER_MODEL = CONFIG.get_model("reranker_model", "", section="semantic_memory")
+SEMANTIC_VECTOR_LIMIT = CONFIG.get_int("semantic_memory", "vector_limit", 12)
+SEMANTIC_RERANK_LIMIT = CONFIG.get_int("semantic_memory", "rerank_limit", 6)
+SEMANTIC_SYNC_BATCH_SIZE = CONFIG.get_int("semantic_memory", "sync_batch_size", 32)
 
 configure_runtime_log_streaming(max_entries=LOG_API_BUFFER_SIZE)
 
@@ -85,6 +97,7 @@ def ensure_runtime_databases() -> None:
     VOICE_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     SQLiteMemoryAdapter(db_path=str(MEMORY_DB_PATH), memory_root=str(MEMORY_ROOT))
     SQLiteInteractionLogAdapter(db_path=str(INTERACTION_LOG_DB_PATH))
+    SQLiteBenchmarkAdapter(db_path=str(BENCHMARK_DB_PATH))
     SQLiteVoiceAdapter(str(VOICE_DB_PATH))
     night_mode.init_db()
 
@@ -186,12 +199,29 @@ class AmbientRuntime:
             db_path=str(MEMORY_DB_PATH),
             memory_root=str(MEMORY_ROOT),
         )
+        semantic_adapter = None
+        semantic_memory = None
+        if SEMANTIC_MEMORY_ENABLED and EMBEDDING_MODEL:
+            semantic_adapter = LlamaCppSemanticAdapter(
+                embedding_base_url=EMBEDDING_API_BASE_URL,
+                embedding_model=EMBEDDING_MODEL,
+                reranker_base_url=RERANKER_API_BASE_URL,
+                reranker_model=RERANKER_MODEL,
+            )
+            semantic_memory = SemanticMemoryService(
+                memory=memory_store,
+                semantic_adapter=semantic_adapter,
+                sync_batch_size=SEMANTIC_SYNC_BATCH_SIZE,
+                vector_limit=SEMANTIC_VECTOR_LIMIT,
+                rerank_limit=SEMANTIC_RERANK_LIMIT,
+            )
         task_queue = SQLiteTaskQueueAdapter()
         reflection_service = (
             ReflectionService(
                 memory=memory_store,
                 task_queue=task_queue,
                 llm_provider=logged_llm,
+                semantic_memory=semantic_memory,
                 history_path=REFLECTION_HISTORY_PATH,
                 cadence_mode=REFLECTION_CADENCE_MODE,
                 interval_hours=REFLECTION_INTERVAL_HOURS,
@@ -213,6 +243,7 @@ class AmbientRuntime:
                 memory=memory_store,
                 task_queue=task_queue,
                 llm_provider=logged_llm,
+                semantic_memory=semantic_memory,
                 activity_ledger=None,
             )
             if PASSIVE_OBSERVER_ENABLED
@@ -222,6 +253,7 @@ class AmbientRuntime:
             UserBioDataService(
                 memory=memory_store,
                 llm_provider=logged_llm,
+                semantic_memory=semantic_memory,
             )
             if PASSIVE_OBSERVER_ENABLED
             else None
@@ -552,6 +584,7 @@ if __name__ == "__main__":
             max_entries=LOG_API_BUFFER_SIZE,
             report_store=SQLiteInteractionLogAdapter(db_path=str(INTERACTION_LOG_DB_PATH)),
             task_store=SQLiteTaskQueueAdapter(),
+            benchmark_store=SQLiteBenchmarkAdapter(db_path=str(BENCHMARK_DB_PATH)),
         )
         logger.info("Runtime log server started at http://%s:%s/logs", LOG_API_HOST, LOG_API_PORT)
 

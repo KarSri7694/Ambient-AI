@@ -122,9 +122,9 @@ class LoggingLLMProvider(LLMProvider):
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
         image: str = "",
-        temperature: float = 0.7,
-        top_p: float = 0.95,
-        top_k: int = 0,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
     ):
         started_at = datetime.now().isoformat()
         started = perf_counter()
@@ -160,6 +160,9 @@ class LoggingLLMProvider(LLMProvider):
             async def _wrapped_stream():
                 try:
                     async for chunk in completion:
+                        if not getattr(chunk, "choices", None):
+                            yield chunk
+                            continue
                         delta = chunk.choices[0].delta
                         if getattr(delta, "content", None):
                             response_text_parts.append(delta.content)

@@ -544,3 +544,58 @@ class ActivityRunDetail:
     links: List[ActivityLink] = field(default_factory=list)
     tags: List[str] = field(default_factory=list)
     traces: List[ActivityTraceLink] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class BenchmarkRun:
+    """One benchmark execution spanning one service and one or more models/cases."""
+    run_id: str
+    created_at: str
+    completed_at: Optional[str]
+    service_name: str
+    model_names_json: str
+    case_ids_json: str
+    status: str
+    notes: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class BenchmarkResult:
+    """One benchmark result for a specific service, case, and model."""
+    result_id: str
+    run_id: str
+    created_at: str
+    completed_at: Optional[str]
+    service_name: str
+    case_id: str
+    case_title: str
+    model_name: str
+    screenshot_path: Optional[str] = None
+    transcript_path: Optional[str] = None
+    response_text: Optional[str] = None
+    structured_output_json: Optional[str] = None
+    error_text: Optional[str] = None
+    prompt_tokens: Optional[int] = None
+    completion_tokens: Optional[int] = None
+    total_tokens: Optional[int] = None
+    prefill_seconds: Optional[float] = None
+    generation_seconds: Optional[float] = None
+    prefill_tokens_per_second: Optional[float] = None
+    generation_tokens_per_second: Optional[float] = None
+    token_count_method: Optional[str] = None
+    auto_score: Optional[float] = None
+    auto_score_details_json: Optional[str] = None
+    metadata_json: Optional[str] = None
+    status: str = "completed"
+
+
+@dataclass(frozen=True)
+class BenchmarkManualReview:
+    """Optional human review attached to a benchmark result."""
+    review_id: str
+    result_id: str
+    created_at: str
+    updated_at: str
+    reviewer: str
+    score: Optional[float] = None
+    notes: Optional[str] = None

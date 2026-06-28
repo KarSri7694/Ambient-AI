@@ -42,6 +42,7 @@ class SQLiteMemoryAdapter(MemoryPort):
         self.open_loop_digest_path = self.memory_root / "open_loops.md"
         self.visual_digest_path = self.memory_root / "visual_context.md"
         self.fused_context_digest_path = self.memory_root / "fused_context.md"
+        self.working_memory_path = self.memory_root.parent / "MEMORY.md"
         self.user_info_path = self.memory_root.parent / "USER_INFO.md"
         self.index_path = self.memory_root / "index.json"
 
@@ -1250,6 +1251,14 @@ class SQLiteMemoryAdapter(MemoryPort):
         if not self.user_info_path.exists():
             return ""
         return self.user_info_path.read_text(encoding="utf-8")
+
+    def save_working_memory(self, content: str) -> None:
+        self.working_memory_path.write_text(content, encoding="utf-8")
+
+    def get_working_memory(self) -> str:
+        if not self.working_memory_path.exists():
+            return ""
+        return self.working_memory_path.read_text(encoding="utf-8")
 
     def append_visual_observation(self, observation: VisualObservation) -> None:
         with self._managed_connection() as conn:

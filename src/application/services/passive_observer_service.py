@@ -29,6 +29,7 @@ Look at the current screenshot, and return JSON only with exactly these fields:
 }
 
 Rules:
+- If you see anything important on screen that the user might need to remember, set maybe_require_a_reminder to true and provide a short reminder_context. 
 - Return only those six fields. Do not add any other keys.
 - When the screen contains a chat or messaging interface, extract all the visible information most importantly infer if the user made any commitments or decisions, or something of importance is told to the user.  
 - Prefer visible facts over speculation.
@@ -317,6 +318,8 @@ Rules:
     async def _consume_stream_text(self, completion) -> str:
         parts: List[str] = []
         async for chunk in completion:
+            if not getattr(chunk, "choices", None):
+                continue
             delta = chunk.choices[0].delta
             if delta.content:
                 parts.append(delta.content)

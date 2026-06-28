@@ -7,9 +7,10 @@ import json
 from typing import Any
 
 import uvicorn
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse
 
+from infrastructure.adapter.SQLiteBenchmarkAdapter import SQLiteBenchmarkAdapter
 from infrastructure.adapter.SQLiteInteractionLogAdapter import SQLiteInteractionLogAdapter
 from infrastructure.adapter.SQLiteTaskQueueAdapter import SQLiteTaskQueueAdapter
 
@@ -95,6 +96,7 @@ def create_runtime_log_app(
     log_buffer: RuntimeLogBuffer,
     report_store: SQLiteInteractionLogAdapter | None = None,
     task_store: SQLiteTaskQueueAdapter | None = None,
+    benchmark_store: SQLiteBenchmarkAdapter | None = None,
 ) -> FastAPI:
     app = FastAPI(title="Ambient Runtime Logs")
 
@@ -156,9 +158,77 @@ def create_runtime_log_app(
                 )
         return {"reports": reports, "queued_tasks": queued_tasks, "count": len(reports)}
 
+    @app.get("/api/benchmarks/runs")
+    def get_benchmark_runs(
+        limit: int = Query(default=50, ge=1, le=200),
+        service_name: str | None = Query(default=None),
+    ) -> dict[str, Any]:
+        rows = benchmark_store.list_runs(limit=limit, service_name=service_name) if benchmark_store is not None else []
+        return {
+            "runs": [row.__dict__ for row in rows],
+            "count": len(rows),
+        }
+
+    @app.get("/api/benchmarks/results")
+    def get_benchmark_results(
+        limit: int = Query(default=200, ge=1, le=500),
+        run_id: str | None = Query(default=None),
+        service_name: str | None = Query(default=None),
+        model_name: str | None = Query(default=None),
+        case_id: str | None = Query(default=None),
+    ) -> dict[str, Any]:
+        rows = (
+            benchmark_store.list_results(
+                limit=limit,
+                run_id=run_id,
+                service_name=service_name,
+                model_name=model_name,
+                case_id=case_id,
+            )
+            if benchmark_store is not None
+            else []
+        )
+        payload: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row.__dict__)
+            review = benchmark_store.get_manual_review(row.result_id) if benchmark_store is not None else None
+            item["manual_review"] = review.__dict__ if review is not None else None
+            payload.append(item)
+        return {"results": payload, "count": len(payload)}
+
+    @app.get("/api/benchmarks/results/{result_id}")
+    def get_benchmark_result(result_id: str) -> dict[str, Any]:
+        if benchmark_store is None:
+            return {"result": None}
+        row = benchmark_store.get_result(result_id)
+        if row is None:
+            return {"result": None}
+        payload = dict(row.__dict__)
+        review = benchmark_store.get_manual_review(result_id)
+        payload["manual_review"] = review.__dict__ if review is not None else None
+        return {"result": payload}
+
+    @app.post("/api/benchmarks/results/{result_id}/review")
+    async def upsert_benchmark_review(result_id: str, request: Request) -> dict[str, Any]:
+        if benchmark_store is None:
+            return {"ok": False, "error": "benchmark_store_unavailable"}
+        body = await request.json()
+        now = datetime.now().isoformat()
+        score = body.get("score")
+        review = benchmark_store.upsert_manual_review(
+            result_id=result_id,
+            reviewer=str(body.get("reviewer") or "local-user"),
+            score=float(score) if score not in (None, "") else None,
+            notes=str(body.get("notes") or "").strip() or None,
+            created_at=now,
+            updated_at=now,
+        )
+        return {"ok": True, "review": review.__dict__}
+
     @app.get("/reports", response_class=HTMLResponse)
     @app.get("/", response_class=HTMLResponse)
     @app.get("/logs", response_class=HTMLResponse)
+    @app.get("/benchmarks", response_class=HTMLResponse)
     def view_logs() -> str:
         return """
 <!doctype html>
@@ -265,7 +335,7 @@ def create_runtime_log_app(
       gap: 16px;
       align-items: start;
     }
-    .report-card, .log-card, .task-card, .task-panel {
+    .report-card, .log-card, .task-card, .task-panel, .benchmark-card, .review-panel {
       background: var(--panel-strong);
       border: 1px solid rgba(64,50,36,0.08);
       border-radius: 24px;
@@ -376,13 +446,91 @@ def create_runtime_log_app(
     .log-level-WARNING { color: var(--warn); }
     .log-level-ERROR, .log-level-CRITICAL { color: var(--err); }
     .log-level-DEBUG { color: #275d8f; }
+    .bench-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.6fr) minmax(300px, 1fr);
+      gap: 16px;
+      align-items: start;
+    }
+    .review-panel {
+      position: sticky;
+      top: 126px;
+    }
+    .benchmark-title {
+      font-size: 1rem;
+      font-weight: 700;
+      margin: 0 0 10px;
+    }
+    .benchmark-meta {
+      color: var(--muted);
+      font-size: 0.88rem;
+      line-height: 1.55;
+      margin-bottom: 10px;
+    }
+    .benchmark-output {
+      background: rgba(248, 243, 235, 0.85);
+      border-radius: 14px;
+      padding: 12px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: Consolas, "SFMono-Regular", monospace;
+      font-size: 0.86rem;
+      max-height: 280px;
+      overflow: auto;
+    }
+    .benchmark-json {
+      margin-top: 12px;
+      border-top: 1px solid var(--line);
+      padding-top: 12px;
+    }
+    .benchmark-json details {
+      background: rgba(255,255,255,0.65);
+      border: 1px solid rgba(64,50,36,0.08);
+      border-radius: 12px;
+      padding: 10px 12px;
+      margin-top: 8px;
+    }
+    .benchmark-json summary {
+      cursor: pointer;
+      font-weight: 700;
+      color: var(--text);
+    }
+    .benchmark-json pre {
+      margin: 10px 0 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: Consolas, "SFMono-Regular", monospace;
+      font-size: 0.83rem;
+      max-height: 420px;
+      overflow: auto;
+    }
+    .review-panel input, .review-panel textarea {
+      width: 100%;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      padding: 10px 12px;
+      font: inherit;
+      background: rgba(255,255,255,0.92);
+      margin-bottom: 10px;
+    }
+    .review-panel button {
+      border: 0;
+      border-radius: 999px;
+      padding: 10px 14px;
+      background: var(--accent);
+      color: #fff8f2;
+      font-weight: 700;
+      cursor: pointer;
+    }
     @media (max-width: 640px) {
       .shell { padding: 16px 10px 32px; }
-      .report-card, .log-card, .empty, .task-card, .task-panel { border-radius: 18px; padding: 16px; }
+      .report-card, .log-card, .empty, .task-card, .task-panel, .benchmark-card, .review-panel { border-radius: 18px; padding: 16px; }
       .title { font-size: 1.18rem; }
       .report-text { font-size: 0.98rem; }
       .reports-grid { grid-template-columns: 1fr; }
+      .bench-grid { grid-template-columns: 1fr; }
       .task-panel { position: static; }
+      .review-panel { position: static; }
     }
   </style>
 </head>
@@ -392,6 +540,7 @@ def create_runtime_log_app(
     <div class="subtitle">Meaningful agent work first. Debug logs second.</div>
     <div class="tabs">
       <button class="tab active" data-tab="reports">Reports</button>
+      <button class="tab" data-tab="benchmarks">Benchmarks</button>
       <button class="tab" data-tab="logs">Logs</button>
     </div>
     <div id="status" class="status">connecting...</div>
@@ -410,6 +559,22 @@ def create_runtime_log_app(
         </aside>
       </div>
     </section>
+    <section id="benchmarksSection" class="section">
+      <div class="bench-grid">
+        <div>
+          <div id="benchmarksEmpty" class="empty">No benchmark results stored yet.</div>
+          <div id="benchmarks"></div>
+        </div>
+        <aside class="review-panel">
+          <h2 class="panel-title">Manual Review</h2>
+          <div id="reviewHint" class="meta">Select a benchmark result to review.</div>
+          <input id="reviewerInput" type="text" placeholder="Reviewer" value="local-user" />
+          <input id="scoreInput" type="number" min="0" max="1" step="0.01" placeholder="Score 0.00 - 1.00" />
+          <textarea id="notesInput" rows="8" placeholder="Manual review notes"></textarea>
+          <button id="saveReviewButton" type="button">Save Review</button>
+        </aside>
+      </div>
+    </section>
     <section id="logsSection" class="section">
       <div id="logs"></div>
     </section>
@@ -417,15 +582,25 @@ def create_runtime_log_app(
   <script>
     let latestId = 0;
     let latestReportKey = "";
+    let latestBenchmarkKey = "";
+    let selectedBenchmarkId = "";
     const logs = document.getElementById("logs");
     const reports = document.getElementById("reports");
     const reportsEmpty = document.getElementById("reportsEmpty");
     const queuedTasks = document.getElementById("queuedTasks");
     const tasksEmpty = document.getElementById("tasksEmpty");
+    const benchmarks = document.getElementById("benchmarks");
+    const benchmarksEmpty = document.getElementById("benchmarksEmpty");
+    const reviewerInput = document.getElementById("reviewerInput");
+    const scoreInput = document.getElementById("scoreInput");
+    const notesInput = document.getElementById("notesInput");
+    const reviewHint = document.getElementById("reviewHint");
+    const saveReviewButton = document.getElementById("saveReviewButton");
     const status = document.getElementById("status");
     const tabs = Array.from(document.querySelectorAll(".tab"));
     const sections = {
       reports: document.getElementById("reportsSection"),
+      benchmarks: document.getElementById("benchmarksSection"),
       logs: document.getElementById("logsSection"),
     };
 
@@ -504,6 +679,53 @@ def create_runtime_log_app(
       }
     }
 
+    function renderBenchmarks(items) {
+      benchmarks.innerHTML = "";
+      benchmarksEmpty.style.display = items.length ? "none" : "block";
+      for (const item of items) {
+        const card = document.createElement("article");
+        card.className = "benchmark-card";
+        card.dataset.resultId = item.result_id;
+        const review = item.manual_review || {};
+        const output = item.response_text || item.error_text || item.structured_output_json || "";
+        const structuredJson = item.structured_output_json || "";
+        const metadataJson = item.metadata_json || "";
+        const scoreJson = item.auto_score_details_json || "";
+        card.innerHTML = `
+          <div class="report-top">
+            <div class="chips">
+              <span class="chip">${item.status || "completed"}</span>
+              <span class="chip">${item.service_name || ""}</span>
+            </div>
+            <div class="meta">${new Date(item.created_at).toLocaleString()}</div>
+          </div>
+          <h2 class="benchmark-title">${item.case_title || item.case_id}</h2>
+          <div class="benchmark-meta">
+            <div><strong>Model:</strong> ${item.model_name || "unknown"}</div>
+            <div><strong>Auto score:</strong> ${item.auto_score ?? "n/a"}</div>
+            <div><strong>Prefill speed:</strong> ${item.prefill_tokens_per_second ?? 0} tok/s</div>
+            <div><strong>Total tokens:</strong> ${item.total_tokens ?? 0}</div>
+            <div><strong>Generation speed:</strong> ${item.generation_tokens_per_second ?? 0} tok/s</div>
+            <div><strong>Manual score:</strong> ${review.score ?? "n/a"}</div>
+          </div>
+          <div class="benchmark-output">${output}</div>
+          <div class="benchmark-json">
+            ${structuredJson ? `<details><summary>Structured Output JSON</summary><pre>${structuredJson}</pre></details>` : ""}
+            ${scoreJson ? `<details><summary>Auto Score Details</summary><pre>${scoreJson}</pre></details>` : ""}
+            ${metadataJson ? `<details><summary>Benchmark Metadata</summary><pre>${metadataJson}</pre></details>` : ""}
+          </div>
+        `;
+        card.addEventListener("click", () => {
+          selectedBenchmarkId = item.result_id;
+          reviewerInput.value = review.reviewer || "local-user";
+          scoreInput.value = review.score ?? "";
+          notesInput.value = review.notes || "";
+          reviewHint.textContent = `Reviewing ${item.case_id} on ${item.model_name}`;
+        });
+        benchmarks.appendChild(card);
+      }
+    }
+
     async function pollReports() {
       const res = await fetch(`/api/reports?limit=50`, { cache: "no-store" });
       const payload = await res.json();
@@ -518,11 +740,45 @@ def create_runtime_log_app(
       }
     }
 
+    async function pollBenchmarks() {
+      const res = await fetch(`/api/benchmarks/results?limit=100`, { cache: "no-store" });
+      const payload = await res.json();
+      const serialized = JSON.stringify(payload.results || []);
+      if (serialized !== latestBenchmarkKey) {
+        latestBenchmarkKey = serialized;
+        renderBenchmarks(payload.results || []);
+      }
+    }
+
+    saveReviewButton.addEventListener("click", async () => {
+      if (!selectedBenchmarkId) {
+        reviewHint.textContent = "Select a benchmark result before saving a review.";
+        return;
+      }
+      const response = await fetch(`/api/benchmarks/results/${selectedBenchmarkId}/review`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          reviewer: reviewerInput.value,
+          score: scoreInput.value,
+          notes: notesInput.value,
+        }),
+      });
+      const payload = await response.json();
+      if (payload.ok) {
+        reviewHint.textContent = "Manual review saved.";
+        await pollBenchmarks();
+      } else {
+        reviewHint.textContent = "Failed to save manual review.";
+      }
+    });
+
     async function poll() {
       try {
         const [logRes] = await Promise.all([
           fetch(`/api/logs?after_id=${latestId}&limit=500`, { cache: "no-store" }),
           pollReports(),
+          pollBenchmarks(),
         ]);
         const payload = await logRes.json();
         for (const entry of payload.entries || []) {
@@ -555,6 +811,7 @@ def start_runtime_log_server(
     max_entries: int = 2000,
     report_store: SQLiteInteractionLogAdapter | None = None,
     task_store: SQLiteTaskQueueAdapter | None = None,
+    benchmark_store: SQLiteBenchmarkAdapter | None = None,
 ) -> RuntimeLogBuffer:
     global _SERVER_THREAD
     log_buffer = configure_runtime_log_streaming(max_entries=max_entries)
@@ -562,7 +819,12 @@ def start_runtime_log_server(
         if _SERVER_THREAD is not None and _SERVER_THREAD.is_alive():
             return log_buffer
 
-        app = create_runtime_log_app(log_buffer, report_store=report_store, task_store=task_store)
+        app = create_runtime_log_app(
+            log_buffer,
+            report_store=report_store,
+            task_store=task_store,
+            benchmark_store=benchmark_store,
+        )
 
         def _serve() -> None:
             config = uvicorn.Config(

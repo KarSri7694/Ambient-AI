@@ -321,6 +321,7 @@ class PassiveObserverTests(unittest.TestCase):
                     {
                         "action": "queue_task",
                         "task": "draft a reply email",
+                        "memory_updates": ["User has an unfinished email reply that may need follow-up soon."],
                         "user_info_updates": [],
                     }
                 ),
@@ -328,7 +329,8 @@ class PassiveObserverTests(unittest.TestCase):
                     {
                         "action": "do_now",
                         "task": "search current TV prices",
-                        "user_info_updates": ["User is actively comparing TV options online."],
+                        "memory_updates": ["User may want a near-term TV price check."],
+                        "user_info_updates": ["User compares TV options carefully before purchase."],
                     }
                 ),
             ]
@@ -353,7 +355,14 @@ class PassiveObserverTests(unittest.TestCase):
         ])
         self.assertEqual(result["queued_activities"], ["draft a reply email"])
         self.assertEqual(result["do_now_activities"], ["search current TV prices"])
-        self.assertEqual(result["user_info_updates"], ["User is actively comparing TV options online."])
+        self.assertEqual(
+            result["memory_updates"],
+            [
+                "User has an unfinished email reply that may need follow-up soon.",
+                "User may want a near-term TV price check.",
+            ],
+        )
+        self.assertEqual(result["user_info_updates"], ["User compares TV options carefully before purchase."])
         self.assertIn("scrolling through a social media feed", result["ignored_activities"])
         self.assertEqual(len(task_queue.items), 1)
         self.assertIn("draft a reply email", task_queue.items[0].description)
@@ -362,7 +371,9 @@ class PassiveObserverTests(unittest.TestCase):
         self.assertEqual(task_queue.items[0].metadata["activity"], "writing an email reply")
         self.assertEqual(task_queue.items[0].metadata["task"], "draft a reply email")
         self.assertCountEqual(task_queue.items[0].metadata["source_observation_ids"], ["obs-1", "obs-2"])
-        self.assertIn("User is actively comparing TV options online.", self.memory.get_user_info())
+        self.assertIn("User compares TV options carefully before purchase.", self.memory.get_user_info())
+        self.assertIn("User has an unfinished email reply", self.memory.get_working_memory())
+        self.assertIn("near-term TV price check", self.memory.get_working_memory())
         decision_payload = llm.calls[2]["payload"]
         self.assertEqual(decision_payload["activity"], "writing an email reply")
         self.assertTrue(all(item["app_name"] == "Gmail" for item in decision_payload["observation_context"]))
@@ -507,11 +518,13 @@ class PassiveObserverTests(unittest.TestCase):
                         "entries": [
                             {
                                 "note": "User may be preparing for an upcoming PLISP test.",
+                                "bucket": "memory",
                                 "category": "education",
                                 "confidence": 0.91,
                             },
                             {
                                 "note": "User is actively comparing TVs before purchase.",
+                                "bucket": "user_info",
                                 "category": "interest",
                                 "confidence": 0.88,
                             },
@@ -527,9 +540,10 @@ class PassiveObserverTests(unittest.TestCase):
         self.assertEqual(result["processed_observation_ids"], ["obs-bio-2", "obs-bio-1"])
         self.assertEqual(len(result["entries"]), 2)
         user_info = self.memory.get_user_info()
+        working_memory = self.memory.get_working_memory()
         self.assertIn("Existing user note.", user_info)
-        self.assertIn("[education] User may be preparing for an upcoming PLISP test.", user_info)
         self.assertIn("[interest] User is actively comparing TVs before purchase.", user_info)
+        self.assertIn("[education] User may be preparing for an upcoming PLISP test.", working_memory)
         persisted_first = self.memory.get_visual_observation("obs-bio-1")
         persisted_second = self.memory.get_visual_observation("obs-bio-2")
         self.assertIsNotNone(persisted_first)
@@ -562,6 +576,7 @@ class PassiveObserverTests(unittest.TestCase):
                         "entries": [
                             {
                                 "note": "User is interested in internship opportunities.",
+                                "bucket": "user_info",
                                 "category": "work",
                                 "confidence": 0.82,
                             }

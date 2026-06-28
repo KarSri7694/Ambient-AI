@@ -5,6 +5,7 @@ import logging
 import copy
 import json
 import time
+import re
 from datetime import datetime
 
 from application.ports.LLMProvider import LLMProvider
@@ -87,6 +88,56 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         response.raise_for_status()
         payload = response.json()
         return payload.get("data", [])
+
+    def count_text_tokens(self, text: str, model_name: Optional[str] = None) -> int:
+        """Count text tokens using llama.cpp when available, else fall back to a stable estimate."""
+        payload: Dict[str, Any] = {
+            "content": text or "",
+            "add_special": False,
+            "with_pieces": False,
+        }
+        target_model = model_name or self.currently_loaded_model or self.get_current_model()
+        if target_model:
+            payload["model"] = target_model
+        try:
+            response = requests.post(f"{self.base_url}/tokenize", json=payload, timeout=15)
+            response.raise_for_status()
+            data = response.json()
+            tokens = data.get("tokens", [])
+            if isinstance(tokens, list):
+                return len(tokens)
+        except requests.RequestException:
+            pass
+        return max(1, len(text or "") // 4) if text else 0
+
+    def count_message_tokens(
+        self,
+        messages: List[Dict[str, Any]],
+        image: str = "",
+        model_name: Optional[str] = None,
+    ) -> int:
+        """Estimate prompt tokens by normalizing messages, then asking llama.cpp to tokenize the rendered text."""
+        rendered_parts: List[str] = []
+        for message in messages:
+            role = str(message.get("role", "")).strip() or "unknown"
+            content = message.get("content", "")
+            if isinstance(content, list):
+                flattened: List[str] = []
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        flattened.append(str(item.get("text", "")))
+                    elif isinstance(item, dict) and item.get("type") == "image_url":
+                        flattened.append("[image]")
+                    else:
+                        flattened.append(str(item))
+                content_text = "\n".join(part for part in flattened if part)
+            else:
+                content_text = str(content)
+            rendered_parts.append(f"{role}: {content_text}")
+        if image:
+            rendered_parts.append("user: [image-attached]")
+        rendered_prompt = "\n".join(rendered_parts)
+        return self.count_text_tokens(rendered_prompt, model_name=model_name)
 
     def _set_loaded_model_state(self, model_name: Optional[str]) -> None:
         self.currently_loaded_model = model_name
@@ -369,9 +420,9 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
         image: str = "",
-        temperature: float = 0.7,
-        top_p: float = 0.95,
-        top_k: int = 0,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
     ) -> Iterator:
         """
         Create a streaming chat completion through the OpenAI-compatible API.
@@ -409,13 +460,17 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
             "model": model,
             "messages": copy_messages,
             "stream": True,
-            "temperature": temperature,
-            "top_p": top_p,
+            "stream_options": {"include_usage": True},
         }
-        extra_body: Dict[str, Any] = {"enable_thinking": False}
-        if top_k > 0:
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+        if top_p is not None:
+            kwargs["top_p"] = top_p
+        extra_body: Dict[str, Any] = {}
+        if top_k is not None and top_k > 0:
             extra_body["top_k"] = top_k
-        kwargs["extra_body"] = extra_body
+        if extra_body:
+            kwargs["extra_body"] = extra_body
         if tools:
             kwargs["tools"] = tools
 
