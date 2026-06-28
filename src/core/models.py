@@ -599,3 +599,80 @@ class BenchmarkManualReview:
     reviewer: str
     score: Optional[float] = None
     notes: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class TrainingLLMRecord:
+    """A raw persisted LLM interaction staged for human review and export."""
+    record_id: str
+    interaction_id: str
+    interaction_run_id: Optional[str]
+    created_at: str
+    completed_at: Optional[str]
+    source: str
+    model: str
+    messages_json: str
+    tools_json: Optional[str] = None
+    image_path: Optional[str] = None
+    response_text: Optional[str] = None
+    reasoning_text: Optional[str] = None
+    tool_calls_json: Optional[str] = None
+    error_text: Optional[str] = None
+    duration_ms: Optional[int] = None
+    metadata_json: Optional[str] = None
+    report_json: Optional[str] = None
+    review_status: str = "pending"
+    review_updated_at: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class TrainingLLMReview:
+    """A reviewer-authored correction or approval for one LLM interaction."""
+    review_id: str
+    record_id: str
+    created_at: str
+    updated_at: str
+    reviewer: str
+    status: str
+    corrected_response_text: Optional[str] = None
+    corrected_reasoning_text: Optional[str] = None
+    corrected_messages_json: Optional[str] = None
+    notes: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class TrainingASRRecord:
+    """A raw ASR transcript/audio pair staged for human review and export."""
+    record_id: str
+    transcript_path: str
+    created_at: str
+    transcript_text: str
+    upload_audio_path: Optional[str] = None
+    cleaned_audio_path: Optional[str] = None
+    metadata_json: Optional[str] = None
+    review_status: str = "pending"
+    review_updated_at: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class TrainingASRReview:
+    """A reviewer-authored correction or approval for one ASR transcript."""
+    review_id: str
+    record_id: str
+    created_at: str
+    updated_at: str
+    reviewer: str
+    status: str
+    corrected_transcript_text: Optional[str] = None
+    notes: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class TrainingDatasetExport:
+    """A materialized export snapshot for downstream fine-tuning."""
+    export_id: str
+    dataset_kind: str
+    created_at: str
+    output_path: str
+    record_count: int
+    metadata_json: Optional[str] = None

@@ -13,6 +13,7 @@ from application.services.passive_observer_service import PassiveObserverService
 from application.services.semantic_memory_service import SemanticMemoryService
 from application.services.screenshot_queue_service import ScreenshotQueueService
 from application.services.system_idle_service import SystemIdleService
+from application.services.training_data_service import TrainingDataService
 from application.services.user_bio_data_service import UserBioDataService
 from audio_agent import AudioAgentService
 from infrastructure.adapter.LlamaCppSemanticAdapter import LlamaCppSemanticAdapter
@@ -24,6 +25,7 @@ from infrastructure.adapter.SQLiteBenchmarkAdapter import SQLiteBenchmarkAdapter
 from infrastructure.adapter.SQLiteInteractionLogAdapter import SQLiteInteractionLogAdapter
 from infrastructure.adapter.SQLiteMemoryAdapter import SQLiteMemoryAdapter
 from infrastructure.adapter.SQLiteTaskQueueAdapter import SQLiteTaskQueueAdapter
+from infrastructure.adapter.SQLiteTrainingDataAdapter import SQLiteTrainingDataAdapter
 from infrastructure.adapter.SQLiteVoiceAdapter import SQLiteVoiceAdapter
 from infrastructure.adapter.TodoistTaskAdapter import TodoistTaskAdapter
 from infrastructure.runtime_log_server import (
@@ -55,6 +57,10 @@ MEMORY_ROOT = USER_DATA_DIR / "memory"
 MEMORY_DB_PATH = USER_DATA_DIR / "database" / "memory.db"
 INTERACTION_LOG_DB_PATH = USER_DATA_DIR / "database" / "interaction_logs.db"
 BENCHMARK_DB_PATH = Path(CONFIG.get_str("benchmarking", "db_path", str(PROJECT_ROOT / "database" / "benchmarking.db")))
+TRAINING_DATA_ROOT = Path(CONFIG.get_str("training_data", "root", "D:\\TRAINING_DATA"))
+TRAINING_DATA_DB_PATH = Path(
+    CONFIG.get_str("training_data", "db_path", str(TRAINING_DATA_ROOT / "database" / "training_data.db"))
+)
 CURRENT_RESPONSE_PATH = PROJECT_ROOT / "database" / "current_llm_response.md"
 ARTIFACTS_ROOT = USER_DATA_DIR / "artifacts"
 VOICE_DB_PATH = USER_DATA_DIR / "database" / "voice_database.db"
@@ -71,6 +77,9 @@ LOG_API_PORT = CONFIG.get_int("log_api", "port", 8765)
 LOG_API_BUFFER_SIZE = CONFIG.get_int("log_api", "buffer_size", 2000)
 MCP_CONFIG_PATH = CONFIG.get_str("runtime", "mcp_config_path", "mcp.json")
 TODOIST_ENABLED = CONFIG.get_bool("todoist", "enabled", True)
+UPLOADS_DIR = Path(CONFIG.get_str("audio", "uploads_dir", str(USER_DATA_DIR / "uploads")))
+TRANSCRIPTIONS_DIR = Path(CONFIG.get_str("audio", "transcriptions_dir", str(USER_DATA_DIR / "transcriptions")))
+CLEANED_AUDIO_DIR = Path(CONFIG.get_str("audio", "cleaned_audio_dir", str(USER_DATA_DIR / "cleaned_audio")))
 REFLECTION_ENABLED = CONFIG.get_bool("reflection", "enabled", True)
 REFLECTION_CADENCE_MODE = CONFIG.get_str("reflection", "cadence_mode", "daily")
 REFLECTION_INTERVAL_HOURS = CONFIG.get_int("reflection", "interval_hours", 24)
@@ -98,6 +107,7 @@ def ensure_runtime_databases() -> None:
     SQLiteMemoryAdapter(db_path=str(MEMORY_DB_PATH), memory_root=str(MEMORY_ROOT))
     SQLiteInteractionLogAdapter(db_path=str(INTERACTION_LOG_DB_PATH))
     SQLiteBenchmarkAdapter(db_path=str(BENCHMARK_DB_PATH))
+    SQLiteTrainingDataAdapter(db_path=str(TRAINING_DATA_DB_PATH))
     SQLiteVoiceAdapter(str(VOICE_DB_PATH))
     night_mode.init_db()
 
@@ -578,13 +588,27 @@ class AmbientRuntime:
 
 if __name__ == "__main__":
     if LOG_API_ENABLED:
+        interaction_store = SQLiteInteractionLogAdapter(db_path=str(INTERACTION_LOG_DB_PATH))
+        training_store = SQLiteTrainingDataAdapter(db_path=str(TRAINING_DATA_DB_PATH))
+        training_service = TrainingDataService(
+            store=training_store,
+            interaction_store=interaction_store,
+            training_root=str(TRAINING_DATA_ROOT),
+            user_data_dir=str(USER_DATA_DIR),
+            uploads_dir=str(UPLOADS_DIR),
+            transcripts_dir=str(TRANSCRIPTIONS_DIR),
+            cleaned_audio_dir=str(CLEANED_AUDIO_DIR),
+        )
         start_runtime_log_server(
             host=LOG_API_HOST,
             port=LOG_API_PORT,
             max_entries=LOG_API_BUFFER_SIZE,
-            report_store=SQLiteInteractionLogAdapter(db_path=str(INTERACTION_LOG_DB_PATH)),
+            report_store=interaction_store,
             task_store=SQLiteTaskQueueAdapter(),
             benchmark_store=SQLiteBenchmarkAdapter(db_path=str(BENCHMARK_DB_PATH)),
+            training_store=training_store,
+            training_service=training_service,
+            media_roots=[str(USER_DATA_DIR), str(TRAINING_DATA_ROOT)],
         )
         logger.info("Runtime log server started at http://%s:%s/logs", LOG_API_HOST, LOG_API_PORT)
 

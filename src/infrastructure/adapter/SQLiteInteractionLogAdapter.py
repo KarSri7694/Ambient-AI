@@ -139,6 +139,32 @@ class SQLiteInteractionLogAdapter:
             rows = conn.execute(query, params).fetchall()
         return [self._from_row(row) for row in rows]
 
+    def list_entries(
+        self,
+        *,
+        limit: int = 500,
+        offset: int = 0,
+        source: Optional[str] = None,
+    ) -> List[InteractionLogEntry]:
+        query = "SELECT * FROM interaction_logs"
+        params: List[object] = []
+        if source:
+            query += " WHERE source = ?"
+            params.append(source)
+        query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+        with self._managed_connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [self._from_row(row) for row in rows]
+
+    def get_by_interaction_id(self, interaction_id: str) -> Optional[InteractionLogEntry]:
+        with self._managed_connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM interaction_logs WHERE interaction_id = ?",
+                (interaction_id,),
+            ).fetchone()
+        return self._from_row(row) if row is not None else None
+
     def list_recent_reports(self, limit: int = 50) -> List[InteractionLogEntry]:
         with self._managed_connection() as conn:
             rows = conn.execute(

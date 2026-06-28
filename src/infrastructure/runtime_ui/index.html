@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ambient Agent Dashboard</title>
+  <link rel="stylesheet" href="/runtime-ui/styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand-block">
+        <div class="eyebrow">Runtime Console</div>
+        <h1>Ambient Agent</h1>
+      </div>
+      <nav class="tabs" aria-label="Dashboard sections">
+        <button class="tab active" data-tab="reports" type="button">Reports</button>
+        <button class="tab" data-tab="benchmarks" type="button">Benchmarks</button>
+        <button class="tab" data-tab="training" type="button">Training</button>
+        <button class="tab" data-tab="logs" type="button">Logs</button>
+      </nav>
+      <div class="status-wrap">
+        <span class="live-dot" aria-hidden="true"></span>
+        <span id="status">connecting...</span>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section id="reportsSection" class="section active">
+        <div class="section-head">
+          <div>
+            <p class="section-kicker">Agent output</p>
+            <h2>Reports</h2>
+          </div>
+          <div class="metric-strip">
+            <div><span id="reportsCount">0</span><small>Reports</small></div>
+            <div><span id="tasksCount">0</span><small>Tasks</small></div>
+          </div>
+        </div>
+        <div class="split-grid reports-grid">
+          <div class="pane">
+            <div id="reportsEmpty" class="empty-state">No user-relevant agent reports yet.</div>
+            <div id="reports" class="record-stack"></div>
+          </div>
+          <aside class="side-pane">
+            <div class="panel-head">
+              <h3>Queued Tasks</h3>
+            </div>
+            <div id="tasksEmpty" class="empty-state compact">No queued tasks right now.</div>
+            <div id="queuedTasks" class="record-stack"></div>
+          </aside>
+        </div>
+      </section>
+
+      <section id="benchmarksSection" class="section">
+        <div class="section-head">
+          <div>
+            <p class="section-kicker">Model evaluation</p>
+            <h2>Benchmarks</h2>
+          </div>
+          <div class="metric-strip">
+            <div><span id="benchmarksCount">0</span><small>Results</small></div>
+          </div>
+        </div>
+        <div class="split-grid">
+          <div class="pane">
+            <div id="benchmarksEmpty" class="empty-state">No benchmark results stored yet.</div>
+            <div id="benchmarks" class="record-stack"></div>
+          </div>
+          <aside class="side-pane review-pane">
+            <div class="panel-head">
+              <h3>Manual Review</h3>
+            </div>
+            <div id="reviewHint" class="hint">Select a benchmark result to review.</div>
+            <label>Reviewer<input id="reviewerInput" type="text" value="local-user" /></label>
+            <label>Score<input id="scoreInput" type="number" min="0" max="1" step="0.01" placeholder="0.00 - 1.00" /></label>
+            <label>Notes<textarea id="notesInput" rows="8" placeholder="Manual review notes"></textarea></label>
+            <button id="saveReviewButton" class="button primary" type="button">Save Review</button>
+          </aside>
+        </div>
+      </section>
+
+      <section id="trainingSection" class="section">
+        <div class="section-head">
+          <div>
+            <p class="section-kicker">Fine-tuning data</p>
+            <h2>Training Review</h2>
+          </div>
+          <div class="toolbar">
+            <div class="segmented" role="group" aria-label="Training mode">
+              <button id="modeLlm" class="mode-tab active" type="button">LLM</button>
+              <button id="modeAsr" class="mode-tab" type="button">ASR</button>
+            </div>
+            <button id="syncTrainingButton" class="button primary" type="button">Sync</button>
+            <button id="exportTrainingButton" class="button" type="button">Export Approved</button>
+          </div>
+        </div>
+        <div class="split-grid training-grid">
+          <div class="pane">
+            <div class="filter-bar" aria-label="Training filters">
+              <label>Status
+                <select id="trainingFilterStatus">
+                  <option value="">All statuses</option>
+                  <option value="pending">pending</option>
+                  <option value="approved">approved</option>
+                  <option value="rejected">rejected</option>
+                </select>
+              </label>
+              <label id="trainingFilterSourceWrap">Source
+                <input id="trainingFilterSource" type="search" placeholder="Any source" />
+              </label>
+              <label id="trainingFilterModelWrap">Model
+                <input id="trainingFilterModel" type="search" placeholder="Any model" />
+              </label>
+              <button id="applyTrainingFiltersButton" class="button primary" type="button">Apply</button>
+              <button id="clearTrainingFiltersButton" class="button" type="button">Clear</button>
+            </div>
+            <div id="trainingEmpty" class="empty-state">No training records synced yet.</div>
+            <div id="trainingRecords" class="record-stack"></div>
+          </div>
+          <aside class="side-pane review-pane">
+            <div class="panel-head">
+              <h3>Record Editor</h3>
+            </div>
+            <div id="trainingHint" class="hint">Select a record to inspect and correct.</div>
+            <div id="trainingViewer" class="viewer"></div>
+            <div class="form-grid">
+              <label>Reviewer<input id="trainingReviewerInput" type="text" value="local-user" /></label>
+              <label>Status
+                <select id="trainingStatusInput">
+                  <option value="pending">pending</option>
+                  <option value="approved">approved</option>
+                  <option value="rejected">rejected</option>
+                </select>
+              </label>
+            </div>
+            <label>Correction<textarea id="trainingPrimaryText" rows="10" placeholder="Corrected response or transcript"></textarea></label>
+            <div id="trainingPrimaryHelp" class="field-help">Use this for the final answer/transcript you want the model to learn.</div>
+            <label>Secondary correction<textarea id="trainingSecondaryText" rows="5" placeholder="Corrected reasoning or messages JSON"></textarea></label>
+            <div id="trainingSecondaryHelp" class="field-help">Optional for LLM records. Leave blank unless you want to preserve corrected reasoning.</div>
+            <label>Notes<textarea id="trainingNotesInput" rows="5" placeholder="Review notes"></textarea></label>
+            <button id="saveTrainingReviewButton" class="button primary" type="button">Save Training Review</button>
+            <div id="trainingExports" class="exports"></div>
+          </aside>
+        </div>
+      </section>
+
+      <section id="logsSection" class="section">
+        <div class="section-head">
+          <div>
+            <p class="section-kicker">Live runtime</p>
+            <h2>Logs</h2>
+          </div>
+          <div class="metric-strip">
+            <div><span id="logsCount">0</span><small>Lines</small></div>
+          </div>
+        </div>
+        <div id="logs" class="log-stream"></div>
+      </section>
+    </main>
+  </div>
+  <div id="imageLightbox" class="image-lightbox" aria-hidden="true">
+    <div class="image-lightbox-backdrop" data-lightbox-close></div>
+    <div class="image-lightbox-panel" role="dialog" aria-modal="true" aria-label="Expanded screenshot preview">
+      <button id="imageLightboxClose" class="lightbox-close" type="button" aria-label="Close expanded image">Close</button>
+      <img id="imageLightboxImage" alt="Expanded screenshot preview" />
+    </div>
+  </div>
+  <script src="/runtime-ui/dashboard.js" defer></script>
+</body>
+</html>
