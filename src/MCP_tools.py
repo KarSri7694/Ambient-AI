@@ -1,6 +1,8 @@
 import requests
 from fastmcp import FastMCP
 from todoist_api_python.api import TodoistAPI
+import asyncio
+import json
 import os
 import sqlite3
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -15,7 +17,12 @@ import serpapi
 import night_mode
 from utils.threading_util import run_async
 import yt_dlp
+from application.services.semantic_deduplication_service import SemanticDeduplicationService
+from config import CONFIG
+from infrastructure.adapter.LoggingLLMProvider import LoggingLLMProvider
 from infrastructure.adapter.llamaCppAdapter import LlamaCppAdapter
+from infrastructure.adapter.SQLiteInteractionLogAdapter import SQLiteInteractionLogAdapter
+from infrastructure.adapter.SQLiteMemoryAdapter import SQLiteMemoryAdapter
 import csv
 import subprocess
 
@@ -27,6 +34,86 @@ SERPAPI_API_KEY = os.environ.get("SERPAPI_API_KEY")
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 SCOPES = ['https://www.googleapis.com/auth/calendar.events']
+USER_DATA_DIR = CONFIG.get_str("runtime", "user_data_dir", "D:\\USER_DATA")
+MEMORY_DB_PATH = os.path.join(USER_DATA_DIR, "database", "memory.db")
+MEMORY_ROOT = os.path.join(USER_DATA_DIR, "memory")
+INTERACTION_LOG_DB_PATH = os.path.join(USER_DATA_DIR, "database", "interaction_logs.db")
+SEMANTIC_DEDUPE_MODEL = CONFIG.get_model("model", CONFIG.get_str("runtime", "default_model", ""), section="semantic_dedupe")
+SEMANTIC_DEDUPE_ENABLED = CONFIG.get_bool("semantic_dedupe", "enabled", True)
+SEMANTIC_DEDUPE_CANDIDATE_LIMIT = CONFIG.get_int("semantic_dedupe", "candidate_limit", 8)
+SEMANTIC_DEDUPE_DEFAULT_TTL_SECONDS = CONFIG.get_int("semantic_dedupe", "default_ttl_seconds", 604800)
+SEMANTIC_DEDUPE_TTL_BY_KIND = {
+    "todoist_reminder": CONFIG.get_int("semantic_dedupe", "todoist_reminder_ttl_seconds", 7 * 24 * 60 * 60),
+    "internal_task": CONFIG.get_int("semantic_dedupe", "internal_task_ttl_seconds", 24 * 60 * 60),
+    "reflection_task": CONFIG.get_int("semantic_dedupe", "reflection_task_ttl_seconds", 7 * 24 * 60 * 60),
+    "do_now_action": CONFIG.get_int("semantic_dedupe", "do_now_action_ttl_seconds", 2 * 60 * 60),
+    "calendar_event": CONFIG.get_int("semantic_dedupe", "calendar_event_ttl_seconds", 14 * 24 * 60 * 60),
+}
+
+
+def _build_semantic_dedupe_service() -> SemanticDeduplicationService:
+    return SemanticDeduplicationService(
+        memory=SQLiteMemoryAdapter(db_path=MEMORY_DB_PATH, memory_root=MEMORY_ROOT),
+        llm_provider=LoggingLLMProvider(
+            provider=LlamaCppAdapter(
+                base_url=CONFIG.get_str("runtime", "api_base_url", "http://localhost:8080"),
+                api_key=CONFIG.get_str("runtime", "api_key", "testkey"),
+            ),
+            log_store=SQLiteInteractionLogAdapter(db_path=INTERACTION_LOG_DB_PATH),
+            current_response_path=None,
+        ),
+        enabled=SEMANTIC_DEDUPE_ENABLED,
+        model=SEMANTIC_DEDUPE_MODEL,
+        candidate_limit=SEMANTIC_DEDUPE_CANDIDATE_LIMIT,
+        default_ttl_seconds=SEMANTIC_DEDUPE_DEFAULT_TTL_SECONDS,
+        per_entity_ttl_seconds=SEMANTIC_DEDUPE_TTL_BY_KIND,
+    )
+
+
+def _evaluate_creation_candidate(*, entity_kind: str, source_kind: str, text: str, metadata: dict | None = None) -> dict:
+    return asyncio.run(
+        _build_semantic_dedupe_service().evaluate_candidate(
+            entity_kind=entity_kind,
+            source_kind=source_kind,
+            text=text,
+            metadata=metadata or {},
+            model=SEMANTIC_DEDUPE_MODEL,
+        )
+    )
+
+
+def _record_created_candidate(
+    *,
+    entity_kind: str,
+    source_kind: str,
+    text: str,
+    metadata: dict | None = None,
+    provider_ref: str | None = None,
+) -> None:
+    _build_semantic_dedupe_service().record_created(
+        entity_kind=entity_kind,
+        source_kind=source_kind,
+        text=text,
+        metadata=metadata or {},
+        provider_ref=provider_ref,
+    )
+
+
+def _record_skipped_candidate(
+    *,
+    entity_kind: str,
+    source_kind: str,
+    text: str,
+    duplicate_of_item_id: str | None,
+    metadata: dict | None = None,
+) -> None:
+    _build_semantic_dedupe_service().record_skipped_duplicate(
+        entity_kind=entity_kind,
+        source_kind=source_kind,
+        text=text,
+        duplicate_of_item_id=duplicate_of_item_id,
+        metadata=metadata or {},
+    )
 
 
 def read_model_details() -> list[dict[str, str]]:
@@ -112,8 +199,35 @@ def add_task(content :Annotated[str, "The content of the reminder/to-do to be ad
     api = TodoistAPI(TODOIST_API_TOKEN)
     try:
         parsed_due_date_time = datetime.datetime.fromisoformat(due_datetime)
+        metadata = {"due_datetime": parsed_due_date_time.isoformat()}
+        dedupe = _evaluate_creation_candidate(
+            entity_kind="todoist_reminder",
+            source_kind="mcp_add_task",
+            text=content,
+            metadata=metadata,
+        )
+        if dedupe["decision"] != "create_new":
+            _record_skipped_candidate(
+                entity_kind="todoist_reminder",
+                source_kind="mcp_add_task",
+                text=content,
+                duplicate_of_item_id=dedupe.get("duplicate_of_item_id"),
+                metadata={
+                    **metadata,
+                    "dedupe_reason": dedupe.get("reason"),
+                    "dedupe_confidence": dedupe.get("confidence"),
+                },
+            )
+            return {"Task Status": "Skipped Duplicate", "duplicate_of_item_id": dedupe.get("duplicate_of_item_id")}
         task = api.add_task(content = content, due_datetime=parsed_due_date_time)
         if task is not None:
+            _record_created_candidate(
+                entity_kind="todoist_reminder",
+                source_kind="mcp_add_task",
+                text=content,
+                metadata=metadata,
+                provider_ref=str(getattr(task, "id", "")).strip() or None,
+            )
             return {"Task Status": "Success", "Task ID": task.id, "Content": task.content, "Due Date": task.due}
         else:
             return {"error": "Failed to add task"}
@@ -172,6 +286,35 @@ def schedule_meeting(title: Annotated[str, "Title of the meeting"] = None,
     }
 
     try:
+        metadata = {
+            "schedule_info": {
+                "date": date,
+                "time": time,
+                "duration_minutes": duration_minutes,
+                "participants": participants or [],
+                "start_iso": start_iso,
+                "end_iso": end_iso,
+            }
+        }
+        dedupe = _evaluate_creation_candidate(
+            entity_kind="calendar_event",
+            source_kind="mcp_schedule_meeting",
+            text=title,
+            metadata=metadata,
+        )
+        if dedupe["decision"] != "create_new":
+            _record_skipped_candidate(
+                entity_kind="calendar_event",
+                source_kind="mcp_schedule_meeting",
+                text=title,
+                duplicate_of_item_id=dedupe.get("duplicate_of_item_id"),
+                metadata={
+                    **metadata,
+                    "dedupe_reason": dedupe.get("reason"),
+                    "dedupe_confidence": dedupe.get("confidence"),
+                },
+            )
+            return {"status": "Skipped Duplicate", "duplicate_of_item_id": dedupe.get("duplicate_of_item_id")}
         service = get_calendar_service()
         event = service.events().insert(
             calendarId='primary',
@@ -181,6 +324,13 @@ def schedule_meeting(title: Annotated[str, "Title of the meeting"] = None,
         ).execute()
 
         meet_link = event.get('hangoutLink') or (event.get('conferenceData') or {}).get('entryPoints', [{}])[0].get('uri')
+        _record_created_candidate(
+            entity_kind="calendar_event",
+            source_kind="mcp_schedule_meeting",
+            text=title,
+            metadata=metadata,
+            provider_ref=str(event.get('id', '')).strip() or None,
+        )
         return {"eventId": event.get('id'), "meetLink": meet_link}
     except Exception as e:
         return {"error": str(e)}
@@ -216,7 +366,33 @@ def queue_night_task(
     Add a task to the night queue for later processing.
     """
     try:
+        metadata = {"priority": priority, "task_kind": "night_queue"}
+        dedupe = _evaluate_creation_candidate(
+            entity_kind="internal_task",
+            source_kind="mcp_queue_night_task",
+            text=task_description,
+            metadata=metadata,
+        )
+        if dedupe["decision"] != "create_new":
+            _record_skipped_candidate(
+                entity_kind="internal_task",
+                source_kind="mcp_queue_night_task",
+                text=task_description,
+                duplicate_of_item_id=dedupe.get("duplicate_of_item_id"),
+                metadata={
+                    **metadata,
+                    "dedupe_reason": dedupe.get("reason"),
+                    "dedupe_confidence": dedupe.get("confidence"),
+                },
+            )
+            return f"Skipped duplicate night task: {task_description}"
         night_mode.add_task(task_description, priority)
+        _record_created_candidate(
+            entity_kind="internal_task",
+            source_kind="mcp_queue_night_task",
+            text=task_description,
+            metadata=metadata,
+        )
         return f"✅ Queued for tonight: {task_description}"
     except Exception as e:
         return f"❌ Database error: {e}"

@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 from typing import List, Optional
 
 from application.ports.memory_port import MemoryPort
@@ -54,7 +55,21 @@ class SemanticMemoryService:
             for chunk, embedding in zip(chunks, embeddings):
                 if not embedding:
                     continue
-                self.memory.update_embedding(chunk.chunk_id, embedding)
+                if not self._is_valid_embedding(embedding):
+                    self.logger.warning(
+                        "Skipping invalid semantic embedding for chunk %s.",
+                        chunk.chunk_id,
+                    )
+                    continue
+                try:
+                    self.memory.update_embedding(chunk.chunk_id, embedding)
+                except (TypeError, ValueError) as exc:
+                    self.logger.warning(
+                        "Skipping invalid semantic embedding for chunk %s: %s",
+                        chunk.chunk_id,
+                        exc,
+                    )
+                    continue
                 synced += 1
         return synced
 
@@ -78,6 +93,9 @@ class SemanticMemoryService:
             self.logger.warning("Semantic query embedding failed: %s", exc)
             return []
         if not query_embedding:
+            return []
+        if not self._is_valid_embedding(query_embedding[0]):
+            self.logger.warning("Semantic query embedding was invalid; skipping retrieval.")
             return []
         results = self.memory.vector_search(
             query_embedding[0],
@@ -133,3 +151,11 @@ class SemanticMemoryService:
             return payload if isinstance(payload, dict) else {}
         except json.JSONDecodeError:
             return {}
+
+    def _is_valid_embedding(self, embedding: List[float]) -> bool:
+        if not embedding:
+            return False
+        try:
+            return all(math.isfinite(float(value)) for value in embedding)
+        except (TypeError, ValueError):
+            return False

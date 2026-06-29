@@ -78,17 +78,18 @@ class RuntimeLogBufferHandler(logging.Handler):
 _LOG_BUFFER: RuntimeLogBuffer | None = None
 _LOG_HANDLER: RuntimeLogBufferHandler | None = None
 _SERVER_THREAD: threading.Thread | None = None
+_SERVER: uvicorn.Server | None = None
 _SERVER_LOCK = threading.Lock()
 
 
-def configure_runtime_log_streaming(max_entries: int = 2000) -> RuntimeLogBuffer:
+def configure_runtime_log_streaming(max_entries: int = 2000, debug_enabled: bool = False) -> RuntimeLogBuffer:
     global _LOG_BUFFER, _LOG_HANDLER
     if _LOG_BUFFER is not None and _LOG_HANDLER is not None:
         return _LOG_BUFFER
 
     buffer = RuntimeLogBuffer(max_entries=max_entries)
     handler = RuntimeLogBufferHandler(buffer)
-    handler.setLevel(logging.INFO)
+    handler.setLevel(logging.DEBUG if debug_enabled else logging.INFO)
     formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
     handler.setFormatter(formatter)
 
@@ -443,7 +444,7 @@ def start_runtime_log_server(
     training_service: TrainingDataService | None = None,
     media_roots: Optional[list[str]] = None,
 ) -> RuntimeLogBuffer:
-    global _SERVER_THREAD
+    global _SERVER_THREAD, _SERVER
     log_buffer = configure_runtime_log_streaming(max_entries=max_entries)
     with _SERVER_LOCK:
         if _SERVER_THREAD is not None and _SERVER_THREAD.is_alive():
@@ -460,6 +461,7 @@ def start_runtime_log_server(
         )
 
         def _serve() -> None:
+            global _SERVER
             config = uvicorn.Config(
                 app=app,
                 host=host,
@@ -468,13 +470,33 @@ def start_runtime_log_server(
                 access_log=False,
             )
             server = uvicorn.Server(config)
+            _SERVER = server
             server.run()
+            _SERVER = None
 
         thread = threading.Thread(
             target=_serve,
-            daemon=True,
             name="RuntimeLogServerThread",
         )
         thread.start()
         _SERVER_THREAD = thread
     return log_buffer
+
+
+def shutdown_runtime_log_server(*, join_timeout: float = 5.0, remove_log_handler: bool = False) -> None:
+    global _SERVER_THREAD, _SERVER, _LOG_BUFFER, _LOG_HANDLER
+    with _SERVER_LOCK:
+        server = _SERVER
+        thread = _SERVER_THREAD
+        if server is not None:
+            server.should_exit = True
+        if thread is not None:
+            thread.join(timeout=join_timeout)
+        _SERVER_THREAD = None
+        _SERVER = None
+    if remove_log_handler and _LOG_HANDLER is not None:
+        root_logger = logging.getLogger()
+        root_logger.removeHandler(_LOG_HANDLER)
+        _LOG_HANDLER.close()
+        _LOG_HANDLER = None
+        _LOG_BUFFER = None

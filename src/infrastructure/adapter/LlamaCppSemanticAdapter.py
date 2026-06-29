@@ -41,7 +41,17 @@ class LlamaCppSemanticAdapter:
         payload = response.json()
         data = payload.get("data", [])
         ordered = sorted(data, key=lambda item: int(item.get("index", 0)))
-        return [list(item.get("embedding") or []) for item in ordered]
+        vectors: List[List[float]] = []
+        for item in ordered:
+            raw_embedding = item.get("embedding") or []
+            if not isinstance(raw_embedding, list):
+                vectors.append([])
+                continue
+            try:
+                vectors.append([float(value) if value is not None else float("nan") for value in raw_embedding])
+            except (TypeError, ValueError):
+                vectors.append([])
+        return vectors
 
     def rerank(
         self,

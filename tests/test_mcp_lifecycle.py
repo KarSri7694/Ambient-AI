@@ -181,6 +181,22 @@ def test_ambient_runtime_separates_mcp_lifetime_from_model_lifetime():
     assert still_initialized is False
 
 
+def test_ambient_runtime_stop_requests_mcp_cleanup_on_running_loop():
+    runtime = AmbientRuntime(transcription_queue=queue.Queue())
+    bridge = _FakeToolBridge()
+    loop = asyncio.new_event_loop()
+    try:
+        runtime._loop = loop
+        runtime._tool_bridge = bridge
+        runtime.stop_service()
+        loop.run_until_complete(asyncio.sleep(0))
+        assert bridge.cleanup_calls == 1
+    finally:
+        runtime._loop = None
+        runtime._tool_bridge = None
+        loop.close()
+
+
 def test_llm_interaction_service_uses_reporter_model_override():
     provider = _FakeLLMProvider()
     with tempfile.TemporaryDirectory() as tmpdir:

@@ -90,6 +90,7 @@ class SystemIdleAndQueueTests(unittest.TestCase):
             duplicate_job = queue.enqueue(str(duplicate), captured_at="2026-06-25T10:00:10")
 
             self.assertIsNotNone(first_job)
+            self.assertIsNone(first_job.similarity_score)
             self.assertIsNone(duplicate_job)
             self.assertTrue(duplicate.exists())
             self.assertEqual(queue.size(), 1)
@@ -107,6 +108,7 @@ class SystemIdleAndQueueTests(unittest.TestCase):
             different_job = queue.enqueue(str(different), captured_at="2026-06-25T10:00:10")
 
             self.assertIsNotNone(different_job)
+            self.assertIsNotNone(different_job.similarity_score)
             self.assertTrue(different.exists())
             self.assertEqual(queue.size(), 2)
 

@@ -1,4 +1,5 @@
 import json
+import math
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -19,6 +20,7 @@ from core.models import (
     MemoryFact,
     MemoryReflection,
     OpenLoop,
+    SemanticDeduplicationRecord,
     SemanticMemoryChunk,
     SemanticMemoryResult,
     SpeakerRecord,
@@ -314,6 +316,22 @@ class SQLiteMemoryAdapter(MemoryPort):
                 )
                 """
             )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS semantic_dedupe_items (
+                    dedupe_item_id TEXT PRIMARY KEY,
+                    entity_kind TEXT NOT NULL,
+                    source_kind TEXT NOT NULL,
+                    raw_text TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    ttl_expires_at TEXT NOT NULL,
+                    provider_ref TEXT,
+                    duplicate_of_item_id TEXT,
+                    metadata_json TEXT NOT NULL DEFAULT '{}'
+                )
+                """
+            )
 
     def _ensure_visual_observation_columns(self) -> None:
         required_columns = {
@@ -365,6 +383,20 @@ class SQLiteMemoryAdapter(MemoryPort):
             status=row["status"],
             created_at=row["created_at"],
             consolidated_at=row["consolidated_at"],
+        )
+
+    def _semantic_dedupe_record_from_row(self, row: sqlite3.Row) -> SemanticDeduplicationRecord:
+        return SemanticDeduplicationRecord(
+            dedupe_item_id=row["dedupe_item_id"],
+            entity_kind=row["entity_kind"],
+            source_kind=row["source_kind"],
+            raw_text=row["raw_text"],
+            created_at=row["created_at"],
+            status=row["status"],
+            ttl_expires_at=row["ttl_expires_at"],
+            provider_ref=row["provider_ref"],
+            duplicate_of_item_id=row["duplicate_of_item_id"],
+            metadata_json=row["metadata_json"],
         )
 
     def _fact_from_row(self, row: sqlite3.Row) -> MemoryFact:
@@ -549,6 +581,18 @@ class SQLiteMemoryAdapter(MemoryPort):
                 "Install it in the interpreter used to run Ambient AI."
             )
 
+    def _serialize_embedding(self, embedding: List[float]) -> bytes:
+        self._require_sqlite_vec()
+        normalized: List[float] = []
+        for value in embedding:
+            numeric = float(value)
+            if not math.isfinite(numeric):
+                raise ValueError("Embedding contains non-finite values.")
+            normalized.append(numeric)
+        if not normalized:
+            raise ValueError("Embedding is empty.")
+        return sqlite_vec.serialize_float32(normalized)
+
     def _vector_table_exists(self, conn: sqlite3.Connection) -> bool:
         row = conn.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'semantic_memory_embeddings'"
@@ -690,13 +734,14 @@ class SQLiteMemoryAdapter(MemoryPort):
             if row is None:
                 raise KeyError(f"Unknown semantic chunk: {chunk_id}")
             self._ensure_vector_table(conn, len(embedding))
+            serialized_embedding = self._serialize_embedding(embedding)
             conn.execute(
                 "DELETE FROM semantic_memory_embeddings WHERE rowid = ?",
                 (row["rowid"],),
             )
             conn.execute(
                 "INSERT INTO semantic_memory_embeddings(rowid, embedding) VALUES (?, ?)",
-                (row["rowid"], json.dumps(embedding)),
+                (row["rowid"], serialized_embedding),
             )
             conn.execute(
                 "UPDATE semantic_memory_chunks SET updated_at = ? WHERE chunk_id = ?",
@@ -716,6 +761,7 @@ class SQLiteMemoryAdapter(MemoryPort):
             embedding_dimension = self._get_embedding_dimension(conn)
             if embedding_dimension != len(query_embedding):
                 return []
+            serialized_query = self._serialize_embedding(query_embedding)
 
             base_query = """
                 SELECT
@@ -727,7 +773,7 @@ class SQLiteMemoryAdapter(MemoryPort):
                 WHERE semantic_memory_embeddings.embedding MATCH ?
                   AND k = ?
             """
-            params: List[object] = [json.dumps(query_embedding), limit]
+            params: List[object] = [serialized_query, limit]
             if speaker_ids:
                 placeholders = ", ".join("?" for _ in speaker_ids)
                 base_query += f" AND (semantic_memory_chunks.speaker_id IS NULL OR semantic_memory_chunks.speaker_id IN ({placeholders}))"
@@ -1259,6 +1305,128 @@ class SQLiteMemoryAdapter(MemoryPort):
         if not self.working_memory_path.exists():
             return ""
         return self.working_memory_path.read_text(encoding="utf-8")
+
+    def add_semantic_dedupe_item(
+        self,
+        *,
+        entity_kind: str,
+        source_kind: str,
+        raw_text: str,
+        status: str,
+        ttl_expires_at: str,
+        provider_ref: Optional[str] = None,
+        duplicate_of_item_id: Optional[str] = None,
+        metadata_json: str = "{}",
+        dedupe_item_id: Optional[str] = None,
+    ) -> SemanticDeduplicationRecord:
+        record = SemanticDeduplicationRecord(
+            dedupe_item_id=dedupe_item_id or uuid.uuid4().hex,
+            entity_kind=entity_kind,
+            source_kind=source_kind,
+            raw_text=raw_text,
+            created_at=self._now(),
+            status=status,
+            ttl_expires_at=ttl_expires_at,
+            provider_ref=provider_ref,
+            duplicate_of_item_id=duplicate_of_item_id,
+            metadata_json=metadata_json or "{}",
+        )
+        with self._managed_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO semantic_dedupe_items (
+                    dedupe_item_id, entity_kind, source_kind, raw_text, created_at,
+                    status, ttl_expires_at, provider_ref, duplicate_of_item_id, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.dedupe_item_id,
+                    record.entity_kind,
+                    record.source_kind,
+                    record.raw_text,
+                    record.created_at,
+                    record.status,
+                    record.ttl_expires_at,
+                    record.provider_ref,
+                    record.duplicate_of_item_id,
+                    record.metadata_json,
+                ),
+            )
+        return record
+
+    def list_semantic_dedupe_items(
+        self,
+        *,
+        entity_kinds: Optional[List[str]] = None,
+        statuses: Optional[List[str]] = None,
+        created_after: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[SemanticDeduplicationRecord]:
+        query = "SELECT * FROM semantic_dedupe_items"
+        conditions: List[str] = []
+        params: List[object] = []
+        if entity_kinds:
+            placeholders = ", ".join("?" for _ in entity_kinds)
+            conditions.append(f"entity_kind IN ({placeholders})")
+            params.extend(entity_kinds)
+        if statuses:
+            placeholders = ", ".join("?" for _ in statuses)
+            conditions.append(f"status IN ({placeholders})")
+            params.extend(statuses)
+        if created_after:
+            conditions.append("created_at >= ?")
+            params.append(created_after)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        with self._managed_connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [self._semantic_dedupe_record_from_row(row) for row in rows]
+
+    def update_semantic_dedupe_item(
+        self,
+        dedupe_item_id: str,
+        *,
+        status: Optional[str] = None,
+        provider_ref: Optional[str] = None,
+        duplicate_of_item_id: Optional[str] = None,
+        ttl_expires_at: Optional[str] = None,
+        metadata_json: Optional[str] = None,
+    ) -> Optional[SemanticDeduplicationRecord]:
+        updates: List[str] = []
+        params: List[object] = []
+        if status is not None:
+            updates.append("status = ?")
+            params.append(status)
+        if provider_ref is not None:
+            updates.append("provider_ref = ?")
+            params.append(provider_ref)
+        if duplicate_of_item_id is not None:
+            updates.append("duplicate_of_item_id = ?")
+            params.append(duplicate_of_item_id)
+        if ttl_expires_at is not None:
+            updates.append("ttl_expires_at = ?")
+            params.append(ttl_expires_at)
+        if metadata_json is not None:
+            updates.append("metadata_json = ?")
+            params.append(metadata_json)
+        if updates:
+            params.append(dedupe_item_id)
+            with self._managed_connection() as conn:
+                conn.execute(
+                    f"UPDATE semantic_dedupe_items SET {', '.join(updates)} WHERE dedupe_item_id = ?",
+                    params,
+                )
+        return self.get_semantic_dedupe_item(dedupe_item_id)
+
+    def get_semantic_dedupe_item(self, dedupe_item_id: str) -> Optional[SemanticDeduplicationRecord]:
+        with self._managed_connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM semantic_dedupe_items WHERE dedupe_item_id = ?",
+                (dedupe_item_id,),
+            ).fetchone()
+        return self._semantic_dedupe_record_from_row(row) if row else None
 
     def append_visual_observation(self, observation: VisualObservation) -> None:
         with self._managed_connection() as conn:

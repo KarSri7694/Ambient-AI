@@ -17,14 +17,14 @@ from utils.kv_state_handling import KVStateControl
 class LlamaCppAdapter(LLMProvider, ModelManager):
     """Adapter for llama.cpp server — implements both LLMProvider and ModelManager."""
     DEFAULT_MODEL = "Qwen-4b-Thinking-2507-Q4_K_M"
-    def __init__(self, base_url: str):
+    def __init__(self, base_url: str, api_key: str = "testkey"):
         """Create an adapter for a llama.cpp-compatible OpenAI API server."""
         self.logger = logging.getLogger(self.__class__.__name__)
         self.base_url = base_url
         self.api_uri_v1 = f"{base_url}/v1"
         self.client = openai.AsyncOpenAI(
             base_url=self.api_uri_v1,
-            api_key="testkey"
+            api_key=api_key
         )
         self.currently_loaded_model: Optional[str] = None
         self.kv_state = KVStateControl(self)

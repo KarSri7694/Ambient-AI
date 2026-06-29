@@ -437,6 +437,21 @@ class SemanticMemoryResult:
 
 
 @dataclass(frozen=True)
+class SemanticDeduplicationRecord:
+    """One dedupe-tracked candidate or created item."""
+    dedupe_item_id: str
+    entity_kind: str
+    source_kind: str
+    raw_text: str
+    created_at: str
+    status: str
+    ttl_expires_at: str
+    provider_ref: Optional[str] = None
+    duplicate_of_item_id: Optional[str] = None
+    metadata_json: str = "{}"
+
+
+@dataclass(frozen=True)
 class InteractionLogEntry:
     """One persisted LLM interaction request/response pair."""
     interaction_id: str

@@ -8,8 +8,12 @@ import requests
 import logging
 import base64
 from openai import OpenAI
+from config import CONFIG
 
 logging.basicConfig(level=logging.INFO)
+
+API_BASE_URL = CONFIG.get_str("runtime", "api_base_url", "http://localhost:8080")
+API_KEY = CONFIG.get_str("runtime", "api_key", "testkey")
 
 class WhisperAdapter(TranscriptionPort):
     def __init__(self, model_size: str = "HIN2HINGLISH", device: str = "cpu"):
@@ -46,13 +50,13 @@ class QwenASRAdapter(TranscriptionPort):
     def __init__(self, model_size: str = "QWEN_ASR", device: str = "cpu"):
         self.model_size = model_size
         self.model = self.load_model()
-        self.client = OpenAI(base_url="http://localhost:8080/v1", api_key="test") 
+        self.client = OpenAI(base_url=f"{API_BASE_URL}/v1", api_key=API_KEY) 
     
     def load_model(self):
         """
         Loads the Qwen ASR model from the specified path.
         """
-        BASE_URL = "http://localhost:8080"
+        BASE_URL = API_BASE_URL
 
         response = requests.post(
             f"{BASE_URL}/models/load",

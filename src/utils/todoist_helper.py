@@ -115,6 +115,28 @@ class TodoistHelper:
         except Exception as exc:
             self.logger.warning("Error completing Todoist task %s: %s", task_id, exc)
 
+    def add_task(self, content: str, due_datetime=None):
+        """Create a Todoist task in the configured project."""
+        if self.api is None:
+            return None
+        normalized = str(content or "").strip()
+        if not normalized:
+            return None
+        try:
+            project_id = self._ensure_project_id()
+            if not project_id:
+                return None
+            kwargs = {
+                "project_id": project_id,
+                "content": normalized,
+            }
+            if due_datetime is not None:
+                kwargs["due_datetime"] = due_datetime
+            return self.api.add_task(**kwargs)
+        except Exception as exc:
+            self.logger.warning("Error creating Todoist task %r: %s", normalized, exc)
+            return None
+
 
 if __name__ == "__main__":
     todoist_helper = TodoistHelper()

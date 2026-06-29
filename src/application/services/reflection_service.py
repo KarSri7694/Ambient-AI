@@ -1,6 +1,7 @@
 import hashlib
 import json
 import logging
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -8,6 +9,7 @@ from typing import Any, Dict, List, Optional
 from application.ports.LLMProvider import LLMProvider
 from application.ports.memory_port import MemoryPort
 from application.ports.task_queue_port import TaskQueuePort
+from application.services.semantic_deduplication_service import SemanticDeduplicationService
 from application.services.semantic_memory_service import SemanticMemoryService
 from application.services.interaction_trace import interaction_trace
 
@@ -72,6 +74,7 @@ Rules:
         task_queue: TaskQueuePort,
         llm_provider: LLMProvider,
         semantic_memory: SemanticMemoryService | None = None,
+        semantic_dedupe_service: SemanticDeduplicationService | None = None,
         history_path: str,
         cadence_mode: str = "daily",
         interval_hours: int = 24,
@@ -82,10 +85,11 @@ Rules:
         self.task_queue = task_queue
         self.llm = llm_provider
         self.semantic_memory = semantic_memory
+        self.semantic_dedupe = semantic_dedupe_service
         self.history_path = Path(history_path)
         self.cadence_mode = (cadence_mode or "daily").strip().lower()
         self.interval_hours = max(1, int(interval_hours))
-        self.max_generated_tasks = max(1, min(10, int(max_generated_tasks)))
+        self.max_generated_tasks = int(max_generated_tasks)
         self.logger = logger or logging.getLogger(self.__class__.__name__)
         self.history_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -187,6 +191,35 @@ Rules:
             if normalized in existing_history_tasks:
                 skipped_tasks.append({**task, "skip_reason": "already_generated_before"})
                 continue
+            dedupe = await self._evaluate_candidate(
+                model=model,
+                text=description,
+                metadata={
+                    "task_kind": "reflection_proactive_task",
+                    "reason": task.get("reason", ""),
+                    "priority": task.get("priority", "medium"),
+                    "generated_at": now.isoformat(),
+                },
+            )
+            if dedupe["decision"] != "create_new":
+                skipped_tasks.append(
+                    {
+                        **task,
+                        "skip_reason": "semantic_duplicate",
+                        "duplicate_of_item_id": dedupe.get("duplicate_of_item_id"),
+                    }
+                )
+                self._record_duplicate_skip(
+                    text=description,
+                    dedupe=dedupe,
+                    metadata={
+                        "task_kind": "reflection_proactive_task",
+                        "reason": task.get("reason", ""),
+                        "priority": task.get("priority", "medium"),
+                        "generated_at": now.isoformat(),
+                    },
+                )
+                continue
 
             metadata = {
                 "task_kind": "reflection_proactive_task",
@@ -194,10 +227,16 @@ Rules:
                 "reason": task.get("reason", ""),
                 "generated_at": now.isoformat(),
             }
+            metadata["dedupe_item_id"] = uuid.uuid4().hex
             self.task_queue.add_task(
                 description=description,
                 priority=task.get("priority", "medium"),
                 metadata=metadata,
+            )
+            self._record_created_item(
+                text=description,
+                metadata=metadata,
+                dedupe_item_id=metadata["dedupe_item_id"],
             )
             queued_tasks.append(task)
 
@@ -421,3 +460,49 @@ Rules:
     def _normalize_text(self, value: Any) -> str:
         text = self._clean_text(value).lower()
         return " ".join(text.split())
+
+    async def _evaluate_candidate(self, *, model: str, text: str, metadata: Dict[str, Any]) -> dict:
+        if self.semantic_dedupe is None:
+            return {"decision": "create_new", "duplicate_of_item_id": None, "reason": "service_unavailable"}
+        return await self.semantic_dedupe.evaluate_candidate(
+            entity_kind="reflection_task",
+            source_kind="reflection_service",
+            text=text,
+            metadata=metadata,
+            model=model,
+        )
+
+    def _record_created_item(
+        self,
+        *,
+        text: str,
+        metadata: Dict[str, Any],
+        dedupe_item_id: str | None = None,
+    ) -> None:
+        if self.semantic_dedupe is None:
+            return
+        self.semantic_dedupe.record_created(
+            entity_kind="reflection_task",
+            source_kind="reflection_service",
+            text=text,
+            metadata=metadata,
+            dedupe_item_id=dedupe_item_id,
+        )
+
+    def _record_duplicate_skip(self, *, text: str, dedupe: dict, metadata: Dict[str, Any]) -> None:
+        if self.semantic_dedupe is None:
+            return
+        payload = dict(metadata)
+        payload.update(
+            {
+                "dedupe_reason": dedupe.get("reason"),
+                "dedupe_confidence": dedupe.get("confidence"),
+            }
+        )
+        self.semantic_dedupe.record_skipped_duplicate(
+            entity_kind="reflection_task",
+            source_kind="reflection_service",
+            text=text,
+            duplicate_of_item_id=dedupe.get("duplicate_of_item_id"),
+            metadata=payload,
+        )

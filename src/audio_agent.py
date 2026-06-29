@@ -38,6 +38,7 @@ HIN2HINGLISH = CONFIG.get_str("audio", "hin2hinglish_model", "Hin2Hinglish-ct2/"
 CLEANED_AUDIO_DIR = Path(CONFIG.get_str("audio", "cleaned_audio_dir", str(USER_DATA_DIR / "cleaned_audio")))
 TEMP_AUDIO_DIR = Path(CONFIG.get_str("audio", "temp_audio_dir", str(USER_DATA_DIR / "temp_audio")))
 USER_IDLE_THRESHOLD_SECONDS = CONFIG.get_int("audio", "user_idle_threshold_seconds", 20)
+ALWAYS_ON_MODE = CONFIG.get_bool("runtime", "always_on", False)
 
 HF_TOKEN = CONFIG.get_str("audio", "hf_token", "").strip() or None
 MIN_TIME_THRESHOLD = CONFIG.get_float("audio", "min_time_threshold", 0.2)
@@ -222,19 +223,32 @@ class AudioAgentService:
         self.system_idle_service = SystemIdleService(
             idle_threshold_seconds=USER_IDLE_THRESHOLD_SECONDS,
         )
-        self.worker_thread = threading.Thread(target=self._process_uploads, daemon=True)
+        self.stop_event = threading.Event()
+        self.observer: Observer | None = None
+        self.worker_thread = threading.Thread(target=self._process_uploads, name="AudioUploadWorker")
+
     def get_audio_active_event(self) -> threading.Event:
         return self.audio_active_event
     
     def get_transcription_queue(self) -> queue.Queue:
         return self.transcription_queue
     
+    def _drain_queue(self, target_queue: queue.Queue) -> None:
+        while True:
+            try:
+                item = target_queue.get_nowait()
+            except queue.Empty:
+                break
+            else:
+                target_queue.task_done()
+
     def _process_uploads(self):
         logging.info("Audio pipeline is waiting for uploads and user idle.")
-        while True:
-            if not self.system_idle_service.is_user_idle():
+        while not self.stop_event.is_set():
+            if not ALWAYS_ON_MODE and not self.system_idle_service.is_user_idle():
                 self.audio_active_event.clear()
-                time.sleep(1)
+                if self.stop_event.wait(1):
+                    break
                 continue
 
             try:
@@ -248,13 +262,14 @@ class AudioAgentService:
 
             self.audio_active_event.set()
             self.llm_active_event.clear()
-            logging.info("Audio file received while system is idle. ASR pipeline is active.")
+            if ALWAYS_ON_MODE:
+                logging.info("Audio file received. ASR pipeline is active in always_on mode.")
+            else:
+                logging.info("Audio file received while system is idle. ASR pipeline is active.")
 
             try:
                 with self.gpu_lock:
                     self.audio_agent.run(file_path)
-            except KeyboardInterrupt:
-                logging.info("Terminating")
             except Exception:
                 logging.exception(f"Failed to process file: {file_path}")
             finally:
@@ -263,22 +278,38 @@ class AudioAgentService:
                 self.processing_queue.task_done()
                 logging.info("ASR pipeline finished. Returning to idle wait.")
         self.audio_active_event.clear()
+        self.llm_active_event.clear()
+        self.audio_agent.release_all_models()
     
     def start_service(self):
-        observer = Observer()
-        observer.schedule(Handler(self.processing_queue), str(UPLOAD_DIR), recursive=False)
+        self.stop_event.clear()
+        self.observer = Observer()
+        self.observer.schedule(Handler(self.processing_queue), str(UPLOAD_DIR), recursive=False)
         self.worker_thread.start()
-        observer.start()
+        self.observer.start()
         
         try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            observer.stop()
+            while not self.stop_event.wait(1):
+                pass
         finally:
-            observer.join()
-            self.processing_queue.put(None)
-            self.worker_thread.join()
+            self.stop_service()
+
+    def stop_service(self, join_timeout: float = 10.0) -> None:
+        self.stop_event.set()
+        if self.observer is not None:
+            try:
+                self.observer.stop()
+            finally:
+                self.observer.join(timeout=join_timeout)
+                self.observer = None
+        self.processing_queue.put(None)
+        if self.worker_thread.is_alive():
+            self.worker_thread.join(timeout=join_timeout)
+        self.audio_agent.release_all_models()
+        self.audio_active_event.clear()
+        self.llm_active_event.clear()
+        self._drain_queue(self.processing_queue)
+        self._drain_queue(self.transcription_queue)
 
 if __name__ == "__main__":
     agent_service = AudioAgentService()

@@ -1,8 +1,7 @@
 """
 inspect_window_visible_only.py
 ------------------------------
-Scans the active foreground window and prints only interactive UI elements that
-are truly visible on screen.
+Scans the active foreground window and prints visible UI elements.
 
 Printed columns:
 S.No., Item_Name, Start_X, Start_Y, Length_X_px, Length_Y_px, End_X, End_Y, Bounding_Box
@@ -60,6 +59,35 @@ CLICKABLE_CONTROL_TYPES = {
 
 WRITABLE_CONTROL_TYPES = {
     auto.ControlType.EditControl,
+}
+
+CONTENT_CONTROL_TYPES = {
+    auto.ControlType.TextControl,
+    auto.ControlType.DocumentControl,
+    auto.ControlType.PaneControl,
+    auto.ControlType.GroupControl,
+    auto.ControlType.ListControl,
+    auto.ControlType.ListItemControl,
+    auto.ControlType.TreeControl,
+    auto.ControlType.TreeItemControl,
+    auto.ControlType.TabControl,
+    auto.ControlType.TabItemControl,
+    auto.ControlType.TableControl,
+    auto.ControlType.DataGridControl,
+    auto.ControlType.DataItemControl,
+    auto.ControlType.HeaderControl,
+    auto.ControlType.HeaderItemControl,
+    auto.ControlType.MenuBarControl,
+    auto.ControlType.MenuControl,
+    auto.ControlType.MenuItemControl,
+    auto.ControlType.StatusBarControl,
+    auto.ControlType.ToolBarControl,
+    auto.ControlType.HyperlinkControl,
+    auto.ControlType.ButtonControl,
+    auto.ControlType.CheckBoxControl,
+    auto.ControlType.RadioButtonControl,
+    auto.ControlType.ComboBoxControl,
+    auto.ControlType.WindowControl,
 }
 
 MAX_ITEM_NAME_CHARS = 50
@@ -260,6 +288,45 @@ def is_writable(control: auto.Control) -> bool:
     return False
 
 
+def _safe_control_name(control: auto.Control) -> str:
+    try:
+        return str(control.Name or "").strip()
+    except Exception:
+        return ""
+
+
+def _safe_control_value(control: auto.Control) -> str:
+    try:
+        value_pattern = control.GetPattern(auto.PatternId.ValuePattern)
+        if value_pattern is not None:
+            return str(value_pattern.Value or "").strip()
+    except Exception:
+        pass
+    try:
+        legacy = control.GetPattern(auto.PatternId.LegacyIAccessiblePattern)
+        if legacy is not None:
+            return str(legacy.Value or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _text_candidate(control: auto.Control) -> str:
+    for value in (_safe_control_name(control), _safe_control_value(control)):
+        if value and len(value) > 1:
+            return value
+    return ""
+
+
+def is_content_candidate(control: auto.Control) -> bool:
+    try:
+        if control.ControlType in CONTENT_CONTROL_TYPES and _text_candidate(control):
+            return True
+    except Exception:
+        return False
+    return False
+
+
 def get_same_process_windows(target_pid: int) -> list:
     """Collect visible top-level windows belonging to target_pid."""
     windows = []
@@ -275,9 +342,17 @@ def get_same_process_windows(target_pid: int) -> list:
     return windows
 
 
-def scan_window(window: auto.Control) -> list:
-    """Return (name, left, top, width, height, right, bottom, bbox_tuple) rows."""
+def scan_window(window: auto.Control, mode: str = "interactive_only") -> list:
+    """Return visible UI rows for the foreground app.
+
+    interactive_only:
+      Visible clickable or writable controls only.
+    screen_content:
+      Visible interactive controls plus passive text-bearing content controls.
+    """
     results = []
+    normalized_mode = str(mode or "interactive_only").strip().lower()
+    include_content = normalized_mode == "screen_content"
 
     try:
         target_pid = window.ProcessId
@@ -298,16 +373,15 @@ def scan_window(window: auto.Control) -> list:
             try:
                 if not is_visible_on_screen(control):
                     continue
-                if not is_enabled(control):
+                if not include_content and not is_enabled(control):
                     continue
-                if not (is_clickable(control) or is_writable(control)):
+                if include_content:
+                    if not (is_clickable(control) or is_writable(control) or is_content_candidate(control)):
+                        continue
+                elif not (is_clickable(control) or is_writable(control)):
                     continue
 
-                try:
-                    name = control.Name or ""
-                except Exception:
-                    name = ""
-                clean_name = str(name).strip()
+                clean_name = _text_candidate(control)
                 if not clean_name:
                     continue
                 if len(clean_name) == 1:
@@ -396,6 +470,76 @@ def print_compact_bbox_table(results: list) -> None:
 
     if serial == 0:
         print("No interactive visible elements found.")
+
+
+def inspect_foreground_window(mode: str = "interactive_only") -> dict:
+    """Return structured UIA snapshot for the active foreground window."""
+    window = auto.GetForegroundControl()
+    if window is None:
+        return {
+            "ok": False,
+            "mode": mode,
+            "error": "foreground_window_not_found",
+        }
+
+    try:
+        window_title = window.Name or window.ClassName or "(untitled)"
+    except Exception:
+        window_title = "(untitled)"
+
+    window_class = None
+    process_id = None
+    try:
+        window_class = window.ClassName or None
+    except Exception:
+        window_class = None
+    try:
+        process_id = int(window.ProcessId)
+    except Exception:
+        process_id = None
+
+    chromium = is_chromium_window(window)
+    accessibility_activated = False
+    if chromium:
+        original_state = _get_screen_reader_state()
+        if not original_state:
+            enable_chromium_accessibility()
+            accessibility_activated = True
+
+    try:
+        rows = deduplicate_results(scan_window(window, mode=mode))
+    finally:
+        if accessibility_activated:
+            disable_chromium_accessibility()
+
+    items = [
+        {
+            "name": row[0],
+            "start_x": row[1],
+            "start_y": row[2],
+            "length_x": row[3],
+            "length_y": row[4],
+            "end_x": row[5],
+            "end_y": row[6],
+            "bbox": row[7],
+        }
+        for row in rows
+    ]
+    visible_text_summary = "\n".join(item["name"] for item in items[:80])
+    lowered = visible_text_summary.lower()
+    return {
+        "ok": True,
+        "mode": mode,
+        "window_title": str(window_title),
+        "window_class": window_class,
+        "process_id": process_id,
+        "is_chromium": chromium,
+        "visible_items": items,
+        "visible_text_summary": visible_text_summary,
+        "contains_dialog": any(keyword in lowered for keyword in ("dialog", "confirm", "warning", "permission")),
+        "contains_notification": any(keyword in lowered for keyword in ("notification", "reminder", "alert", "error")),
+        "contains_editable_fields": any(isinstance(item["name"], str) and item["name"] for item in items),
+    }
 
 
 def main() -> None:

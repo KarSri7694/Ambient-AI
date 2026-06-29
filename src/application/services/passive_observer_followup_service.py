@@ -2,15 +2,18 @@ import json
 import logging
 import re
 import hashlib
+import uuid
 from datetime import datetime
 from typing import Any, List
 
 from application.ports.LLMProvider import LLMProvider
 from application.ports.memory_port import MemoryPort
 from application.ports.task_queue_port import TaskQueuePort
+from application.services.semantic_deduplication_service import SemanticDeduplicationService
 from application.services.semantic_memory_service import SemanticMemoryService
 from application.services.interaction_trace import interaction_trace
 from core.models import VisualObservation
+from utils.todoist_helper import TodoistHelper
 
 
 class PassiveObserverFollowupService:
@@ -124,14 +127,18 @@ Output:
         task_queue: TaskQueuePort,
         llm_provider: LLMProvider,
         semantic_memory: SemanticMemoryService | None = None,
+        semantic_dedupe_service: SemanticDeduplicationService | None = None,
         activity_ledger: Any = None,
+        reminder_helper: Any = None,
         logger: logging.Logger | None = None,
     ):
         self.memory = memory
         self.task_queue = task_queue
         self.llm = llm_provider
         self.semantic_memory = semantic_memory
+        self.semantic_dedupe = semantic_dedupe_service
         self.activity_ledger = activity_ledger
+        self.reminder_helper = reminder_helper
         self.logger = logger or logging.getLogger(self.__class__.__name__)
 
     def _build_system_prompt(self, prompt: str) -> str:
@@ -145,17 +152,34 @@ Output:
 
     async def maybe_queue_followup(self, *, model: str) -> dict:
         observations = self.memory.get_recent_unsent_visual_observations(limit=self.UNSENT_OBSERVATION_LIMIT)
+        return await self.process_observations(
+            observations=observations,
+            model=model,
+            mark_sent=True,
+            apply_memory_updates=True,
+        )
+
+    async def process_observations(
+        self,
+        *,
+        observations: List[VisualObservation],
+        model: str,
+        mark_sent: bool = False,
+        apply_memory_updates: bool = True,
+    ) -> dict:
         activity_rows = self._extract_activity_rows(observations)
         if not activity_rows:
             return self._empty_result("no unsent inferred activities")
 
         pending_tasks = self.task_queue.get_pending_tasks()
         pending_descriptions = [str(task.description) for task in pending_tasks[:20]]
-        sent_at = datetime.now().isoformat()
-        self.memory.mark_visual_observations_followup_sent(
-            [row["observation_id"] for row in activity_rows],
-            sent_at=sent_at,
-        )
+        direct_reminders = await self._create_direct_reminders(activity_rows, model=model)
+        if mark_sent:
+            sent_at = datetime.now().isoformat()
+            self.memory.mark_visual_observations_followup_sent(
+                [row["observation_id"] for row in activity_rows],
+                sent_at=sent_at,
+            )
 
         with interaction_trace("passive_observer_followup"):
             unique_activities = await self._request_unique_activities(
@@ -189,24 +213,74 @@ Output:
                 memory_updates.extend(decision["memory_updates"])
                 user_info_updates.extend(decision["user_info_updates"])
                 if action == "queue_task":
-                    if self._looks_duplicate(activity=task, pending_tasks=pending_descriptions):
+                    dedupe = await self._evaluate_candidate(
+                        model=model,
+                        entity_kind="internal_task",
+                        source_kind="passive_observer_followup",
+                        text=task,
+                        metadata=self._build_dedupe_metadata(activity=activity, task=task, rows=matching_rows),
+                    )
+                    if dedupe["decision"] != "create_new":
+                        self._record_duplicate_skip(
+                            entity_kind="internal_task",
+                            source_kind="passive_observer_followup",
+                            text=task,
+                            dedupe=dedupe,
+                            metadata=self._build_dedupe_metadata(activity=activity, task=task, rows=matching_rows),
+                        )
                         ignored_activities.append(task)
                         continue
+                    task_metadata = self._build_task_metadata(activity=activity, task=task, rows=matching_rows)
+                    task_metadata["dedupe_item_id"] = uuid.uuid4().hex
                     self.task_queue.add_task(
                         self._build_task_description(activity=task, rows=matching_rows),
                         priority="low",
-                        metadata=self._build_task_metadata(activity=activity, task=task, rows=matching_rows),
+                        metadata=task_metadata,
+                    )
+                    record = self._record_created_item(
+                        entity_kind="internal_task",
+                        source_kind="passive_observer_followup",
+                        text=task,
+                        metadata=task_metadata,
+                        dedupe_item_id=task_metadata["dedupe_item_id"],
                     )
                     pending_descriptions.append(task)
                     queued_activities.append(task)
                     self._record_activity_ledger(activity=task, rows=matching_rows)
                 elif action == "do_now":
+                    dedupe = await self._evaluate_candidate(
+                        model=model,
+                        entity_kind="do_now_action",
+                        source_kind="passive_observer_followup",
+                        text=task,
+                        metadata=self._build_dedupe_metadata(activity=activity, task=task, rows=matching_rows),
+                    )
+                    if dedupe["decision"] != "create_new":
+                        self._record_duplicate_skip(
+                            entity_kind="do_now_action",
+                            source_kind="passive_observer_followup",
+                            text=task,
+                            dedupe=dedupe,
+                            metadata=self._build_dedupe_metadata(activity=activity, task=task, rows=matching_rows),
+                        )
+                        ignored_activities.append(task)
+                        continue
+                    self._record_created_item(
+                        entity_kind="do_now_action",
+                        source_kind="passive_observer_followup",
+                        text=task,
+                        metadata=self._build_dedupe_metadata(activity=activity, task=task, rows=matching_rows),
+                    )
                     do_now_activities.append(task)
                 else:
                     ignored_activities.append(activity)
 
-            saved_memory_updates = self._apply_memory_updates(memory_updates)
-            saved_user_info_updates = self._apply_user_info_updates(user_info_updates)
+            if apply_memory_updates:
+                saved_memory_updates = self._apply_memory_updates(memory_updates)
+                saved_user_info_updates = self._apply_user_info_updates(user_info_updates)
+            else:
+                saved_memory_updates = self._dedupe_preserve_order(memory_updates)
+                saved_user_info_updates = self._dedupe_preserve_order(user_info_updates)
 
         useful_set = {self._normalize_activity(item) for item in useful_activities}
         for activity in unique_activities:
@@ -220,6 +294,7 @@ Output:
             "queued_activities": queued_activities,
             "do_now_activities": do_now_activities,
             "ignored_activities": ignored_activities,
+            "direct_reminders": direct_reminders,
             "memory_updates": saved_memory_updates,
             "user_info_updates": saved_user_info_updates,
         }
@@ -232,6 +307,7 @@ Output:
             "queued_activities": [],
             "do_now_activities": [],
             "ignored_activities": [],
+            "direct_reminders": [],
             "memory_updates": [],
             "user_info_updates": [],
             "reason": reason,
@@ -259,6 +335,70 @@ Output:
                 }
             )
         return rows
+
+    async def _create_direct_reminders(self, rows: List[dict], *, model: str) -> List[str]:
+        helper = self.reminder_helper
+        if helper is None:
+            return []
+        try:
+            if not helper.is_enabled():
+                return []
+        except Exception:
+            return []
+
+        existing_tasks: List[str] = []
+        try:
+            existing_tasks = [str(item.get("content", "")) for item in helper.get_tasks()[:100]]
+        except Exception as exc:
+            self.logger.warning("Failed to fetch Todoist tasks before creating reminders: %s", exc)
+
+        created: List[str] = []
+        seen: set[str] = set()
+        for row in rows:
+            if not row.get("maybe_require_a_reminder"):
+                continue
+            reminder_text = self._clean_text(row.get("reminder_context"))
+            normalized = self._normalize_activity(reminder_text)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            dedupe_metadata = {
+                "task_kind": "passive_observer_direct_reminder",
+                "source_observation_ids": [row["observation_id"]],
+                "created_at": row["created_at"],
+                "app_name": row["app_name"],
+                "page_hint": row["page_hint"],
+            }
+            dedupe = await self._evaluate_candidate(
+                model=model,
+                entity_kind="todoist_reminder",
+                source_kind="passive_observer_direct_reminder",
+                text=reminder_text,
+                metadata=dedupe_metadata,
+            )
+            if dedupe["decision"] != "create_new":
+                self._record_duplicate_skip(
+                    entity_kind="todoist_reminder",
+                    source_kind="passive_observer_direct_reminder",
+                    text=reminder_text,
+                    dedupe=dedupe,
+                    metadata=dedupe_metadata,
+                )
+                continue
+            task = helper.add_task(reminder_text)
+            if task is not None:
+                provider_ref = self._clean_text(getattr(task, "id", None) if not isinstance(task, dict) else task.get("id")) or None
+                self._record_created_item(
+                    entity_kind="todoist_reminder",
+                    source_kind="passive_observer_direct_reminder",
+                    text=reminder_text,
+                    metadata=dedupe_metadata,
+                    provider_ref=provider_ref,
+                )
+                created.append(reminder_text)
+                existing_tasks.append(reminder_text)
+                self.logger.info("Created direct Todoist reminder from passive observation: %s", reminder_text)
+        return created
 
     def _group_rows_by_activity(self, rows: List[dict]) -> dict[str, List[dict]]:
         grouped: dict[str, List[dict]] = {}
@@ -392,14 +532,82 @@ Output:
                 relation="derived_from",
             )
 
-    def _looks_duplicate(self, *, activity: str, pending_tasks: List[str]) -> bool:
-        normalized_activity = self._normalize_activity(activity)
-        if not normalized_activity:
-            return True
-        for task in pending_tasks:
-            if normalized_activity in self._normalize_activity(task):
-                return True
-        return False
+    def _build_dedupe_metadata(self, *, activity: str, task: str, rows: List[dict]) -> dict:
+        return {
+            "activity": activity,
+            "task": task,
+            "source_observation_ids": [row["observation_id"] for row in rows],
+            "created_at": rows[0]["created_at"] if rows else "",
+            "app_names": [row["app_name"] for row in rows if row["app_name"]],
+            "page_hints": [row["page_hint"] for row in rows if row["page_hint"]],
+            "reminder_contexts": [row["reminder_context"] for row in rows if row["reminder_context"]],
+        }
+
+    async def _evaluate_candidate(
+        self,
+        *,
+        model: str,
+        entity_kind: str,
+        source_kind: str,
+        text: str,
+        metadata: dict,
+    ) -> dict:
+        if self.semantic_dedupe is None:
+            return {"decision": "create_new", "duplicate_of_item_id": None, "reason": "service_unavailable"}
+        return await self.semantic_dedupe.evaluate_candidate(
+            entity_kind=entity_kind,
+            source_kind=source_kind,
+            text=text,
+            metadata=metadata,
+            model=model,
+        )
+
+    def _record_created_item(
+        self,
+        *,
+        entity_kind: str,
+        source_kind: str,
+        text: str,
+        metadata: dict,
+        provider_ref: str | None = None,
+        dedupe_item_id: str | None = None,
+    ):
+        if self.semantic_dedupe is None:
+            return None
+        return self.semantic_dedupe.record_created(
+            entity_kind=entity_kind,
+            source_kind=source_kind,
+            text=text,
+            metadata=metadata,
+            provider_ref=provider_ref,
+            dedupe_item_id=dedupe_item_id,
+        )
+
+    def _record_duplicate_skip(
+        self,
+        *,
+        entity_kind: str,
+        source_kind: str,
+        text: str,
+        dedupe: dict,
+        metadata: dict,
+    ) -> None:
+        if self.semantic_dedupe is None:
+            return
+        payload = dict(metadata)
+        payload.update(
+            {
+                "dedupe_reason": dedupe.get("reason"),
+                "dedupe_confidence": dedupe.get("confidence"),
+            }
+        )
+        self.semantic_dedupe.record_skipped_duplicate(
+            entity_kind=entity_kind,
+            source_kind=source_kind,
+            text=text,
+            duplicate_of_item_id=dedupe.get("duplicate_of_item_id"),
+            metadata=payload,
+        )
 
     def _apply_user_info_updates(self, updates: List[str]) -> List[str]:
         deduped = self._dedupe_preserve_order(updates)

@@ -3,6 +3,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+import threading
 from typing import Deque, Optional
 
 import numpy as np
@@ -13,6 +14,7 @@ from PIL import Image
 class ScreenshotJob:
     screenshot_path: str
     captured_at: str
+    similarity_score: Optional[float] = None
 
 
 class ScreenshotQueueService:
@@ -32,38 +34,53 @@ class ScreenshotQueueService:
         self.logger = logger or logging.getLogger(self.__class__.__name__)
         self._queue: Deque[ScreenshotJob] = deque()
         self._recent_images: Deque[np.ndarray] = deque(maxlen=self.ssim_compare_count)
+        self._lock = threading.Lock()
 
     def enqueue(self, screenshot_path: str, captured_at: str | None = None) -> Optional[ScreenshotJob]:
         candidate = self._load_similarity_image(screenshot_path)
-        if candidate is not None and self._is_too_similar(candidate):
-            self.logger.info("Skipped queued screenshot because it is too similar to a recent capture: %s", screenshot_path)
-            return None
+        with self._lock:
+            similarity_score = self._best_similarity(candidate) if candidate is not None else None
+            self.logger.debug(
+                "Screenshot enqueue candidate=%s similarity_score=%s threshold=%s compare_count=%s",
+                screenshot_path,
+                similarity_score,
+                self.ssim_threshold,
+                self.ssim_compare_count,
+            )
+            if candidate is not None and similarity_score is not None and similarity_score >= self.ssim_threshold:
+                self.logger.info("Skipped queued screenshot because it is too similar to a recent capture: %s", screenshot_path)
+                return None
 
-        if len(self._queue) >= self.maxlen:
-            dropped = self._queue.popleft()
-            self.logger.info("Dropped oldest queued screenshot due to queue overflow: %s", dropped.screenshot_path)
-        job = ScreenshotJob(
-            screenshot_path=screenshot_path,
-            captured_at=captured_at or datetime.now().isoformat(),
-        )
-        self._queue.append(job)
-        if candidate is not None and self.ssim_compare_count > 0:
-            self._recent_images.append(candidate)
-        return job
+            if len(self._queue) >= self.maxlen:
+                dropped = self._queue.popleft()
+                self.logger.info("Dropped oldest queued screenshot due to queue overflow: %s", dropped.screenshot_path)
+            job = ScreenshotJob(
+                screenshot_path=screenshot_path,
+                captured_at=captured_at or datetime.now().isoformat(),
+                similarity_score=similarity_score,
+            )
+            self._queue.append(job)
+            if candidate is not None and self.ssim_compare_count > 0:
+                self._recent_images.append(candidate)
+            return job
 
     def dequeue(self) -> Optional[ScreenshotJob]:
-        if not self._queue:
-            return None
-        return self._queue.popleft()
+        with self._lock:
+            if not self._queue:
+                return None
+            return self._queue.popleft()
 
     def size(self) -> int:
-        return len(self._queue)
+        with self._lock:
+            return len(self._queue)
 
     def is_empty(self) -> bool:
-        return not self._queue
+        with self._lock:
+            return not self._queue
 
     def peek_oldest(self) -> Optional[ScreenshotJob]:
-        return self._queue[0] if self._queue else None
+        with self._lock:
+            return self._queue[0] if self._queue else None
 
     def _load_similarity_image(self, path: str) -> Optional[np.ndarray]:
         if self.ssim_compare_count <= 0:
@@ -76,13 +93,13 @@ class ScreenshotQueueService:
             self.logger.debug("Failed to load screenshot for SSIM comparison %s: %s", path, exc)
             return None
 
-    def _is_too_similar(self, candidate: np.ndarray) -> bool:
+    def _best_similarity(self, candidate: np.ndarray) -> Optional[float]:
         if not self._recent_images:
-            return False
+            return None
+        best = 0.0
         for previous in list(self._recent_images)[-self.ssim_compare_count:]:
-            if self._ssim(candidate, previous) >= self.ssim_threshold:
-                return True
-        return False
+            best = max(best, self._ssim(candidate, previous))
+        return best
 
     def _ssim(self, left: np.ndarray, right: np.ndarray) -> float:
         if left.shape != right.shape:

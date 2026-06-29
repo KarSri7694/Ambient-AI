@@ -9,6 +9,7 @@ from core.models import (
     MemoryReflection,
     OpenLoop,
     SemanticMemoryChunk,
+    SemanticDeduplicationRecord,
     SemanticMemoryResult,
     SpeakerRecord,
     TranscriptEvidence,
@@ -302,4 +303,48 @@ class MemoryPort(ABC):
         limit: int = 30,
         speaker_ids: Optional[List[str]] = None,
     ) -> List[SemanticMemoryResult]:
+        pass
+
+    @abstractmethod
+    def add_semantic_dedupe_item(
+        self,
+        *,
+        entity_kind: str,
+        source_kind: str,
+        raw_text: str,
+        status: str,
+        ttl_expires_at: str,
+        provider_ref: Optional[str] = None,
+        duplicate_of_item_id: Optional[str] = None,
+        metadata_json: str = "{}",
+        dedupe_item_id: Optional[str] = None,
+    ) -> SemanticDeduplicationRecord:
+        pass
+
+    @abstractmethod
+    def list_semantic_dedupe_items(
+        self,
+        *,
+        entity_kinds: Optional[List[str]] = None,
+        statuses: Optional[List[str]] = None,
+        created_after: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[SemanticDeduplicationRecord]:
+        pass
+
+    @abstractmethod
+    def update_semantic_dedupe_item(
+        self,
+        dedupe_item_id: str,
+        *,
+        status: Optional[str] = None,
+        provider_ref: Optional[str] = None,
+        duplicate_of_item_id: Optional[str] = None,
+        ttl_expires_at: Optional[str] = None,
+        metadata_json: Optional[str] = None,
+    ) -> Optional[SemanticDeduplicationRecord]:
+        pass
+
+    @abstractmethod
+    def get_semantic_dedupe_item(self, dedupe_item_id: str) -> Optional[SemanticDeduplicationRecord]:
         pass

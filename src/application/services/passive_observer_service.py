@@ -1,10 +1,11 @@
 import json
 import logging
+import re
 import uuid
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from application.ports.LLMProvider import LLMProvider
 from application.ports.memory_port import MemoryPort
@@ -16,7 +17,7 @@ from core.models import VisualObservation, VisualSession
 class PassiveObserverService:
     """Capture periodic screenshots and persist passive visual context."""
 
-    OBSERVER_PROMPT = """You are the passive visual observer for an ambient personal agent.
+    FULL_OBSERVER_PROMPT = """You are the passive visual observer for an ambient personal agent.
 
 Look at the current screenshot, and return JSON only with exactly these fields:
 {
@@ -39,6 +40,23 @@ Rules:
 - Use the provided screenshot timestamp only as context for when the observation was captured.
 - If the screen is idle, blank, locked, or not useful, keep the four fields minimal and factual.
 """
+    FAST_ROUTER_PROMPT = """You are a fast screen routing model for an ambient personal agent.
+
+Look at the screenshot and return JSON only with exactly these fields:
+{
+  "app_page": "short app/site and page/screen description combined into one line",
+  "summary": "1 sentence summary of what is on screen",
+  "detailed_description": "short but concrete description of the current screen state",
+  "inferred_user_activity": "what the user appears to be doing",
+  "maybe_require_a_reminder": false,
+  "reminder_context": ""
+}
+
+Rules:
+- Keep the response compact and concrete.
+- Prefer continuity-sensitive observations over exhaustive description.
+- Return valid JSON only.
+"""
 
     def __init__(
         self,
@@ -47,6 +65,16 @@ Rules:
         llm_provider: LLMProvider,
         screen_capture: ScreenCapturePort,
         screenshot_root: str,
+        fast_model: Optional[str] = None,
+        full_model: Optional[str] = None,
+        full_vlm_ssim_threshold: float = 0.70,
+        ignore_apps: Optional[List[str]] = None,
+        ignore_domains: Optional[List[str]] = None,
+        always_full_apps: Optional[List[str]] = None,
+        always_full_domains: Optional[List[str]] = None,
+        fast_model_retry_count: int = 2,
+        uiat_adapter: Optional[Any] = None,
+        persist_observations: bool = True,
         logger: logging.Logger | None = None,
     ):
         self.memory = memory
@@ -54,6 +82,16 @@ Rules:
         self.screen_capture = screen_capture
         self.screenshot_root = Path(screenshot_root)
         self.screenshot_root.mkdir(parents=True, exist_ok=True)
+        self.fast_model = (fast_model or "").strip()
+        self.full_model = (full_model or self.fast_model).strip()
+        self.full_vlm_ssim_threshold = max(0.0, min(1.0, float(full_vlm_ssim_threshold)))
+        self.ignore_apps = {str(item).strip().lower() for item in (ignore_apps or []) if str(item).strip()}
+        self.ignore_domains = {str(item).strip().lower() for item in (ignore_domains or []) if str(item).strip()}
+        self.always_full_apps = {str(item).strip().lower() for item in (always_full_apps or []) if str(item).strip()}
+        self.always_full_domains = {str(item).strip().lower() for item in (always_full_domains or []) if str(item).strip()}
+        self.fast_model_retry_count = max(0, int(fast_model_retry_count))
+        self.uiat_adapter = uiat_adapter
+        self.persist_observations = bool(persist_observations)
         self.logger = logger or logging.getLogger(self.__class__.__name__)
 
     def capture_screenshot(self) -> str:
@@ -76,12 +114,14 @@ Rules:
         model: str,
         recent_context: str,
         captured_at: str | None = None,
+        similarity_score: float | None = None,
     ) -> Optional[VisualObservation]:
         parsed = await self._analyze(
             screenshot_path=screenshot_path,
             model=model,
             recent_context=recent_context,
             captured_at=captured_at,
+            similarity_score=similarity_score,
         )
         if not parsed:
             return None
@@ -109,6 +149,12 @@ Rules:
             confidence=0.0,
             raw_payload_json=json.dumps(parsed, ensure_ascii=False, indent=2),
         )
+        if not self.persist_observations:
+            self.logger.debug(
+                "Passive observer persistence disabled; returning transient observation for %s",
+                screenshot_path,
+            )
+            return observation
         session = self._attach_to_session(observation)
         observation = replace(observation, session_id=session.session_id)
         self.memory.append_visual_observation(observation)
@@ -189,16 +235,241 @@ Rules:
         model: str,
         recent_context: str,
         captured_at: str | None = None,
+        similarity_score: float | None = None,
     ) -> dict:
         if not Path(screenshot_path).exists():
             self.logger.warning("Passive observer screenshot missing before analysis: %s", screenshot_path)
             return {}
         recent_observations = self.memory.get_recent_visual_observations(limit=3)
         previous_observation = recent_observations[0] if recent_observations else None
+        uiat_context = self._inspect_foreground_window()
+        route = self._route_screenshot(
+            similarity_score=similarity_score,
+            uiat_context=uiat_context,
+            previous_observation=previous_observation,
+        )
+        if route == "skip":
+            return {}
+
+        if route == "fast_model":
+            parsed = await self._run_fast_model(
+                screenshot_path=screenshot_path,
+                model=model,
+                captured_at=captured_at,
+                similarity_score=similarity_score,
+                previous_observation=previous_observation,
+                uiat_context=uiat_context,
+            )
+        else:
+            parsed = await self._run_full_model(
+                screenshot_path=screenshot_path,
+                model=model,
+                recent_context=recent_context,
+                captured_at=captured_at,
+                similarity_score=similarity_score,
+                previous_observation=previous_observation,
+                recent_observations=recent_observations,
+                uiat_context=uiat_context,
+            )
+        if isinstance(parsed, dict) and parsed:
+            parsed.setdefault("_analysis_mode", route)
+            if similarity_score is not None:
+                parsed.setdefault("_similarity_score", similarity_score)
+            if uiat_context:
+                parsed.setdefault("_uiat_window_title", uiat_context.get("window_title"))
+                parsed.setdefault("_uiat_domain", uiat_context.get("domain_hint"))
+        return parsed if isinstance(parsed, dict) else {}
+
+    def _inspect_foreground_window(self) -> Dict[str, Any]:
+        if self.uiat_adapter is None:
+            return {}
+        payload = self.uiat_adapter.inspect_foreground_window() or {}
+        if not isinstance(payload, dict):
+            return {}
+        payload["domain_hint"] = self._infer_domain_hint(payload)
+        payload["app_hint"] = self._infer_app_hint(payload)
+        self.logger.debug(
+            "UIAT context ok=%s app_hint=%r domain_hint=%r dialog=%s notification=%s items=%s",
+            payload.get("ok"),
+            payload.get("app_hint"),
+            payload.get("domain_hint"),
+            payload.get("contains_dialog"),
+            payload.get("contains_notification"),
+            len(payload.get("visible_items") or []),
+        )
+        return payload
+
+    def _infer_domain_hint(self, uiat_context: Dict[str, Any]) -> Optional[str]:
+        candidates = [
+            str(uiat_context.get("window_title") or ""),
+            str(uiat_context.get("visible_text_summary") or ""),
+        ]
+        for candidate in candidates:
+            match = re.search(r"\b([a-z0-9-]+\.(?:com|in|org|net|ai|io|co|app|dev))\b", candidate.lower())
+            if match:
+                return match.group(1)
+        return None
+
+    def _infer_app_hint(self, uiat_context: Dict[str, Any]) -> Optional[str]:
+        title = str(uiat_context.get("window_title") or "").strip()
+        window_class = str(uiat_context.get("window_class") or "").strip()
+        if title:
+            if " - " in title:
+                return title.split(" - ")[-1].strip()
+            if " | " in title:
+                return title.split(" | ")[-1].strip()
+            return title[:80]
+        return window_class or None
+
+    def _route_screenshot(
+        self,
+        *,
+        similarity_score: float | None,
+        uiat_context: Dict[str, Any],
+        previous_observation: Optional[VisualObservation],
+    ) -> str:
+        app_name = str(uiat_context.get("app_hint") or "").strip().lower()
+        domain_hint = str(uiat_context.get("domain_hint") or "").strip().lower()
+        previous_app = str(previous_observation.app_name or "").strip().lower() if previous_observation else ""
+        previous_page = str(previous_observation.page_hint or "").strip().lower() if previous_observation else ""
+        window_title = str(uiat_context.get("window_title") or "").strip().lower()
+        app_switched = bool(app_name and previous_app and app_name != previous_app)
+        domain_switched = bool(domain_hint and previous_page and domain_hint not in previous_page)
+        has_override = (
+            bool(uiat_context.get("contains_dialog"))
+            or bool(uiat_context.get("contains_notification"))
+            or app_switched
+            or domain_switched
+            or app_name in self.always_full_apps
+            or domain_hint in self.always_full_domains
+            or "error" in window_title
+        )
+        self.logger.debug(
+            "Routing screenshot similarity=%s app=%r domain=%r prev_app=%r prev_page=%r app_switched=%s domain_switched=%s override=%s",
+            similarity_score,
+            app_name,
+            domain_hint,
+            previous_app,
+            previous_page,
+            app_switched,
+            domain_switched,
+            has_override,
+        )
+        if not has_override and (
+            self._matches_policy(app_name, self.ignore_apps)
+            or self._matches_policy(domain_hint, self.ignore_domains)
+        ):
+            self.logger.debug("Routing decision=skip reason=policy_ignore")
+            return "skip"
+        if has_override:
+            self.logger.debug("Routing decision=full_vlm reason=override")
+            return "full_vlm"
+        if similarity_score is None:
+            self.logger.debug("Routing decision=full_vlm reason=no_similarity_score")
+            return "full_vlm"
+        if similarity_score < self.full_vlm_ssim_threshold:
+            self.logger.debug(
+                "Routing decision=full_vlm reason=similarity_below_threshold full_threshold=%s",
+                self.full_vlm_ssim_threshold,
+            )
+            return "full_vlm"
+        self.logger.debug(
+            "Routing decision=fast_model reason=similarity_band full_threshold=%s skip_threshold=queue",
+            self.full_vlm_ssim_threshold,
+        )
+        return "fast_model"
+
+    def _matches_policy(self, value: str, policy_values: set[str]) -> bool:
+        normalized = str(value or "").strip().lower()
+        if not normalized:
+            return False
+        for candidate in policy_values:
+            if candidate and (normalized == candidate or normalized.startswith(candidate) or candidate in normalized):
+                self.logger.debug("Policy match value=%r candidate=%r", normalized, candidate)
+                return True
+        return False
+
+    async def _run_fast_model(
+        self,
+        *,
+        screenshot_path: str,
+        model: str,
+        captured_at: str | None,
+        similarity_score: float | None,
+        previous_observation: Optional[VisualObservation],
+        uiat_context: Dict[str, Any],
+    ) -> dict:
         payload = {
             "screenshot_captured_at": captured_at or datetime.now().isoformat(),
+            "similarity_score": similarity_score,
+            "previous_observation": (
+                {
+                    "app_name": previous_observation.app_name,
+                    "page_hint": previous_observation.page_hint,
+                    "summary": previous_observation.summary,
+                    "inferred_user_activity": previous_observation.inferred_user_activity,
+                }
+                if previous_observation is not None
+                else None
+            ),
+            "uiat_context": {
+                "window_title": uiat_context.get("window_title"),
+                "window_class": uiat_context.get("window_class"),
+                "domain_hint": uiat_context.get("domain_hint"),
+                "app_hint": uiat_context.get("app_hint"),
+                "visible_text_summary": str(uiat_context.get("visible_text_summary") or "")[:1500],
+                "contains_dialog": bool(uiat_context.get("contains_dialog")),
+                "contains_notification": bool(uiat_context.get("contains_notification")),
+            },
+        }
+        attempts = self.fast_model_retry_count + 1
+        for attempt in range(1, attempts + 1):
+            self.logger.debug(
+                "Fast model attempt=%s/%s model=%s similarity=%s screenshot=%s",
+                attempt,
+                attempts,
+                self.fast_model or model,
+                similarity_score,
+                screenshot_path,
+            )
+            parsed = await self._invoke_model(
+                prompt=self.FAST_ROUTER_PROMPT,
+                payload=payload,
+                screenshot_path=screenshot_path,
+                model_name=self.fast_model or model,
+            )
+            if parsed:
+                self.logger.debug("Fast model returned valid JSON on attempt=%s", attempt)
+                return parsed
+            self.logger.debug("Fast model returned invalid/empty JSON on attempt=%s", attempt)
+        return {}
+
+    async def _run_full_model(
+        self,
+        *,
+        screenshot_path: str,
+        model: str,
+        recent_context: str,
+        captured_at: str | None,
+        similarity_score: float | None,
+        previous_observation: Optional[VisualObservation],
+        recent_observations: List[VisualObservation],
+        uiat_context: Dict[str, Any],
+    ) -> dict:
+        payload = {
+            "screenshot_captured_at": captured_at or datetime.now().isoformat(),
+            "similarity_score": similarity_score,
             "recent_context": recent_context,
             "visual_digest": self.memory.get_visual_digest(),
+            "uiat_context": {
+                "window_title": uiat_context.get("window_title"),
+                "window_class": uiat_context.get("window_class"),
+                "domain_hint": uiat_context.get("domain_hint"),
+                "app_hint": uiat_context.get("app_hint"),
+                "visible_text_summary": str(uiat_context.get("visible_text_summary") or "")[:4000],
+                "contains_dialog": bool(uiat_context.get("contains_dialog")),
+                "contains_notification": bool(uiat_context.get("contains_notification")),
+            },
             "previous_observation": (
                 {
                     "summary": previous_observation.summary,
@@ -228,11 +499,32 @@ Rules:
                 for item in recent_observations
             ],
         }
-        with interaction_trace("passive_observer", metadata={"image_path": screenshot_path}):
+        return await self._invoke_model(
+            prompt=self.FULL_OBSERVER_PROMPT,
+            payload=payload,
+            screenshot_path=screenshot_path,
+            model_name=self.full_model or model,
+        )
+
+    async def _invoke_model(
+        self,
+        *,
+        prompt: str,
+        payload: Dict[str, Any],
+        screenshot_path: str,
+        model_name: str,
+    ) -> dict:
+        self.logger.debug(
+            "Invoking passive observer model=%s image=%s payload_keys=%s",
+            model_name,
+            screenshot_path,
+            sorted(payload.keys()),
+        )
+        with interaction_trace("passive_observer", metadata={"image_path": screenshot_path, "model": model_name}):
             completion = await self.llm.chat_completion_stream(
-                model=model,
+                model=model_name,
                 messages=[
-                    {"role": "system", "content": self._build_system_prompt(self.OBSERVER_PROMPT)},
+                    {"role": "system", "content": self._build_system_prompt(prompt)},
                     {"role": "user", "content": json.dumps(payload, ensure_ascii=False, indent=2)},
                 ],
                 tools=None,
@@ -240,6 +532,12 @@ Rules:
             )
         text = await self._consume_stream_text(completion)
         parsed = self._parse_json_object(text)
+        self.logger.debug(
+            "Passive observer model=%s parsed_json=%s raw_text_chars=%s",
+            model_name,
+            bool(parsed),
+            len(text or ""),
+        )
         return parsed if isinstance(parsed, dict) else {}
 
     def _attach_to_session(self, observation: VisualObservation) -> VisualSession:

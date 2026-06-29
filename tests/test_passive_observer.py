@@ -104,6 +104,30 @@ class FakeTaskQueue:
         return None
 
 
+class FakeUIATAdapter:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def inspect_foreground_window(self):
+        return dict(self.payload)
+
+
+class FakeReminderHelper:
+    def __init__(self, existing=None):
+        self.existing = list(existing or [])
+        self.created = []
+
+    def is_enabled(self):
+        return True
+
+    def get_tasks(self):
+        return [{"content": item} for item in self.existing + self.created]
+
+    def add_task(self, content, due_datetime=None):
+        self.created.append(content)
+        return {"content": content, "due_datetime": due_datetime}
+
+
 class PassiveObserverTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -230,6 +254,211 @@ class PassiveObserverTests(unittest.TestCase):
         )
         self.assertEqual(self.memory.get_recent_visual_observations(limit=1)[0].app_name, "Steam")
         self.assertTrue(screenshot.exists())
+
+    def test_process_screenshot_uses_fast_model_for_medium_similarity(self):
+        llm = FakeVisualLLM(
+            [
+                json.dumps(
+                    {
+                        "app_page": "Docs / report",
+                        "summary": "A report remains open with small edits.",
+                        "detailed_description": "The same report view is visible with minor textual updates.",
+                        "inferred_user_activity": "editing a report",
+                    }
+                )
+            ]
+        )
+        screenshot = self.temp_path / "fast.png"
+        screenshot.write_bytes(b"queued")
+        service = PassiveObserverService(
+            memory=self.memory,
+            llm_provider=llm,
+            screen_capture=FakeScreenCapture([]),
+            screenshot_root=str(self.temp_path / "shots"),
+            fast_model="fast-model",
+            full_model="full-model",
+        )
+
+        observation = asyncio.run(
+            service.process_screenshot(
+                screenshot_path=str(screenshot),
+                model="fallback-model",
+                recent_context="",
+                captured_at="2026-06-25T10:00:00",
+                similarity_score=0.8,
+            )
+        )
+
+        self.assertIsNotNone(observation)
+        self.assertEqual(llm.calls[0]["model"], "fast-model")
+        payload = json.loads(observation.raw_payload_json or "{}")
+        self.assertEqual(payload.get("_analysis_mode"), "fast_model")
+
+    def test_process_screenshot_uses_full_model_for_large_change(self):
+        llm = FakeVisualLLM(
+            [
+                json.dumps(
+                    {
+                        "app_page": "Amazon / product page",
+                        "summary": "A new product page is open.",
+                        "detailed_description": "A laptop product page is visible with pricing and reviews.",
+                        "inferred_user_activity": "evaluating a product purchase",
+                    }
+                )
+            ]
+        )
+        screenshot = self.temp_path / "full.png"
+        screenshot.write_bytes(b"queued")
+        service = PassiveObserverService(
+            memory=self.memory,
+            llm_provider=llm,
+            screen_capture=FakeScreenCapture([]),
+            screenshot_root=str(self.temp_path / "shots"),
+            fast_model="fast-model",
+            full_model="full-model",
+        )
+
+        observation = asyncio.run(
+            service.process_screenshot(
+                screenshot_path=str(screenshot),
+                model="fallback-model",
+                recent_context="",
+                captured_at="2026-06-25T10:00:00",
+                similarity_score=0.4,
+            )
+        )
+
+        self.assertIsNotNone(observation)
+        self.assertEqual(llm.calls[0]["model"], "full-model")
+        payload = json.loads(observation.raw_payload_json or "{}")
+        self.assertEqual(payload.get("_analysis_mode"), "full_vlm")
+
+    def test_process_screenshot_skips_ignored_app_without_override(self):
+        llm = FakeVisualLLM([])
+        screenshot = self.temp_path / "ignored.png"
+        screenshot.write_bytes(b"queued")
+        service = PassiveObserverService(
+            memory=self.memory,
+            llm_provider=llm,
+            screen_capture=FakeScreenCapture([]),
+            screenshot_root=str(self.temp_path / "shots"),
+            ignore_apps=["spotify"],
+            uiat_adapter=FakeUIATAdapter(
+                {
+                    "ok": True,
+                    "window_title": "Spotify Premium",
+                    "window_class": "SpotifyMainWindow",
+                    "visible_text_summary": "Spotify playlist and playback controls",
+                    "contains_dialog": False,
+                    "contains_notification": False,
+                }
+            ),
+        )
+
+        observation = asyncio.run(
+            service.process_screenshot(
+                screenshot_path=str(screenshot),
+                model="fallback-model",
+                recent_context="",
+                captured_at="2026-06-25T10:00:00",
+                similarity_score=0.8,
+            )
+        )
+
+        self.assertIsNone(observation)
+        self.assertEqual(llm.calls, [])
+
+    def test_process_screenshot_can_disable_persistence(self):
+        llm = FakeVisualLLM(
+            [
+                json.dumps(
+                    {
+                        "app_page": "Docs / transient",
+                        "summary": "A transient screen was analyzed.",
+                        "detailed_description": "Visible content was analyzed without memory persistence.",
+                        "inferred_user_activity": "reviewing a transient screen",
+                    }
+                )
+            ]
+        )
+        screenshot = self.temp_path / "transient.png"
+        screenshot.write_bytes(b"queued")
+        service = PassiveObserverService(
+            memory=self.memory,
+            llm_provider=llm,
+            screen_capture=FakeScreenCapture([]),
+            screenshot_root=str(self.temp_path / "shots"),
+            persist_observations=False,
+        )
+
+        observation = asyncio.run(
+            service.process_screenshot(
+                screenshot_path=str(screenshot),
+                model="fallback-model",
+                recent_context="",
+                captured_at="2026-06-25T10:00:00",
+                similarity_score=0.4,
+            )
+        )
+
+        self.assertIsNotNone(observation)
+        self.assertEqual(len(self.memory.get_recent_visual_observations(limit=5)), 0)
+
+    def test_followup_creates_direct_todoist_reminder_from_hint(self):
+        observation = VisualObservation(
+            observation_id="obs-reminder",
+            screenshot_path="whatsapp.png",
+            created_at="2026-06-29T20:30:00",
+            app_name="WhatsApp",
+            summary="Coding challenge announcement is visible.",
+            detailed_description="The screen shows Code Autopsy 1.0 starting tonight at 9 PM IST.",
+            inferred_user_activity="checking coding challenge details",
+            raw_payload_json=json.dumps(
+                {
+                    "maybe_require_a_reminder": True,
+                    "reminder_context": "Code Autopsy 1.0 starts tonight, June 29, at 9:00 PM IST.",
+                }
+            ),
+        )
+        llm = FakeVisualLLM(
+            [
+                json.dumps({"unique_activities": ["checking coding challenge details"]}),
+                json.dumps({"useful_activities": []}),
+                json.dumps(
+                    {
+                        "action": "nothing",
+                        "task": "",
+                        "memory_updates": [],
+                        "user_info_updates": [],
+                    }
+                ),
+            ]
+        )
+        reminder_helper = FakeReminderHelper()
+        service = PassiveObserverFollowupService(
+            memory=self.memory,
+            task_queue=FakeTaskQueue(),
+            llm_provider=llm,
+            reminder_helper=reminder_helper,
+        )
+
+        result = asyncio.run(
+            service.process_observations(
+                observations=[observation],
+                model="test-model",
+                mark_sent=False,
+                apply_memory_updates=False,
+            )
+        )
+
+        self.assertEqual(
+            reminder_helper.created,
+            ["Code Autopsy 1.0 starts tonight, June 29, at 9:00 PM IST."],
+        )
+        self.assertEqual(
+            result["direct_reminders"],
+            ["Code Autopsy 1.0 starts tonight, June 29, at 9:00 PM IST."],
+        )
 
     def test_process_screenshot_returns_none_when_file_is_missing(self):
         llm = FakeVisualLLM([json.dumps({})])
