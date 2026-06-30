@@ -8,7 +8,6 @@ import re
 import threading
 import time
 from typing import Optional
-from concurrent.futures import Future
 
 from application.services.passive_observer_followup_service import PassiveObserverFollowupService
 from application.services.reflection_service import ReflectionService
@@ -200,7 +199,6 @@ class AmbientRuntime:
         self._screenshot_capture_thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._tool_bridge: Optional[MCPToolAdapter] = None
-        self._mcp_cleanup_future: Optional[Future] = None
 
     def _drain_queue(self, target_queue: queue.Queue) -> None:
         while True:
@@ -214,20 +212,6 @@ class AmbientRuntime:
     def stop_service(self) -> None:
         self.stop_event.set()
         self._screenshot_capture_stop_event.set()
-        self._request_mcp_cleanup()
-
-    def _request_mcp_cleanup(self) -> None:
-        if self._tool_bridge is None or self._loop is None or self._loop.is_closed():
-            return
-        if self._mcp_cleanup_future is not None and not self._mcp_cleanup_future.done():
-            return
-        try:
-            self._mcp_cleanup_future = asyncio.run_coroutine_threadsafe(
-                self._tool_bridge.cleanup(),
-                self._loop,
-            )
-        except RuntimeError:
-            self._mcp_cleanup_future = None
 
     async def _sleep_or_stop(self, seconds: float) -> bool:
         deadline = time.monotonic() + max(0.0, seconds)
@@ -235,7 +219,12 @@ class AmbientRuntime:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return False
-            await asyncio.sleep(min(0.25, remaining))
+            try:
+                await asyncio.sleep(min(0.25, remaining))
+            except asyncio.CancelledError:
+                if self.stop_event.is_set():
+                    return True
+                raise
         return True
 
     def _is_context_overflow_error(self, exc: Exception) -> bool:
@@ -567,7 +556,6 @@ class AmbientRuntime:
         try:
             self.stop_event.clear()
             self._tool_bridge = tool_bridge
-            self._mcp_cleanup_future = None
             await self._initialize_mcp_tools(tool_bridge, llm_service)
             self._start_screenshot_capture_loop(
                 passive_observer=passive_observer,
@@ -882,6 +870,9 @@ class AmbientRuntime:
 
                 if await self._sleep_or_stop(1):
                     break
+        except asyncio.CancelledError:
+            self.stop_event.set()
+            logger.info("Ambient runtime loop cancelled during shutdown.")
         finally:
             self._stop_screenshot_capture_loop()
             llm_service.reset_context()
@@ -893,7 +884,6 @@ class AmbientRuntime:
                 )
             await tool_bridge.cleanup()
             self._tool_bridge = None
-            self._mcp_cleanup_future = None
             self.llm_active_event.clear()
             self._drain_queue(self.queue)
 
