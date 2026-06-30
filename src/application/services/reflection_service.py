@@ -79,6 +79,7 @@ Rules:
         cadence_mode: str = "daily",
         interval_hours: int = 24,
         max_generated_tasks: int = 8,
+        max_task_generation_runs: int = 3,
         logger: Optional[logging.Logger] = None,
     ):
         self.memory = memory
@@ -90,6 +91,7 @@ Rules:
         self.cadence_mode = (cadence_mode or "daily").strip().lower()
         self.interval_hours = max(1, int(interval_hours))
         self.max_generated_tasks = int(max_generated_tasks)
+        self.max_task_generation_runs = max(0, int(max_task_generation_runs))
         self.logger = logger or logging.getLogger(self.__class__.__name__)
         self.history_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -105,6 +107,16 @@ Rules:
     async def run_if_due(self, *, model: str, now: Optional[datetime] = None) -> dict:
         now = now or datetime.now()
         history = self._load_history()
+        if self._task_generation_limit_reached(history):
+            return {
+                "ran": False,
+                "reason": "task_generation_limit_reached",
+                "last_run_at": history.get("last_run_at"),
+                "queued_tasks": [],
+                "generated_tasks": [],
+                "task_generation_runs": self._task_generation_run_count(history),
+                "max_task_generation_runs": self.max_task_generation_runs,
+            }
         if not self._is_due(history, now):
             return {
                 "ran": False,
@@ -172,24 +184,10 @@ Rules:
 
         queued_tasks: List[dict] = []
         skipped_tasks: List[dict] = []
-        existing_history_tasks = self._historical_task_descriptions(history)
-        pending_norm = {self._normalize_text(item) for item in pending_descriptions if self._normalize_text(item)}
-        seen_generated: set[str] = set()
-
         for task in generated_tasks[: self.max_generated_tasks]:
             description = task["description"]
             normalized = self._normalize_text(description)
             if not normalized:
-                continue
-            if normalized in seen_generated:
-                skipped_tasks.append({**task, "skip_reason": "duplicate_in_run"})
-                continue
-            seen_generated.add(normalized)
-            if normalized in pending_norm:
-                skipped_tasks.append({**task, "skip_reason": "already_pending"})
-                continue
-            if normalized in existing_history_tasks:
-                skipped_tasks.append({**task, "skip_reason": "already_generated_before"})
                 continue
             dedupe = await self._evaluate_candidate(
                 model=model,
@@ -261,7 +259,7 @@ Rules:
         }
 
     async def _cleanup_user_info(self, *, model: str, user_info: str) -> str:
-        with interaction_trace("reflection_service_cleanup"):
+        with interaction_trace("reflection.cleanup_user_info"):
             completion = await self.llm.chat_completion_stream(
                 model=model,
                 messages=[
@@ -289,7 +287,7 @@ Rules:
             "max_tasks": self.max_generated_tasks,
             "semantic_context": self._semantic_context(cleaned_user_info, cleaned_working_memory),
         }
-        with interaction_trace("reflection_service_generation"):
+        with interaction_trace("reflection.generation"):
             completion = await self.llm.chat_completion_stream(
                 model=model,
                 messages=[
@@ -304,7 +302,7 @@ Rules:
     async def _cleanup_working_memory(self, *, model: str, working_memory: str) -> str:
         if not working_memory.strip():
             return ""
-        with interaction_trace("reflection_service_memory_cleanup"):
+        with interaction_trace("reflection.cleanup_memory"):
             completion = await self.llm.chat_completion_stream(
                 model=model,
                 messages=[
@@ -378,6 +376,21 @@ Rules:
                     }
                 )
         return results
+
+    def _task_generation_run_count(self, history: dict) -> int:
+        count = 0
+        for run in history.get("runs", []):
+            queued_tasks = run.get("queued_tasks") or []
+            if isinstance(queued_tasks, list) and queued_tasks:
+                count += 1
+        return count
+
+    def _task_generation_limit_reached(self, history: dict) -> bool:
+        if self.cadence_mode != "every_idle_cycle":
+            return False
+        if self.max_task_generation_runs <= 0:
+            return False
+        return self._task_generation_run_count(history) >= self.max_task_generation_runs
 
     def _historical_task_descriptions(self, history: dict) -> set[str]:
         values: set[str] = set()
