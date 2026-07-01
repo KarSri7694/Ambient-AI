@@ -179,7 +179,7 @@ def get_calendar_service():
     service = build('calendar', 'v3', credentials=creds)
     return service
 
-@mcp.tool(enabled=False)
+@mcp.tool
 def get_current_datetime():
     """
     Get the current date and time in ISO 8601 format.
@@ -336,7 +336,7 @@ def schedule_meeting(title: Annotated[str, "Title of the meeting"] = None,
         return {"error": str(e)}
 
 
-@mcp.tool(enabled=False)
+@mcp.tool
 def add(a: int, b: int) -> int:
     return a + b
 
@@ -508,7 +508,7 @@ def list_available_models() -> dict:
         "count": len(models),
     }
 
-@mcp.tool(enabled=True)
+@mcp.tool
 async def restore_previous_agent(message_to_agent: Annotated[str, "Message to the agent about the task and the  detailed summary of the task you performed"]):
     """
     Restore the LLM state from the most recently saved state.
@@ -516,7 +516,7 @@ async def restore_previous_agent(message_to_agent: Annotated[str, "Message to th
     # This tool is implemented directly in the LLMInteractionService to ensure the message history is properly handled during the model restoration.
     pass
     
-@mcp.tool(enabled=True)
+@mcp.tool
 def load_agent(model_name: Annotated[str, "The name of the model to load"], message: Annotated[str, "Task to be performed by the model"]) -> str:
     """
     Load a different specialised model and perform a task with it.
@@ -526,4 +526,5 @@ def load_agent(model_name: Annotated[str, "The name of the model to load"], mess
     pass
     
 if __name__ == "__main__":
+    mcp.disable("get_current_datetime", "add")
     mcp.run()
