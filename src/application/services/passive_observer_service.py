@@ -26,11 +26,15 @@ Look at the current screenshot, and return JSON only with exactly these fields:
   "detailed_description": "information-rich detail about what is visible",
   "inferred_user_activity": "what the user seems to be doing or trying to do",
   "maybe_require_a_reminder": "true or false, if the user might need a reminder about something on screen",
-  "reminder_context": "if maybe_require_a_reminder is true, provide a short description of what the reminder should be about"
+  "reminder_context": {
+    "message_to_user": "if maybe_require_a_reminder is true, provide the reminder text to send to the user",
+    "due_date": "optional ISO datetime string when the due time can be inferred, otherwise empty string"
+  }
 }
 
 Rules:
-- If you see anything important on screen that the user might need to remember, set maybe_require_a_reminder to true and provide a short reminder_context. 
+- If you see anything important on screen that the user might need to remember, set maybe_require_a_reminder to true and provide reminder_context.message_to_user.
+- Fill reminder_context.due_date only when the screenshot provides enough evidence to infer a concrete due datetime.
 - Return only those six fields. Do not add any other keys.
 - When the screen contains a chat or messaging interface, extract all the visible information most importantly infer if the user made any commitments or decisions, or something of importance is told to the user.  
 - Prefer visible facts over speculation.
@@ -49,7 +53,10 @@ Look at the screenshot and return JSON only with exactly these fields:
   "detailed_description": "short but concrete description of the current screen state",
   "inferred_user_activity": "what the user appears to be doing",
   "maybe_require_a_reminder": false,
-  "reminder_context": ""
+  "reminder_context": {
+    "message_to_user": "",
+    "due_date": ""
+  }
 }
 
 Rules:

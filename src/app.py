@@ -563,7 +563,7 @@ class AmbientRuntime:
                 system_idle_service=system_idle_service,
                 capture_interval_seconds=passive_observer_interval,
             )
-            logger.info("Starting reduced ambient runtime manager.")
+            logger.info("Starting ambient runtime manager.")
 
             while not self.stop_event.is_set():
                 current_user_idle = system_idle_service.is_user_idle()
@@ -643,8 +643,7 @@ class AmbientRuntime:
                     if explicit_tasks:
                         task = explicit_tasks[0]
                         logger.info(
-                            "Executing highest-priority Todoist task ID %s while idle: %s",
-                            task.get("id"),
+                            "Executing user-given Todoist task while idle: %s",
                             task.get("content"),
                         )
                         try:
@@ -665,7 +664,7 @@ class AmbientRuntime:
                                     )
                             finally:
                                 llm_service.reset_context()
-                            logger.info("Todoist task %s completed with result: %s", task.get("id"), result[:500])
+                            logger.info("Todoist task %s completed", task.get("id"))
                             todoist_provider.complete_task(task["id"])
                         except Exception:
                             logger.exception("Todoist task execution failed.")
@@ -758,37 +757,7 @@ class AmbientRuntime:
 
                 if runtime_active_now and now - last_idle_cycle_at >= idle_cycle_interval:
                     try:
-                        if reflection_service is not None and not ALWAYS_ON_MODE:
-                            services_initialized = await self._ensure_runtime(
-                                llm_adapter=llm_adapter,
-                                services_initialized=services_initialized,
-                                reason="running reflection service",
-                                model_name=REFLECTION_MODEL,
-                            )
-                            with self.gpu_lock:
-                                reflection_result = await reflection_service.run_if_due(model=REFLECTION_MODEL)
-                            if reflection_result.get("ran"):
-                                logger.info(
-                                    "Reflection service ran: cleaned_changed=%s, generated=%s, queued=%s, skipped=%s.",
-                                    reflection_result.get("cleaned_user_info_changed"),
-                                    len(reflection_result.get("generated_tasks", [])),
-                                    len(reflection_result.get("queued_tasks", [])),
-                                    len(reflection_result.get("skipped_tasks", [])),
-                                )
-                        if user_biodata_service is not None and not ALWAYS_ON_MODE:
-                            services_initialized = await self._ensure_runtime(
-                                llm_adapter=llm_adapter,
-                                services_initialized=services_initialized,
-                                reason="updating user biodata from passive observations",
-                                model_name=USER_BIODATA_MODEL,
-                            )
-                            with self.gpu_lock:
-                                biodata_result = await user_biodata_service.update_biodata(model=USER_BIODATA_MODEL)
-                            logger.info(
-                                "User BioData update processed %s observations and appended %s entries.",
-                                len(biodata_result.get("processed_observation_ids", [])),
-                                len(biodata_result.get("entries", [])),
-                            )
+                        # Perform Important Do-Now follow-up tasks
                         if passive_followup is not None and not ALWAYS_ON_MODE:
                             services_initialized = await self._ensure_runtime(
                                 llm_adapter=llm_adapter,
@@ -826,6 +795,7 @@ class AmbientRuntime:
                                 finally:
                                     llm_service.reset_context()
                                 logger.info("Do-now activity completed with result: %s", result[:500])
+                        #Perform queued follow-up tasks
                         queue_task_execution_allowed = user_idle_now or PERFORM_QUEUE_TASKS
                         pending_tasks = task_queue.get_pending_tasks() if queue_task_execution_allowed else []
                         if pending_tasks:
@@ -857,6 +827,38 @@ class AmbientRuntime:
                                 self._mark_dedupe_item_completed(semantic_dedupe, task)
                             finally:
                                 llm_service.reset_context()
+
+                        if reflection_service is not None and not ALWAYS_ON_MODE:
+                            services_initialized = await self._ensure_runtime(
+                                llm_adapter=llm_adapter,
+                                services_initialized=services_initialized,
+                                reason="running reflection service",
+                                model_name=REFLECTION_MODEL,
+                            )
+                            with self.gpu_lock:
+                                reflection_result = await reflection_service.run_if_due(model=REFLECTION_MODEL)
+                            if reflection_result.get("ran"):
+                                logger.info(
+                                    "Reflection service ran: cleaned_changed=%s, generated=%s, queued=%s, skipped=%s.",
+                                    reflection_result.get("cleaned_user_info_changed"),
+                                    len(reflection_result.get("generated_tasks", [])),
+                                    len(reflection_result.get("queued_tasks", [])),
+                                    len(reflection_result.get("skipped_tasks", [])),
+                                )
+                        if user_biodata_service is not None and not ALWAYS_ON_MODE:
+                            services_initialized = await self._ensure_runtime(
+                                llm_adapter=llm_adapter,
+                                services_initialized=services_initialized,
+                                reason="updating user biodata from passive observations",
+                                model_name=USER_BIODATA_MODEL,
+                            )
+                            with self.gpu_lock:
+                                biodata_result = await user_biodata_service.update_biodata(model=USER_BIODATA_MODEL)
+                            logger.info(
+                                "User BioData update processed %s observations and appended %s entries.",
+                                len(biodata_result.get("processed_observation_ids", [])),
+                                len(biodata_result.get("entries", [])),
+                            )
                     except Exception:
                         logger.exception("Idle follow-up cycle failed.")
                     last_idle_cycle_at = now
@@ -865,7 +867,7 @@ class AmbientRuntime:
                     services_initialized = await self._release_runtime(
                         llm_adapter=llm_adapter,
                         services_initialized=services_initialized,
-                        reason="user is active; keep VRAM clear",
+                        reason="user is active; freeing up VRAM",
                     )
 
                 if await self._sleep_or_stop(1):

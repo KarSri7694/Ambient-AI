@@ -248,7 +248,10 @@ class SemanticDeduplicationServiceTests(unittest.TestCase):
             raw_payload_json=json.dumps(
                 {
                     "maybe_require_a_reminder": True,
-                    "reminder_context": "Code Autopsy 1.0 starts tonight at 9 PM",
+                    "reminder_context": {
+                        "message_to_user": "Code Autopsy 1.0 starts tonight at 9 PM",
+                        "due_date": "2026-06-29T21:00:00+05:30",
+                    },
                 }
             ),
         )

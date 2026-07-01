@@ -246,7 +246,14 @@ Rules:
             payload = json.loads(raw_payload_json)
         except json.JSONDecodeError:
             return ""
-        return self._clean_text(payload.get("reminder_context"))
+        reminder_context = payload.get("reminder_context")
+        if isinstance(reminder_context, dict):
+            message = self._clean_text(reminder_context.get("message_to_user"))
+            due_date = self._clean_text(reminder_context.get("due_date"))
+            if message and due_date:
+                return f"{message} Due: {due_date}"
+            return message or due_date
+        return self._clean_text(reminder_context)
 
     def _clean_text(self, value) -> str:
         if value is None:

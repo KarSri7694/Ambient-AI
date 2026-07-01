@@ -3,6 +3,7 @@ import json
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -121,10 +122,12 @@ class FakeReminderHelper:
         return True
 
     def get_tasks(self):
-        return [{"content": item} for item in self.existing + self.created]
+        tasks = [{"content": item} for item in self.existing]
+        tasks.extend({"content": item["content"]} for item in self.created)
+        return tasks
 
     def add_task(self, content, due_datetime=None):
-        self.created.append(content)
+        self.created.append({"content": content, "due_datetime": due_datetime})
         return {"content": content, "due_datetime": due_datetime}
 
 
@@ -416,7 +419,10 @@ class PassiveObserverTests(unittest.TestCase):
             raw_payload_json=json.dumps(
                 {
                     "maybe_require_a_reminder": True,
-                    "reminder_context": "Code Autopsy 1.0 starts tonight, June 29, at 9:00 PM IST.",
+                    "reminder_context": {
+                        "message_to_user": "Code Autopsy 1.0 starts tonight, June 29, at 9:00 PM IST.",
+                        "due_date": "2026-06-29T21:00:00+05:30",
+                    },
                 }
             ),
         )
@@ -453,12 +459,161 @@ class PassiveObserverTests(unittest.TestCase):
 
         self.assertEqual(
             reminder_helper.created,
-            ["Code Autopsy 1.0 starts tonight, June 29, at 9:00 PM IST."],
+            [
+                {
+                    "content": "Code Autopsy 1.0 starts tonight, June 29, at 9:00 PM IST.",
+                    "due_datetime": datetime.fromisoformat("2026-06-29T21:00:00+05:30"),
+                }
+            ],
         )
         self.assertEqual(
             result["direct_reminders"],
             ["Code Autopsy 1.0 starts tonight, June 29, at 9:00 PM IST."],
         )
+
+    def test_followup_creates_direct_todoist_reminder_without_due_date_when_missing(self):
+        observation = VisualObservation(
+            observation_id="obs-reminder-no-due",
+            screenshot_path="gmail.png",
+            created_at="2026-06-29T20:30:00",
+            app_name="Gmail",
+            summary="A reminder-worthy email is open.",
+            detailed_description="An email mentions something to remember later today.",
+            inferred_user_activity="reviewing reminder details",
+            raw_payload_json=json.dumps(
+                {
+                    "maybe_require_a_reminder": True,
+                    "reminder_context": {
+                        "message_to_user": "follow up on the pending reply if not sent today",
+                        "due_date": "",
+                    },
+                }
+            ),
+        )
+        llm = FakeVisualLLM(
+            [
+                json.dumps({"unique_activities": ["reviewing reminder details"]}),
+                json.dumps({"useful_activities": []}),
+                json.dumps({"action": "nothing", "task": "", "memory_updates": [], "user_info_updates": []}),
+            ]
+        )
+        reminder_helper = FakeReminderHelper()
+        service = PassiveObserverFollowupService(
+            memory=self.memory,
+            task_queue=FakeTaskQueue(),
+            llm_provider=llm,
+            reminder_helper=reminder_helper,
+        )
+
+        result = asyncio.run(
+            service.process_observations(
+                observations=[observation],
+                model="test-model",
+                mark_sent=False,
+                apply_memory_updates=False,
+            )
+        )
+
+        self.assertEqual(
+            reminder_helper.created,
+            [{"content": "follow up on the pending reply if not sent today", "due_datetime": None}],
+        )
+        self.assertEqual(result["direct_reminders"], ["follow up on the pending reply if not sent today"])
+
+    def test_followup_legacy_string_reminder_context_remains_supported(self):
+        observation = VisualObservation(
+            observation_id="obs-legacy-reminder",
+            screenshot_path="legacy.png",
+            created_at="2026-06-29T20:30:00",
+            app_name="WhatsApp",
+            summary="A legacy reminder payload is stored.",
+            detailed_description="The old reminder payload still uses a plain string.",
+            inferred_user_activity="checking event details",
+            raw_payload_json=json.dumps(
+                {
+                    "maybe_require_a_reminder": True,
+                    "reminder_context": "Code Autopsy 1.0 starts tonight at 9 PM",
+                }
+            ),
+        )
+        llm = FakeVisualLLM(
+            [
+                json.dumps({"unique_activities": ["checking event details"]}),
+                json.dumps({"useful_activities": []}),
+                json.dumps({"action": "nothing", "task": "", "memory_updates": [], "user_info_updates": []}),
+            ]
+        )
+        reminder_helper = FakeReminderHelper()
+        service = PassiveObserverFollowupService(
+            memory=self.memory,
+            task_queue=FakeTaskQueue(),
+            llm_provider=llm,
+            reminder_helper=reminder_helper,
+        )
+
+        result = asyncio.run(
+            service.process_observations(
+                observations=[observation],
+                model="test-model",
+                mark_sent=False,
+                apply_memory_updates=False,
+            )
+        )
+
+        self.assertEqual(
+            reminder_helper.created,
+            [{"content": "Code Autopsy 1.0 starts tonight at 9 PM", "due_datetime": None}],
+        )
+        self.assertEqual(result["direct_reminders"], ["Code Autopsy 1.0 starts tonight at 9 PM"])
+
+    def test_followup_invalid_due_date_falls_back_to_content_only(self):
+        observation = VisualObservation(
+            observation_id="obs-invalid-due",
+            screenshot_path="calendar.png",
+            created_at="2026-06-29T20:30:00",
+            app_name="Calendar",
+            summary="A reminder with malformed due date is visible.",
+            detailed_description="The payload includes an invalid due date string.",
+            inferred_user_activity="checking event details",
+            raw_payload_json=json.dumps(
+                {
+                    "maybe_require_a_reminder": True,
+                    "reminder_context": {
+                        "message_to_user": "join the event tonight",
+                        "due_date": "tonight-at-nine",
+                    },
+                }
+            ),
+        )
+        llm = FakeVisualLLM(
+            [
+                json.dumps({"unique_activities": ["checking event details"]}),
+                json.dumps({"useful_activities": []}),
+                json.dumps({"action": "nothing", "task": "", "memory_updates": [], "user_info_updates": []}),
+            ]
+        )
+        reminder_helper = FakeReminderHelper()
+        service = PassiveObserverFollowupService(
+            memory=self.memory,
+            task_queue=FakeTaskQueue(),
+            llm_provider=llm,
+            reminder_helper=reminder_helper,
+        )
+
+        result = asyncio.run(
+            service.process_observations(
+                observations=[observation],
+                model="test-model",
+                mark_sent=False,
+                apply_memory_updates=False,
+            )
+        )
+
+        self.assertEqual(
+            reminder_helper.created,
+            [{"content": "join the event tonight", "due_datetime": None}],
+        )
+        self.assertEqual(result["direct_reminders"], ["join the event tonight"])
 
     def test_process_screenshot_returns_none_when_file_is_missing(self):
         llm = FakeVisualLLM([json.dumps({})])
@@ -492,7 +647,10 @@ class PassiveObserverTests(unittest.TestCase):
             raw_payload_json=json.dumps(
                 {
                     "maybe_require_a_reminder": True,
-                    "reminder_context": "follow up on the pending reply if not sent today",
+                    "reminder_context": {
+                        "message_to_user": "follow up on the pending reply if not sent today",
+                        "due_date": "",
+                    },
                 }
             ),
         )
@@ -609,7 +767,9 @@ class PassiveObserverTests(unittest.TestCase):
         detailed_text = " ".join(item["detailed_description"] for item in decision_payload["observation_context"])
         self.assertIn("unfinished reply draft", detailed_text)
         self.assertTrue(any(item["maybe_require_a_reminder"] for item in decision_payload["observation_context"]))
-        reminder_text = " ".join(item["reminder_context"] for item in decision_payload["observation_context"])
+        reminder_text = " ".join(
+            item["reminder_context"]["message_to_user"] for item in decision_payload["observation_context"]
+        )
         self.assertIn("follow up on the pending reply", reminder_text)
         for observation_id in ("obs-1", "obs-2", "obs-3", "obs-4"):
             persisted = self.memory.get_visual_observation(observation_id)

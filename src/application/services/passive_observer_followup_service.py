@@ -317,7 +317,8 @@ Output:
         rows: List[dict] = []
         for observation in observations:
             reminder_hint = self._extract_reminder_hint(observation.raw_payload_json)
-            activity = self._clean_text(observation.inferred_user_activity) or reminder_hint["reminder_context"]
+            reminder_text = self._reminder_message(reminder_hint["reminder_context"])
+            activity = self._clean_text(observation.inferred_user_activity) or reminder_text
             if not activity:
                 continue
             rows.append(
@@ -357,7 +358,9 @@ Output:
         for row in rows:
             if not row.get("maybe_require_a_reminder"):
                 continue
-            reminder_text = self._clean_text(row.get("reminder_context"))
+            reminder_context = self._normalize_reminder_context(row.get("reminder_context"))
+            reminder_text = self._reminder_message(reminder_context)
+            due_date_text = self._clean_text(reminder_context.get("due_date"))
             normalized = self._normalize_activity(reminder_text)
             if not normalized or normalized in seen:
                 continue
@@ -368,6 +371,7 @@ Output:
                 "created_at": row["created_at"],
                 "app_name": row["app_name"],
                 "page_hint": row["page_hint"],
+                "reminder_due_date": due_date_text,
             }
             dedupe = await self._evaluate_candidate(
                 model=model,
@@ -385,7 +389,8 @@ Output:
                     metadata=dedupe_metadata,
                 )
                 continue
-            task = helper.add_task(reminder_text)
+            due_datetime = self._parse_due_datetime(due_date_text, reminder_text=reminder_text)
+            task = helper.add_task(reminder_text, due_datetime=due_datetime)
             if task is not None:
                 provider_ref = self._clean_text(getattr(task, "id", None) if not isinstance(task, dict) else task.get("id")) or None
                 self._record_created_item(
@@ -483,7 +488,10 @@ Output:
         for rows in grouped_rows.values():
             if not rows:
                 continue
-            if not any(row["maybe_require_a_reminder"] and row["reminder_context"] for row in rows):
+            if not any(
+                row["maybe_require_a_reminder"] and self._reminder_message(row["reminder_context"])
+                for row in rows
+            ):
                 continue
             activity = rows[0]["activity"]
             key = self._normalize_activity(activity)
@@ -540,7 +548,17 @@ Output:
             "created_at": rows[0]["created_at"] if rows else "",
             "app_names": [row["app_name"] for row in rows if row["app_name"]],
             "page_hints": [row["page_hint"] for row in rows if row["page_hint"]],
-            "reminder_contexts": [row["reminder_context"] for row in rows if row["reminder_context"]],
+            "reminder_contexts": [
+                row["reminder_context"]
+                for row in rows
+                if self._reminder_message(row["reminder_context"]) or self._clean_text(row["reminder_context"].get("due_date"))
+            ],
+            "reminder_messages": [self._reminder_message(row["reminder_context"]) for row in rows if self._reminder_message(row["reminder_context"])],
+            "reminder_due_dates": [
+                self._clean_text(row["reminder_context"].get("due_date"))
+                for row in rows
+                if isinstance(row.get("reminder_context"), dict) and self._clean_text(row["reminder_context"].get("due_date"))
+            ],
         }
 
     async def _evaluate_candidate(
@@ -678,15 +696,55 @@ Output:
 
     def _extract_reminder_hint(self, raw_payload_json: str | None) -> dict:
         if not raw_payload_json:
-            return {"maybe_require_a_reminder": False, "reminder_context": ""}
+            return {"maybe_require_a_reminder": False, "reminder_context": self._empty_reminder_context()}
         try:
             payload = json.loads(raw_payload_json)
         except json.JSONDecodeError:
-            return {"maybe_require_a_reminder": False, "reminder_context": ""}
+            return {"maybe_require_a_reminder": False, "reminder_context": self._empty_reminder_context()}
         return {
             "maybe_require_a_reminder": self._truthy(payload.get("maybe_require_a_reminder")),
-            "reminder_context": self._clean_text(payload.get("reminder_context")),
+            "reminder_context": self._normalize_reminder_context(payload.get("reminder_context")),
         }
+
+    def _empty_reminder_context(self) -> dict[str, str]:
+        return {"message_to_user": "", "due_date": ""}
+
+    def _normalize_reminder_context(self, value) -> dict[str, str]:
+        if isinstance(value, dict):
+            return {
+                "message_to_user": self._clean_text(value.get("message_to_user")),
+                "due_date": self._clean_text(value.get("due_date")),
+            }
+        legacy_text = self._clean_text(value)
+        if not legacy_text:
+            return self._empty_reminder_context()
+        return {"message_to_user": legacy_text, "due_date": ""}
+
+    def _reminder_message(self, reminder_context) -> str:
+        normalized = self._normalize_reminder_context(reminder_context)
+        return self._clean_text(normalized.get("message_to_user"))
+
+    def _format_reminder_context(self, reminder_context) -> str:
+        normalized = self._normalize_reminder_context(reminder_context)
+        message = self._clean_text(normalized.get("message_to_user"))
+        due_date = self._clean_text(normalized.get("due_date"))
+        if message and due_date:
+            return f"{message} Due: {due_date}"
+        return message or due_date
+
+    def _parse_due_datetime(self, due_date_text: str, *, reminder_text: str) -> datetime | None:
+        clean_due_date = self._clean_text(due_date_text)
+        if not clean_due_date:
+            return None
+        try:
+            return datetime.fromisoformat(clean_due_date)
+        except ValueError:
+            self.logger.warning(
+                "Invalid reminder due_date %r for passive observer reminder %r; creating task without due date.",
+                clean_due_date,
+                reminder_text,
+            )
+            return None
 
     def _dedupe_preserve_order(self, values: List[str]) -> List[str]:
         seen: set[str] = set()
@@ -748,6 +806,7 @@ Output:
         except json.JSONDecodeError:
             self.logger.warning("Passive observer follow-up response was not valid JSON.")
             return {}
+
     def _semantic_context(self, *, activity: str, rows: List[dict]) -> List[dict]:
         if self.semantic_memory is None:
             return []
@@ -760,7 +819,7 @@ Output:
                         for part in [
                             row.get("summary", ""),
                             row.get("detailed_description", ""),
-                            row.get("reminder_context", ""),
+                            self._format_reminder_context(row.get("reminder_context")),
                         ]
                         if part
                     )

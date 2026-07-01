@@ -184,10 +184,41 @@ Rules:
 
         queued_tasks: List[dict] = []
         skipped_tasks: List[dict] = []
+        pending_normalized = {
+            self._normalize_text(description)
+            for description in pending_descriptions
+            if self._normalize_text(description)
+        }
+        historical_normalized = self._historical_task_descriptions(history)
+        seen_this_run: set[str] = set()
         for task in generated_tasks[: self.max_generated_tasks]:
             description = task["description"]
             normalized = self._normalize_text(description)
             if not normalized:
+                continue
+            if normalized in pending_normalized:
+                skipped_tasks.append(
+                    {
+                        **task,
+                        "skip_reason": "pending_duplicate",
+                    }
+                )
+                continue
+            if normalized in historical_normalized:
+                skipped_tasks.append(
+                    {
+                        **task,
+                        "skip_reason": "historical_duplicate",
+                    }
+                )
+                continue
+            if normalized in seen_this_run:
+                skipped_tasks.append(
+                    {
+                        **task,
+                        "skip_reason": "run_duplicate",
+                    }
+                )
                 continue
             dedupe = await self._evaluate_candidate(
                 model=model,
@@ -236,6 +267,7 @@ Rules:
                 metadata=metadata,
                 dedupe_item_id=metadata["dedupe_item_id"],
             )
+            seen_this_run.add(normalized)
             queued_tasks.append(task)
 
         run_payload = {

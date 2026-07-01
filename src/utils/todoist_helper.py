@@ -116,18 +116,14 @@ class TodoistHelper:
             self.logger.warning("Error completing Todoist task %s: %s", task_id, exc)
 
     def add_task(self, content: str, due_datetime=None):
-        """Create a Todoist task in the configured project."""
+        """Create a Todoist task in the user's Todoist Inbox."""
         if self.api is None:
             return None
         normalized = str(content or "").strip()
         if not normalized:
             return None
         try:
-            project_id = self._ensure_project_id()
-            if not project_id:
-                return None
             kwargs = {
-                "project_id": project_id,
                 "content": normalized,
             }
             if due_datetime is not None:
