@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import json
 import logging
@@ -9,7 +10,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from application.ports.LLMProvider import LLMProvider
-from application.ports.tool_bridge_port import ToolBridgePort
+from application.ports.tool_bridge_port import (
+    BrowserToolBridgePort,
+    BrowserToolSessionPort,
+    ToolBridgePort,
+)
 from application.services.interaction_trace import (
     current_interaction_metadata,
     current_interaction_source,
@@ -23,6 +28,8 @@ class AgentFrame:
     messages: List[Dict[str, Any]] = field(default_factory=list)
     model: Optional[str] = None
     depth: int = 0
+    tools: Optional[List[Dict[str, Any]]] = None
+    tool_bridge: Optional[Any] = None
 
 
 class LLMInteractionService:
@@ -55,6 +62,18 @@ class LLMInteractionService:
         "- When the task is complete, immediately call restore_previous_agent exactly once.\n"
         "- In message_to_agent, return only the concrete result of the delegated task, with no extra planning.\n"
     )
+    BROWSER_AGENT_PROMPT = (
+        "You are a dedicated browser-control sub-agent working on one delegated task.\n"
+        "\n"
+        "Rules:\n"
+        "- Perform only the browser task supplied by the parent agent.\n"
+        "- Use the available browser tools to inspect pages before interacting with them.\n"
+        "- Do not broaden the task, visit unrelated sites, or attempt to spawn another agent.\n"
+        "- Do not bypass authentication, CAPTCHA, two-factor authentication, security warnings, "
+        "or confirmation screens. Return a clear blocker instead.\n"
+        "- When finished, return a concise result containing completion status, material actions "
+        "performed, requested information, and any blocker.\n"
+    )
     REPORTER_PROMPT = (
         "Create a user-facing report for an ambient agent execution.\n"
         "\n"
@@ -76,14 +95,21 @@ class LLMInteractionService:
         self,
         llm_provider: LLMProvider,
         tool_bridge: ToolBridgePort,
+        browser_tool_bridge: Optional[BrowserToolBridgePort] = None,
+        browser_model: Optional[str] = None,
+        browser_task_timeout_seconds: float = 180.0,
         reporter_model: Optional[str] = None,
         artifact_root: Optional[str] = None,
     ):
         self.llm = llm_provider
         self.tool_bridge = tool_bridge
+        self.browser_tool_bridge = browser_tool_bridge
+        self.browser_model = browser_model
+        self.browser_task_timeout_seconds = browser_task_timeout_seconds
         self.logger = logging.getLogger(self.__class__.__name__)
         self._tools: Optional[List[Dict[str, Any]]] = None
-        self._frame_stack: List[AgentFrame] = [AgentFrame()]
+        self._frame_stack: List[AgentFrame] = [AgentFrame(tool_bridge=tool_bridge)]
+        self._browser_lock = asyncio.Lock()
         self.reporter_model = reporter_model
         self.artifact_root = Path(artifact_root) if artifact_root else (self.PARENT_DIR / "artifacts")
         self.artifact_root.mkdir(parents=True, exist_ok=True)
@@ -92,8 +118,22 @@ class LLMInteractionService:
     def _frame(self) -> AgentFrame:
         return self._frame_stack[-1]
 
-    def _push_frame(self, model: str, depth: int) -> None:
-        self._frame_stack.append(AgentFrame(model=model, depth=depth))
+    def _push_frame(
+        self,
+        model: str,
+        depth: int,
+        *,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_bridge: Optional[Any] = None,
+    ) -> None:
+        self._frame_stack.append(
+            AgentFrame(
+                model=model,
+                depth=depth,
+                tools=tools,
+                tool_bridge=tool_bridge or self.tool_bridge,
+            )
+        )
 
     def _pop_frame(self) -> AgentFrame:
         if len(self._frame_stack) == 1:
@@ -185,19 +225,27 @@ class LLMInteractionService:
         allowed_tool_names: Optional[set[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Return the tool set allowed for the current agent depth."""
-        if not self._tools:
+        available_tools = self._frame.tools if self._frame.tools is not None else self._tools
+        if not available_tools:
             return []
         if agent_depth < self.MAX_AGENT_DEPTH:
-            tools = list(self._tools)
+            tools = list(available_tools)
         else:
             filtered_tools: List[Dict[str, Any]] = []
-            for tool in self._tools:
+            for tool in available_tools:
                 function_meta = tool.get("function", {})
                 tool_name = function_meta.get("name")
                 if tool_name in {"load_agent", "list_available_models"}:
                     continue
                 filtered_tools.append(tool)
             tools = filtered_tools
+
+        if agent_depth > 0:
+            tools = [
+                tool
+                for tool in tools
+                if tool.get("function", {}).get("name") != "use_browser"
+            ]
 
         if allowed_tool_names is None:
             return tools
@@ -209,6 +257,107 @@ class LLMInteractionService:
             if tool_name in allowed_tool_names:
                 filtered_tools.append(tool)
         return filtered_tools
+
+    async def _run_browser_agent(
+        self,
+        *,
+        task: str,
+        headless: bool,
+        agent_depth: int,
+    ) -> str:
+        if agent_depth != 0:
+            raise RuntimeError("use_browser can only be called by the root agent.")
+        if not task.strip():
+            raise ValueError("use_browser requires a non-empty task.")
+        if self.browser_tool_bridge is None:
+            raise RuntimeError("Browser MCP delegation is not configured.")
+        if not self.browser_model:
+            raise RuntimeError("No browser model is configured.")
+
+        async with self._browser_lock:
+            parent_model_name = self.llm.get_current_model() or self._frame.model
+            if not parent_model_name:
+                raise RuntimeError("Cannot determine the parent model before browser delegation.")
+
+            saved_parent_state = await self.llm.save_and_unload(self._frame.messages)
+            if saved_parent_state is None:
+                raise RuntimeError("Could not save the parent model state; browser task was not started.")
+
+            browser_session: Optional[BrowserToolSessionPort] = None
+            child_frame_pushed = False
+            browser_result = ""
+            primary_error: Optional[BaseException] = None
+            try:
+                browser_session = await self.browser_tool_bridge.open_session(headless=headless)
+                browser_tools = await browser_session.get_all_tools()
+                if not browser_tools:
+                    raise RuntimeError("The browser MCP server did not expose any safe tools.")
+
+                await self.llm.load_model(self.browser_model)
+                self._push_frame(
+                    model=self.browser_model,
+                    depth=agent_depth + 1,
+                    tools=browser_tools,
+                    tool_bridge=browser_session,
+                )
+                child_frame_pushed = True
+                allowed_tool_names = {
+                    tool.get("function", {}).get("name")
+                    for tool in browser_tools
+                    if tool.get("function", {}).get("name")
+                }
+                browser_result = await asyncio.wait_for(
+                    self.run_interaction(
+                        user_input="You have been given this browser task:\n" + task.strip(),
+                        system_prompt=self.BROWSER_AGENT_PROMPT,
+                        model=self.browser_model,
+                        agent_depth=agent_depth + 1,
+                        allowed_tool_names=allowed_tool_names,
+                        report_policy="silent",
+                    ),
+                    timeout=self.browser_task_timeout_seconds,
+                )
+            except BaseException as exc:
+                primary_error = exc
+            finally:
+                if child_frame_pushed:
+                    self._pop_frame()
+
+                cleanup_error: Optional[BaseException] = None
+                if browser_session is not None:
+                    try:
+                        await browser_session.cleanup()
+                    except BaseException as exc:
+                        cleanup_error = exc
+                        self.logger.exception("Failed to close browser MCP session.")
+
+                restore_error: Optional[BaseException] = None
+                try:
+                    current_model_name = self.llm.get_current_model()
+                    if current_model_name and current_model_name != parent_model_name:
+                        await self.llm.unload_model()
+                    await self.llm.load_and_restore()
+                except BaseException as exc:
+                    restore_error = exc
+                    self.logger.exception("Failed to restore parent model after browser delegation.")
+
+                if restore_error is not None:
+                    if primary_error is not None:
+                        raise RuntimeError(
+                            f"Browser task failed ({primary_error}) and parent restoration also failed "
+                            f"({restore_error})."
+                        ) from restore_error
+                    raise RuntimeError(
+                        f"Browser task completed but parent restoration failed: {restore_error}"
+                    ) from restore_error
+                if primary_error is not None:
+                    raise primary_error
+                if cleanup_error is not None:
+                    raise RuntimeError(
+                        f"Browser task completed but browser cleanup failed: {cleanup_error}"
+                    ) from cleanup_error
+
+            return browser_result
 
     def _build_system_prompt(self, system_prompt: str) -> str:
         now = datetime.now()
@@ -424,7 +573,17 @@ class LLMInteractionService:
                         }
                     )
                     continue
-                if tool_name == "load_agent":
+                if tool_name == "use_browser":
+                    task = tool_args.get("task", "")
+                    headless = tool_args.get("headless", False)
+                    if not isinstance(headless, bool):
+                        raise ValueError("use_browser headless must be a boolean.")
+                    response_content = await self._run_browser_agent(
+                        task=str(task),
+                        headless=headless,
+                        agent_depth=agent_depth,
+                    )
+                elif tool_name == "load_agent":
                     if agent_depth >= self.MAX_AGENT_DEPTH:
                         response_content = (
                             f"Error: maximum agent depth reached ({self.MAX_AGENT_DEPTH}). "
@@ -530,7 +689,8 @@ class LLMInteractionService:
                             messages_path,
                         )
                 else:
-                    response_content = await self.tool_bridge.execute_tool(tool_name, tool_args)
+                    active_tool_bridge = self._frame.tool_bridge or self.tool_bridge
+                    response_content = await active_tool_bridge.execute_tool(tool_name, tool_args)
             except Exception as e:
                 response_content = f"Error: {str(e)}"
             tool_results.append((tool_name, response_content))

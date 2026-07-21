@@ -23,6 +23,7 @@ from audio_agent import AudioAgentService
 from infrastructure.adapter.LlamaCppSemanticAdapter import LlamaCppSemanticAdapter
 from infrastructure.adapter.llamaCppAdapter import LlamaCppAdapter
 from infrastructure.adapter.LoggingLLMProvider import LoggingLLMProvider
+from infrastructure.adapter.BrowserMCPToolAdapter import BrowserMCPToolAdapter
 from infrastructure.adapter.MCPToolAdapter import MCPToolAdapter
 from infrastructure.adapter.MSSScreenCaptureAdapter import MssScreenCaptureAdapter
 from infrastructure.adapter.SQLiteBenchmarkAdapter import SQLiteBenchmarkAdapter
@@ -63,6 +64,7 @@ REPORTER_MODEL = CONFIG.get_model("reporter_model", DEFAULT_MODEL)
 TODOIST_EXECUTION_MODEL = CONFIG.get_model("todoist_execution_model", DEFAULT_MODEL)
 REFLECTION_MODEL = CONFIG.get_model("reflection_model", DEFAULT_MODEL)
 TRANSCRIPT_PROCESSING_MODEL = CONFIG.get_model("transcript_processing_model", FOLLOWUP_EXECUTION_MODEL)
+BROWSER_MODEL = CONFIG.get_model("browser_model", FOLLOWUP_EXECUTION_MODEL)
 USER_DATA_DIR = Path(CONFIG.get_str("runtime", "user_data_dir", "D:\\USER_DATA"))
 PROJECT_ROOT = Path(__file__).parent.parent
 MEMORY_ROOT = USER_DATA_DIR / "memory"
@@ -94,6 +96,13 @@ LOG_API_HOST = CONFIG.get_str("log_api", "host", "0.0.0.0")
 LOG_API_PORT = CONFIG.get_int("log_api", "port", 8765)
 LOG_API_BUFFER_SIZE = CONFIG.get_int("log_api", "buffer_size", 2000)
 MCP_CONFIG_PATH = CONFIG.get_str("runtime", "mcp_config_path", "mcp.json")
+BROWSER_MCP_SERVER_NAME = CONFIG.get_str("browser", "server_name", "playwright")
+BROWSER_TASK_TIMEOUT_SECONDS = CONFIG.get_float("browser", "task_timeout_seconds", 180.0)
+BROWSER_PROFILE_DIR = CONFIG.get_str(
+    "browser",
+    "persistent_profile_dir",
+    str(USER_DATA_DIR / "browser" / "profile"),
+)
 TODOIST_ENABLED = CONFIG.get_bool("todoist", "enabled", True)
 UPLOADS_DIR = Path(CONFIG.get_str("audio", "uploads_dir", str(USER_DATA_DIR / "uploads")))
 TRANSCRIPTIONS_DIR = Path(CONFIG.get_str("audio", "transcriptions_dir", str(USER_DATA_DIR / "transcriptions")))
@@ -144,6 +153,10 @@ PASSIVE_OBSERVER_IGNORE_APPS = _parse_json_list("passive_observer", "ignore_apps
 PASSIVE_OBSERVER_IGNORE_DOMAINS = _parse_json_list("passive_observer", "ignore_domains_json")
 PASSIVE_OBSERVER_ALWAYS_FULL_APPS = _parse_json_list("passive_observer", "always_full_apps_json")
 PASSIVE_OBSERVER_ALWAYS_FULL_DOMAINS = _parse_json_list("passive_observer", "always_full_domains_json")
+BROWSER_DENIED_TOOL_NAMES = set(
+    _parse_json_list("browser", "denied_tools_json")
+    or ["browser_run_code", "browser_run_code_unsafe"]
+)
 
 configure_runtime_log_streaming(max_entries=LOG_API_BUFFER_SIZE, debug_enabled=DEBUG_MODE)
 
@@ -335,9 +348,18 @@ class AmbientRuntime:
             current_response_path=str(CURRENT_RESPONSE_PATH),
         )
         tool_bridge = MCPToolAdapter()
+        browser_tool_bridge = BrowserMCPToolAdapter(
+            config_path=MCP_CONFIG_PATH,
+            server_name=BROWSER_MCP_SERVER_NAME,
+            profile_dir=BROWSER_PROFILE_DIR,
+            denied_tool_names=BROWSER_DENIED_TOOL_NAMES,
+        )
         llm_service = LLMInteractionService(
             llm_provider=logged_llm,
             tool_bridge=tool_bridge,
+            browser_tool_bridge=browser_tool_bridge,
+            browser_model=BROWSER_MODEL,
+            browser_task_timeout_seconds=BROWSER_TASK_TIMEOUT_SECONDS,
             reporter_model=REPORTER_MODEL,
             artifact_root=str(ARTIFACTS_ROOT),
         )

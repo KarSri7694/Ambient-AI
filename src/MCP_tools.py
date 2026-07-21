@@ -515,6 +515,27 @@ async def restore_previous_agent(message_to_agent: Annotated[str, "Message to th
     """
     # This tool is implemented directly in the LLMInteractionService to ensure the message history is properly handled during the model restoration.
     pass
+
+
+@mcp.tool
+async def use_browser(
+    task: Annotated[
+        str,
+        "Detailed browser task including the goal, relevant URLs, stopping conditions, and expected result",
+    ],
+    headless: Annotated[
+        bool,
+        "Run in an isolated headless browser when true; use the visible persistent browser profile when false",
+    ] = False,
+) -> str:
+    """
+    Delegate one browser task to the dedicated browser-control model.
+
+    The main model is saved and unloaded while the browser agent works. Raw
+    browser tools are available only to that delegated agent. This tool is
+    implemented by LLMInteractionService because it owns model handoff state.
+    """
+    pass
     
 @mcp.tool
 def load_agent(model_name: Annotated[str, "The name of the model to load"], message: Annotated[str, "Task to be performed by the model"]) -> str:

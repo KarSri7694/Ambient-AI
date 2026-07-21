@@ -33,6 +33,12 @@ class MCPToolAdapter(ToolBridgePort):
             config = json.load(f)
 
         for server_name, server_config in config.get("mcpServers", {}).items():
+            if server_config.get("exposure") == "browser_agent":
+                self.logger.info(
+                    "Skipping browser-agent-only MCP server during main tool startup: %s",
+                    server_name,
+                )
+                continue
             self.logger.info(f"Connecting to MCP server: {server_name}")
             params = StdioServerParameters(
                 command=server_config["command"],

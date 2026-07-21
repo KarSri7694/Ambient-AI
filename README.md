@@ -81,6 +81,7 @@ Configured MCP tools currently include:
 - Custom local MCP tools from [src/MCP_tools.py](src/MCP_tools.py)
 - Finance tools from [src/finance_tools.py](src/finance_tools.py)
 - Tavily MCP remote search
+- A delegated Playwright MCP browser agent through `use_browser`
 
 The exact active tool surface depends on the servers listed in [mcp.json](mcp.json).
 
@@ -127,6 +128,13 @@ At minimum, verify:
 - the path to `src/MCP_tools.py`
 - the path to `src/finance_tools.py`
 - any required environment variables such as `GEMINI_API_KEY`, `SERPAPI_API_KEY`, or `TODOIST_API_TOKEN`
+
+The `playwright` server in `mcp.example.json` is marked with
+`"exposure": "browser_agent"`. Its raw `browser_*` tools are intentionally hidden
+from the main model. The main model sees `use_browser(task, headless=false)`, which
+saves and unloads it, runs one task with the configured `browser_model`, closes the
+browser MCP process, and restores the main model. Visible calls retain a browser
+profile under `.ambient_data/browser/profile`; headless calls are isolated.
 
 Do not commit real secrets in `mcp.json` or related config.
 
