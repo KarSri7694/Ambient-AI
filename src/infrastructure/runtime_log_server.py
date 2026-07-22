@@ -1,6 +1,9 @@
+import asyncio
+import hmac
 import json
 import logging
 import mimetypes
+import queue
 import threading
 from collections import deque
 from datetime import datetime
@@ -9,11 +12,12 @@ from typing import Any, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from application.services.training_data_service import TrainingDataService
 from infrastructure.adapter.SQLiteBenchmarkAdapter import SQLiteBenchmarkAdapter
+from infrastructure.adapter.SQLiteChatAdapter import ChatEventBroker, SQLiteChatAdapter
 from infrastructure.adapter.SQLiteInteractionLogAdapter import SQLiteInteractionLogAdapter
 from infrastructure.adapter.SQLiteTaskQueueAdapter import SQLiteTaskQueueAdapter
 from infrastructure.adapter.SQLiteTrainingDataAdapter import SQLiteTrainingDataAdapter
@@ -149,11 +153,27 @@ def create_runtime_log_app(
     training_store: SQLiteTrainingDataAdapter | None = None,
     training_service: TrainingDataService | None = None,
     media_roots: Optional[list[str]] = None,
+    chat_store: SQLiteChatAdapter | None = None,
+    chat_event_broker: ChatEventBroker | None = None,
+    auth_token: str = "",
 ) -> FastAPI:
     app = FastAPI(title="Ambient Runtime Logs")
     normalized_media_roots = [Path(root) for root in (media_roots or [])]
     if UI_ROOT.exists():
         app.mount("/runtime-ui", StaticFiles(directory=str(UI_ROOT)), name="runtime_ui")
+
+    @app.middleware("http")
+    async def protect_api(request: Request, call_next):
+        if request.url.path.startswith("/api/") and auth_token:
+            authorization = request.headers.get("authorization", "")
+            expected = f"Bearer {auth_token}"
+            cookie_token = request.cookies.get("ambient_auth", "")
+            if not (
+                hmac.compare_digest(authorization, expected)
+                or hmac.compare_digest(cookie_token, auth_token)
+            ):
+                return JSONResponse(status_code=401, content={"detail": "invalid_auth_token"})
+        return await call_next(request)
 
     @app.get("/healthz")
     def healthz() -> dict[str, Any]:
@@ -194,7 +214,7 @@ def create_runtime_log_app(
             )
         queued_tasks = []
         if task_store is not None:
-            for task in task_store.get_pending_tasks():
+            for task in task_store.get_all_pending_tasks():
                 metadata = {}
                 if getattr(task, "metadata_json", None):
                     try:
@@ -209,9 +229,113 @@ def create_runtime_log_app(
                         "created_at": task.created_at,
                         "status": task.status,
                         "metadata": metadata,
+                        "run_at_utc": task.run_at_utc,
                     }
                 )
         return {"reports": reports, "queued_tasks": queued_tasks, "count": len(reports)}
+
+    @app.get("/api/chat/sessions")
+    def get_chat_sessions(limit: int = Query(default=100, ge=1, le=500)) -> dict[str, Any]:
+        if chat_store is None:
+            return {"sessions": [], "count": 0}
+        sessions = chat_store.list_sessions(limit=limit)
+        return {"sessions": sessions, "count": len(sessions)}
+
+    @app.post("/api/chat/sessions")
+    async def create_chat_session(request: Request) -> dict[str, Any]:
+        if chat_store is None:
+            raise HTTPException(status_code=503, detail="chat_unavailable")
+        body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+        return {"session": chat_store.create_session(str(body.get("title") or "New conversation"))}
+
+    @app.patch("/api/chat/sessions/{session_id}")
+    async def rename_chat_session(session_id: str, request: Request) -> dict[str, Any]:
+        if chat_store is None:
+            raise HTTPException(status_code=503, detail="chat_unavailable")
+        body = await request.json()
+        try:
+            session = chat_store.rename_session(session_id, str(body.get("title") or ""))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if session is None:
+            raise HTTPException(status_code=404, detail="session_not_found")
+        return {"session": session}
+
+    @app.get("/api/chat/sessions/{session_id}/messages")
+    def get_chat_messages(
+        session_id: str,
+        limit: int = Query(default=200, ge=1, le=1000),
+    ) -> dict[str, Any]:
+        if chat_store is None:
+            raise HTTPException(status_code=503, detail="chat_unavailable")
+        session = chat_store.get_session(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="session_not_found")
+        messages = chat_store.list_messages(session_id, limit=limit)
+        return {"session": session, "messages": messages, "count": len(messages)}
+
+    @app.post("/api/chat/sessions/{session_id}/messages")
+    async def submit_chat_message(session_id: str, request: Request) -> dict[str, Any]:
+        if chat_store is None:
+            raise HTTPException(status_code=503, detail="chat_unavailable")
+        body = await request.json()
+        try:
+            turn = chat_store.enqueue_turn(session_id, str(body.get("content") or ""))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="session_not_found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        assistant = turn["assistant_message"]
+        return {
+            **turn,
+            "stream_url": f"/api/chat/messages/{assistant['id']}/events",
+        }
+
+    @app.get("/api/chat/messages/{message_id}/events")
+    async def stream_chat_message(message_id: str, request: Request):
+        if chat_store is None or chat_event_broker is None:
+            raise HTTPException(status_code=503, detail="chat_stream_unavailable")
+        initial = chat_store.get_message(message_id)
+        if initial is None or initial.get("role") != "assistant":
+            raise HTTPException(status_code=404, detail="message_not_found")
+        subscriber = chat_event_broker.subscribe(message_id)
+
+        async def event_stream():
+            try:
+                snapshot = chat_store.get_message(message_id)
+                yield f"event: snapshot\ndata: {json.dumps(snapshot, ensure_ascii=False)}\n\n"
+                if snapshot and snapshot.get("status") in {"completed", "failed"}:
+                    terminal_type = "done" if snapshot["status"] == "completed" else "error"
+                    yield f"event: {terminal_type}\ndata: {json.dumps(snapshot, ensure_ascii=False)}\n\n"
+                    return
+                while not await request.is_disconnected():
+                    try:
+                        event = await asyncio.to_thread(subscriber.get, True, 15.0)
+                    except queue.Empty:
+                        yield ": heartbeat\n\n"
+                        continue
+                    if event.get("type") == "snapshot_required":
+                        event = {"type": "snapshot", "message": chat_store.get_message(message_id)}
+                    event_type = str(event.get("type") or "message")
+                    yield f"event: {event_type}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+                    if event_type in {"done", "error"}:
+                        return
+            finally:
+                chat_event_broker.unsubscribe(message_id, subscriber)
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    @app.post("/api/chat/scheduled/{task_id}/cancel")
+    def cancel_scheduled_task(task_id: int) -> dict[str, Any]:
+        if task_store is None:
+            raise HTTPException(status_code=503, detail="task_store_unavailable")
+        if not task_store.cancel_task(task_id):
+            raise HTTPException(status_code=409, detail="task_not_pending")
+        return {"ok": True, "task_id": task_id, "status": "cancelled"}
 
     @app.get("/api/benchmarks/runs")
     def get_benchmark_runs(
@@ -422,6 +546,7 @@ def create_runtime_log_app(
         return FileResponse(path=str(resolved), media_type=mime_type or "application/octet-stream")
 
     @app.get("/reports", response_class=HTMLResponse)
+    @app.get("/chat", response_class=HTMLResponse)
     @app.get("/", response_class=HTMLResponse)
     @app.get("/logs", response_class=HTMLResponse)
     @app.get("/benchmarks", response_class=HTMLResponse)
@@ -443,6 +568,9 @@ def start_runtime_log_server(
     training_store: SQLiteTrainingDataAdapter | None = None,
     training_service: TrainingDataService | None = None,
     media_roots: Optional[list[str]] = None,
+    chat_store: SQLiteChatAdapter | None = None,
+    chat_event_broker: ChatEventBroker | None = None,
+    auth_token: str = "",
 ) -> RuntimeLogBuffer:
     global _SERVER_THREAD, _SERVER
     log_buffer = configure_runtime_log_streaming(max_entries=max_entries)
@@ -458,6 +586,9 @@ def start_runtime_log_server(
             training_store=training_store,
             training_service=training_service,
             media_roots=media_roots,
+            chat_store=chat_store,
+            chat_event_broker=chat_event_broker,
+            auth_token=auth_token,
         )
 
         def _serve() -> None:

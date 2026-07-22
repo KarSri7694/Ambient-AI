@@ -131,12 +131,27 @@ At minimum, verify:
 
 The `playwright` server in `mcp.example.json` is marked with
 `"exposure": "browser_agent"`. Its raw `browser_*` tools are intentionally hidden
-from the main model. The main model sees `use_browser(task, headless=false)`, which
-saves and unloads it, runs one task with the configured `browser_model`, closes the
-browser MCP process, and restores the main model. Visible calls retain a browser
-profile under `.ambient_data/browser/profile`; headless calls are isolated.
+from the main model. The main model sees `use_browser(task)`; browser visibility is
+selected by the user's `[browser] headless` setting. The delegated model runs with
+the configured `browser_agent_model` and must end with
+`finish_browser_task(exit_browser, status, summary)`. Setting `exit_browser=false`
+returns control to the main model while retaining the browser session; retained
+sessions close during application shutdown.
 
 Do not commit real secrets in `mcp.json` or related config.
+
+### Direct Chat
+
+The runtime dashboard at `http://127.0.0.1:8765/` includes a persistent Chat tab.
+Conversations are stored locally in SQLite, can be reopened later, and stream
+responses while Ambient AI uses its normal MCP tools. Natural-language requests
+for an exact future time are scheduled through `schedule_task_at`; overdue tasks
+run the next time Ambient AI is available and publish their result to both the
+originating conversation and Reports.
+
+For access from another device on the LAN, set `[log_api] host = 0.0.0.0` and
+configure a strong `[chat] auth_token`. The runtime refuses non-loopback startup
+without that token. Keep the dashboard on a trusted network.
 
 ## Running
 Ambient AI currently expects multiple local processes.

@@ -30,3 +30,4 @@ DEVLOG.md
 /prompts
 config.ini
 /benchmarking
+/.playwright-mcp

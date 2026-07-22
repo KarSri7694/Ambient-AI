@@ -14,7 +14,8 @@
         <h1>Ambient Agent</h1>
       </div>
       <nav class="tabs" aria-label="Dashboard sections">
-        <button class="tab active" data-tab="reports" type="button">Reports</button>
+        <button class="tab active" data-tab="chat" type="button">Chat</button>
+        <button class="tab" data-tab="reports" type="button">Reports</button>
         <button class="tab" data-tab="benchmarks" type="button">Benchmarks</button>
         <button class="tab" data-tab="training" type="button">Training</button>
         <button class="tab" data-tab="logs" type="button">Logs</button>
@@ -26,7 +27,58 @@
     </header>
 
     <main class="workspace">
-      <section id="reportsSection" class="section active">
+      <section id="chatSection" class="section active">
+        <div class="chat-layout">
+          <aside class="chat-sidebar">
+            <div class="chat-sidebar-head">
+              <div>
+                <p class="section-kicker">Conversations</p>
+                <h2>Ambient AI</h2>
+              </div>
+              <button id="newChatButton" class="button primary" type="button">New</button>
+            </div>
+            <div id="chatAuthPanel" class="chat-auth-panel">
+              <label for="chatTokenInput">LAN access token</label>
+              <div class="chat-token-row">
+                <input id="chatTokenInput" type="password" autocomplete="current-password" placeholder="Token, if configured" />
+                <button id="saveChatTokenButton" class="button" type="button">Use</button>
+              </div>
+              <small>Kept in this browser tab only.</small>
+            </div>
+            <div id="chatSessionsEmpty" class="empty-state compact">No conversations yet.</div>
+            <div id="chatSessions" class="chat-session-list"></div>
+          </aside>
+          <div class="chat-main">
+            <header class="chat-header">
+              <div>
+                <p class="section-kicker">Direct conversation</p>
+                <h2 id="chatTitle">New conversation</h2>
+              </div>
+              <button id="renameChatButton" class="button" type="button" disabled>Rename</button>
+            </header>
+            <div id="chatMessages" class="chat-messages" aria-live="polite">
+              <div id="chatWelcome" class="chat-welcome">
+                <div class="welcome-mark">A</div>
+                <h3>Ask, act, or schedule.</h3>
+                <p>Ask about local information, give Ambient AI something to do now, or describe when it should run later.</p>
+                <div class="chat-examples">
+                  <button type="button" data-chat-example="Summarize the latest local runtime reports.">Summarize local reports</button>
+                  <button type="button" data-chat-example="Open the project README and tell me the most important setup steps.">Inspect a local file</button>
+                  <button type="button" data-chat-example="Tomorrow at 9:00 AM, check the queued tasks and report what is still pending.">Schedule a task</button>
+                </div>
+              </div>
+            </div>
+            <div id="chatActivity" class="chat-activity" aria-live="polite"></div>
+            <form id="chatComposer" class="chat-composer">
+              <textarea id="chatInput" rows="2" maxlength="12000" placeholder="Message Ambient AI…" aria-label="Message Ambient AI"></textarea>
+              <button id="sendChatButton" class="send-button" type="submit">Send</button>
+            </form>
+            <div class="composer-help">Enter to send · Shift+Enter for a new line · explicit action requests can use tools</div>
+          </div>
+        </div>
+      </section>
+
+      <section id="reportsSection" class="section">
         <div class="section-head">
           <div>
             <p class="section-kicker">Agent output</p>

@@ -72,7 +72,7 @@ class RuntimeLogServerTests(unittest.TestCase):
         app = create_runtime_log_app(buffer)
         client = TestClient(app)
 
-        for route in ["/", "/reports", "/logs", "/benchmarks", "/training"]:
+        for route in ["/", "/chat", "/reports", "/logs", "/benchmarks", "/training"]:
             response = client.get(route)
             self.assertEqual(response.status_code, 200)
             self.assertIn("Ambient Agent", response.text)

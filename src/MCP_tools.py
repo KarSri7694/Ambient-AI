@@ -523,18 +523,30 @@ async def use_browser(
         str,
         "Detailed browser task including the goal, relevant URLs, stopping conditions, and expected result",
     ],
-    headless: Annotated[
-        bool,
-        "Run in an isolated headless browser when true; use the visible persistent browser profile when false",
-    ] = False,
 ) -> str:
     """
     Delegate one browser task to the dedicated browser-control model.
 
-    The main model is saved and unloaded while the browser agent works. Raw
-    browser tools are available only to that delegated agent. This tool is
-    implemented by LLMInteractionService because it owns model handoff state.
+    The main model is saved and unloaded while the browser agent works. Browser
+    visibility is selected by the user in application configuration, not by the
+    model. Raw browser tools are available only to that delegated agent. This
+    tool is implemented by LLMInteractionService because it owns model handoff
+    state.
     """
+    pass
+
+
+@mcp.tool
+async def schedule_task_at(
+    task: Annotated[str, "Detailed task to execute later"],
+    run_at: Annotated[
+        str,
+        "Exact ISO 8601 date-time for execution; include a UTC offset whenever possible",
+    ],
+    priority: Annotated[str, "Task priority: low, medium, or high"] = "medium",
+) -> str:
+    """Schedule a task for an exact future date and time."""
+    # Implemented in LLMInteractionService so interaction/chat metadata is retained.
     pass
     
 @mcp.tool

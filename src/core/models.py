@@ -117,6 +117,9 @@ class NightTask:
     status: str = "pending"
     created_at: Optional[str] = None
     metadata_json: Optional[str] = None
+    run_at_utc: Optional[str] = None
+    claimed_at: Optional[str] = None
+    completed_at: Optional[str] = None
 
 @dataclass
 class Notification:

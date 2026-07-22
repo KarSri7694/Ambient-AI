@@ -13,12 +13,18 @@ const state = {
     model: "",
   },
   logCount: 0,
+  chatToken: sessionStorage.getItem("ambientChatToken") || "",
+  chatSessions: [],
+  selectedChatId: "",
+  chatMessageKey: "",
+  activeChatStreams: new Set(),
 };
 
 const els = {
   status: document.getElementById("status"),
   tabs: Array.from(document.querySelectorAll(".tab")),
   sections: {
+    chat: document.getElementById("chatSection"),
     reports: document.getElementById("reportsSection"),
     benchmarks: document.getElementById("benchmarksSection"),
     training: document.getElementById("trainingSection"),
@@ -64,6 +70,20 @@ const els = {
   modeAsr: document.getElementById("modeAsr"),
   logs: document.getElementById("logs"),
   logsCount: document.getElementById("logsCount"),
+  chatAuthPanel: document.getElementById("chatAuthPanel"),
+  chatTokenInput: document.getElementById("chatTokenInput"),
+  saveChatTokenButton: document.getElementById("saveChatTokenButton"),
+  newChatButton: document.getElementById("newChatButton"),
+  renameChatButton: document.getElementById("renameChatButton"),
+  chatSessions: document.getElementById("chatSessions"),
+  chatSessionsEmpty: document.getElementById("chatSessionsEmpty"),
+  chatTitle: document.getElementById("chatTitle"),
+  chatMessages: document.getElementById("chatMessages"),
+  chatWelcome: document.getElementById("chatWelcome"),
+  chatActivity: document.getElementById("chatActivity"),
+  chatComposer: document.getElementById("chatComposer"),
+  chatInput: document.getElementById("chatInput"),
+  sendChatButton: document.getElementById("sendChatButton"),
   imageLightbox: document.getElementById("imageLightbox"),
   imageLightboxImage: document.getElementById("imageLightboxImage"),
   imageLightboxClose: document.getElementById("imageLightboxClose"),
@@ -150,8 +170,27 @@ function closeImageLightbox() {
 }
 
 async function getJson(url) {
-  const response = await fetch(url, { cache: "no-store" });
+  const response = await apiFetch(url, { cache: "no-store" });
   return response.json();
+}
+
+function authHeaders(extra = {}) {
+  const headers = { ...extra };
+  if (state.chatToken) headers.Authorization = `Bearer ${state.chatToken}`;
+  return headers;
+}
+
+async function apiFetch(url, options = {}) {
+  const response = await fetch(url, {
+    ...options,
+    headers: authHeaders(options.headers || {}),
+  });
+  if (response.status === 401) {
+    els.chatAuthPanel.classList.add("needs-token");
+    els.status.textContent = "access token required";
+    throw new Error("Invalid or missing access token");
+  }
+  return response;
 }
 
 function renderReports(items) {
@@ -194,6 +233,8 @@ function renderQueuedTasks(items) {
       </div>
       <h3 class="record-title">Task ${escapeHtml(item.id ?? "")}</h3>
       <p class="record-text">${escapeHtml(item.description || "")}</p>
+      ${item.run_at_utc ? `<div class="meta-grid"><div><strong>Runs</strong>${escapeHtml(formatDate(item.run_at_utc))}</div></div>
+      <button class="button" type="button" data-cancel-task="${escapeHtml(item.id)}">Cancel scheduled task</button>` : ""}
     `;
     els.queuedTasks.appendChild(card);
   }
@@ -413,6 +454,242 @@ function setTrainingMode(mode) {
   pollTraining(true);
 }
 
+function chatWelcomeMarkup() {
+  return `
+    <div class="chat-welcome">
+      <div class="welcome-mark">A</div>
+      <h3>Ask, act, or schedule.</h3>
+      <p>Ask about local information, give Ambient AI something to do now, or describe when it should run later.</p>
+      <div class="chat-examples">
+        <button type="button" data-chat-example="Summarize the latest local runtime reports.">Summarize local reports</button>
+        <button type="button" data-chat-example="Open the project README and tell me the most important setup steps.">Inspect a local file</button>
+        <button type="button" data-chat-example="Tomorrow at 9:00 AM, check the queued tasks and report what is still pending.">Schedule a task</button>
+      </div>
+    </div>`;
+}
+
+function messageContent(message) {
+  if (message.status === "failed") return message.error_text || message.content || "Response failed.";
+  if (message.content) return message.content;
+  if (message.status === "queued") return "Queued…";
+  if (message.status === "running") return "Thinking…";
+  return message.error_text || "No response returned.";
+}
+
+function chatMessageElement(message) {
+  const article = document.createElement("article");
+  article.className = `chat-message ${message.role} ${message.status || ""}`;
+  article.dataset.messageId = message.id;
+  article.innerHTML = `
+    <div class="chat-bubble">${escapeHtml(messageContent(message))}</div>
+    <div class="chat-message-meta">
+      <span>${escapeHtml(message.role === "user" ? "You" : "Ambient AI")}</span>
+      <span>${escapeHtml(message.status || "completed")}</span>
+      ${message.message_kind === "scheduled_result" ? "<span>scheduled result</span>" : ""}
+      <span>${escapeHtml(formatDate(message.created_at))}</span>
+    </div>`;
+  return article;
+}
+
+function updateChatMessage(message) {
+  if (!message || !message.id) return;
+  const existing = els.chatMessages.querySelector(`[data-message-id="${CSS.escape(message.id)}"]`);
+  const replacement = chatMessageElement(message);
+  if (existing) existing.replaceWith(replacement);
+  else els.chatMessages.appendChild(replacement);
+  els.chatMessages.scrollTop = els.chatMessages.scrollHeight;
+}
+
+function renderChatMessages(messages) {
+  els.chatMessages.innerHTML = "";
+  if (!messages.length) {
+    els.chatMessages.innerHTML = chatWelcomeMarkup();
+    return;
+  }
+  for (const message of messages) {
+    els.chatMessages.appendChild(chatMessageElement(message));
+    if (message.role === "assistant" && ["queued", "running"].includes(message.status)) {
+      streamChatMessage(message.id);
+    }
+  }
+  els.chatMessages.scrollTop = els.chatMessages.scrollHeight;
+}
+
+function renderChatSessions() {
+  els.chatSessions.innerHTML = "";
+  els.chatSessionsEmpty.style.display = state.chatSessions.length ? "none" : "block";
+  for (const session of state.chatSessions) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `chat-session ${session.id === state.selectedChatId ? "active" : ""}`;
+    button.innerHTML = `
+      <strong>${escapeHtml(session.title)}</strong>
+      <small>${escapeHtml(session.preview || "No messages yet")}</small>`;
+    button.addEventListener("click", () => selectChatSession(session.id));
+    els.chatSessions.appendChild(button);
+  }
+}
+
+async function loadChatSessions() {
+  const payload = await getJson("/api/chat/sessions?limit=100");
+  state.chatSessions = payload.sessions || [];
+  renderChatSessions();
+  if (!state.selectedChatId && state.chatSessions.length) {
+    await selectChatSession(state.chatSessions[0].id);
+  }
+}
+
+async function createChatSession() {
+  const response = await apiFetch("/api/chat/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title: "New conversation" }),
+  });
+  const payload = await response.json();
+  await loadChatSessions();
+  await selectChatSession(payload.session.id);
+  els.chatInput.focus();
+  return payload.session;
+}
+
+async function selectChatSession(sessionId, force = false) {
+  if (!force && state.selectedChatId === sessionId && state.chatMessageKey) return;
+  const payload = await getJson(`/api/chat/sessions/${sessionId}/messages?limit=500`);
+  state.selectedChatId = sessionId;
+  state.chatMessageKey = JSON.stringify(payload.messages || []);
+  els.chatTitle.textContent = payload.session.title;
+  els.renameChatButton.disabled = false;
+  renderChatSessions();
+  renderChatMessages(payload.messages || []);
+  updateComposerState(payload.messages || []);
+}
+
+function updateComposerState(messages = []) {
+  const hasActive = messages.some(
+    (message) => message.role === "assistant" && ["queued", "running"].includes(message.status),
+  );
+  els.sendChatButton.disabled = hasActive;
+  els.chatInput.disabled = hasActive;
+  if (hasActive) els.chatActivity.textContent = "Ambient AI is working on this conversation…";
+  else if (!state.activeChatStreams.size) els.chatActivity.textContent = "";
+}
+
+function parseSseBlock(block) {
+  let eventType = "message";
+  const dataLines = [];
+  for (const line of block.split("\n")) {
+    if (line.startsWith("event:")) eventType = line.slice(6).trim();
+    if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
+  }
+  if (!dataLines.length) return null;
+  try {
+    return { type: eventType, data: JSON.parse(dataLines.join("\n")) };
+  } catch {
+    return null;
+  }
+}
+
+function handleChatStreamEvent(messageId, eventType, data) {
+  if (eventType === "snapshot") {
+    const message = data.message || data;
+    updateChatMessage(message);
+  } else if (eventType === "delta") {
+    const existing = els.chatMessages.querySelector(`[data-message-id="${CSS.escape(messageId)}"]`);
+    if (existing) {
+      const bubble = existing.querySelector(".chat-bubble");
+      if (["Thinking…", "Queued…"].includes(bubble.textContent)) bubble.textContent = "";
+      bubble.textContent += data.content || "";
+      els.chatMessages.scrollTop = els.chatMessages.scrollHeight;
+    }
+  } else if (eventType === "tool_started") {
+    els.chatActivity.textContent = `Using ${data.tool_name || "a tool"}…`;
+  } else if (eventType === "tool_finished") {
+    els.chatActivity.textContent = `${data.tool_name || "Tool"} ${data.ok ? "finished" : "failed"}.`;
+  } else if (eventType === "status") {
+    els.chatActivity.textContent = data.status === "running" ? "Ambient AI is thinking…" : data.status;
+  } else if (eventType === "done") {
+    updateChatMessage(data.message || data);
+    els.chatActivity.textContent = "";
+  } else if (eventType === "error") {
+    const existing = els.chatMessages.querySelector(`[data-message-id="${CSS.escape(messageId)}"]`);
+    if (existing) {
+      existing.classList.add("failed");
+      existing.querySelector(".chat-bubble").textContent = data.error_text || data.error || "Response failed.";
+    }
+    els.chatActivity.textContent = "The response failed. You can send the request again.";
+  }
+}
+
+async function streamChatMessage(messageId) {
+  if (state.activeChatStreams.has(messageId)) return;
+  state.activeChatStreams.add(messageId);
+  try {
+    const response = await apiFetch(`/api/chat/messages/${messageId}/events`, {
+      headers: { Accept: "text/event-stream" },
+      cache: "no-store",
+    });
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true }).replaceAll("\r\n", "\n");
+      let separator = buffer.indexOf("\n\n");
+      while (separator >= 0) {
+        const parsed = parseSseBlock(buffer.slice(0, separator));
+        buffer = buffer.slice(separator + 2);
+        if (parsed) handleChatStreamEvent(messageId, parsed.type, parsed.data);
+        separator = buffer.indexOf("\n\n");
+      }
+    }
+  } catch (error) {
+    els.chatActivity.textContent = "Live connection interrupted; saved messages will continue processing.";
+  } finally {
+    state.activeChatStreams.delete(messageId);
+    if (state.selectedChatId) await selectChatSession(state.selectedChatId, true);
+    await loadChatSessions();
+  }
+}
+
+async function submitChatMessage() {
+  const content = els.chatInput.value.trim();
+  if (!content) return;
+  if (!state.selectedChatId) await createChatSession();
+  els.sendChatButton.disabled = true;
+  els.chatInput.disabled = true;
+  try {
+    const response = await apiFetch(`/api/chat/sessions/${state.selectedChatId}/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content }),
+    });
+    const payload = await response.json();
+    els.chatInput.value = "";
+    updateChatMessage(payload.user_message);
+    updateChatMessage(payload.assistant_message);
+    els.chatActivity.textContent = "Queued for Ambient AI…";
+    await loadChatSessions();
+    streamChatMessage(payload.assistant_message.id);
+  } catch (error) {
+    els.chatActivity.textContent = error.message || "Could not send the message.";
+    els.sendChatButton.disabled = false;
+    els.chatInput.disabled = false;
+  }
+}
+
+async function pollChat() {
+  await loadChatSessions();
+  if (!state.selectedChatId || state.activeChatStreams.size) return;
+  const payload = await getJson(`/api/chat/sessions/${state.selectedChatId}/messages?limit=500`);
+  const serialized = JSON.stringify(payload.messages || []);
+  if (serialized !== state.chatMessageKey) {
+    state.chatMessageKey = serialized;
+    renderChatMessages(payload.messages || []);
+    updateComposerState(payload.messages || []);
+  }
+}
+
 function bindEvents() {
   els.tabs.forEach((tab) => {
     tab.addEventListener("click", () => {
@@ -422,6 +699,57 @@ function bindEvents() {
         section.classList.toggle("active", name === key);
       });
     });
+  });
+
+  els.saveChatTokenButton.addEventListener("click", async () => {
+    state.chatToken = els.chatTokenInput.value.trim();
+    sessionStorage.setItem("ambientChatToken", state.chatToken);
+    document.cookie = `ambient_auth=${encodeURIComponent(state.chatToken)}; Path=/; SameSite=Strict`;
+    els.chatAuthPanel.classList.remove("needs-token");
+    try {
+      await pollChat();
+      els.status.textContent = "access granted";
+    } catch (error) {
+      els.status.textContent = "invalid access token";
+    }
+  });
+
+  els.newChatButton.addEventListener("click", createChatSession);
+  els.renameChatButton.addEventListener("click", async () => {
+    const selected = state.chatSessions.find((session) => session.id === state.selectedChatId);
+    if (!selected) return;
+    const title = window.prompt("Conversation name", selected.title);
+    if (!title || !title.trim()) return;
+    await apiFetch(`/api/chat/sessions/${selected.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: title.trim() }),
+    });
+    await loadChatSessions();
+    els.chatTitle.textContent = title.trim();
+  });
+
+  els.chatComposer.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    await submitChatMessage();
+  });
+  els.chatInput.addEventListener("keydown", async (event) => {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      await submitChatMessage();
+    }
+  });
+  els.chatMessages.addEventListener("click", (event) => {
+    const example = event.target.closest("[data-chat-example]");
+    if (!example) return;
+    els.chatInput.value = example.dataset.chatExample;
+    els.chatInput.focus();
+  });
+  els.queuedTasks.addEventListener("click", async (event) => {
+    const button = event.target.closest("[data-cancel-task]");
+    if (!button) return;
+    await apiFetch(`/api/chat/scheduled/${button.dataset.cancelTask}/cancel`, { method: "POST" });
+    await pollReports();
   });
 
   els.modeLlm.addEventListener("click", () => setTrainingMode("llm"));
@@ -475,7 +803,7 @@ function bindEvents() {
       els.reviewHint.textContent = "Select a benchmark result before saving a review.";
       return;
     }
-    const payload = await fetch(`/api/benchmarks/results/${state.selectedBenchmarkId}/review`, {
+    const payload = await apiFetch(`/api/benchmarks/results/${state.selectedBenchmarkId}/review`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -507,7 +835,7 @@ function bindEvents() {
     } else {
       body.corrected_transcript_text = els.trainingPrimaryText.value;
     }
-    const payload = await fetch(endpoint, {
+    const payload = await apiFetch(endpoint, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -523,7 +851,7 @@ function bindEvents() {
 
   els.syncTrainingButton.addEventListener("click", async () => {
     const endpoint = state.trainingMode === "llm" ? "/api/training/sync/llm" : "/api/training/sync/asr";
-    const payload = await fetch(endpoint, { method: "POST" }).then((response) => response.json());
+    const payload = await apiFetch(endpoint, { method: "POST" }).then((response) => response.json());
     els.trainingHint.textContent = payload.ok
       ? `Synced ${payload.synced || 0} ${state.trainingMode.toUpperCase()} records.`
       : "Sync failed.";
@@ -532,7 +860,7 @@ function bindEvents() {
 
   els.exportTrainingButton.addEventListener("click", async () => {
     const endpoint = state.trainingMode === "llm" ? "/api/training/export/llm" : "/api/training/export/asr";
-    const payload = await fetch(endpoint, {
+    const payload = await apiFetch(endpoint, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ statuses: ["approved"] }),
@@ -551,6 +879,7 @@ async function poll() {
       pollReports(),
       pollBenchmarks(),
       pollTraining(),
+      pollChat(),
     ]);
     for (const entry of logPayload.entries || []) {
       appendLog(entry);
@@ -563,6 +892,10 @@ async function poll() {
 }
 
 bindEvents();
+els.chatTokenInput.value = state.chatToken;
+if (state.chatToken) {
+  document.cookie = `ambient_auth=${encodeURIComponent(state.chatToken)}; Path=/; SameSite=Strict`;
+}
 setTrainingMode("llm");
 poll();
 setInterval(poll, 2000);

@@ -1,11 +1,50 @@
 import json
 import logging
+import os
+import re
 from contextlib import AsyncExitStack
 from typing import List, Dict, Any, Optional
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from application.ports.tool_bridge_port import ToolBridgePort
+
+
+_ENVIRONMENT_REFERENCE = re.compile(
+    r"%(?P<windows>[A-Za-z_][A-Za-z0-9_]*)%|\$\{(?P<portable>[A-Za-z_][A-Za-z0-9_]*)\}"
+)
+
+
+def expand_environment_references(value: str) -> str:
+    """Expand config placeholders without placing secret values in mcp.json."""
+
+    def _replace(match: re.Match[str]) -> str:
+        variable_name = match.group("windows") or match.group("portable")
+        resolved = os.environ.get(variable_name)
+        if resolved is None or not resolved.strip():
+            raise ValueError(
+                f"Required MCP environment variable '{variable_name}' is not set."
+            )
+        return resolved
+
+    return _ENVIRONMENT_REFERENCE.sub(_replace, value)
+
+
+def resolve_server_config(server_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Resolve environment references in an MCP command, arguments, and env."""
+    command = expand_environment_references(str(server_config["command"]))
+    args = [
+        expand_environment_references(str(argument))
+        for argument in server_config.get("args", [])
+    ]
+    configured_env = server_config.get("env")
+    env = None
+    if configured_env is not None:
+        env = {
+            str(name): expand_environment_references(str(value))
+            for name, value in configured_env.items()
+        }
+    return {"command": command, "args": args, "env": env}
 
 
 class MCPToolAdapter(ToolBridgePort):
@@ -40,12 +79,9 @@ class MCPToolAdapter(ToolBridgePort):
                 )
                 continue
             self.logger.info(f"Connecting to MCP server: {server_name}")
-            params = StdioServerParameters(
-                command=server_config["command"],
-                args=server_config.get("args", []),
-                env=server_config.get("env"),
-            )
             try:
+                resolved_config = resolve_server_config(server_config)
+                params = StdioServerParameters(**resolved_config)
                 read, write = await self._exit_stack.enter_async_context(stdio_client(params))
                 session = await self._exit_stack.enter_async_context(ClientSession(read, write))
                 await session.initialize()

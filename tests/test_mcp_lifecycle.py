@@ -40,9 +40,14 @@ class _StubSQLiteVoiceAdapter:
 sqlite_voice_stub.SQLiteVoiceAdapter = _StubSQLiteVoiceAdapter
 sys.modules.setdefault("infrastructure.adapter.SQLiteVoiceAdapter", sqlite_voice_stub)
 
+import app
 from app import AmbientRuntime
 from application.services.llm_interaction_service import LLMInteractionService
-from infrastructure.adapter.MCPToolAdapter import MCPToolAdapter
+from infrastructure.adapter.MCPToolAdapter import (
+    MCPToolAdapter,
+    expand_environment_references,
+    resolve_server_config,
+)
 
 
 class _FakeLLMProvider:
@@ -146,6 +151,40 @@ def test_mcp_tool_adapter_start_servers_is_idempotent():
     assert list(adapter._sessions.keys()) == ["existing"]
 
 
+def test_mcp_config_expands_windows_and_portable_environment_references(monkeypatch):
+    monkeypatch.setenv("MCP_TEST_TOKEN", "resolved-secret")
+
+    resolved = resolve_server_config(
+        {
+            "command": "runner",
+            "args": ["https://example.test/?token=%MCP_TEST_TOKEN%"],
+            "env": {
+                "WINDOWS_STYLE": "%MCP_TEST_TOKEN%",
+                "PORTABLE_STYLE": "${MCP_TEST_TOKEN}",
+            },
+        }
+    )
+
+    assert resolved == {
+        "command": "runner",
+        "args": ["https://example.test/?token=resolved-secret"],
+        "env": {
+            "WINDOWS_STYLE": "resolved-secret",
+            "PORTABLE_STYLE": "resolved-secret",
+        },
+    }
+
+
+def test_mcp_config_rejects_unresolved_environment_reference(monkeypatch):
+    monkeypatch.delenv("MCP_MISSING_TOKEN", raising=False)
+
+    with pytest.raises(
+        ValueError,
+        match="Required MCP environment variable 'MCP_MISSING_TOKEN' is not set",
+    ):
+        expand_environment_references("%MCP_MISSING_TOKEN%")
+
+
 def test_ambient_runtime_separates_mcp_lifetime_from_model_lifetime():
     runtime = AmbientRuntime(transcription_queue=queue.Queue())
     llm = _FakeModelManager()
@@ -179,6 +218,56 @@ def test_ambient_runtime_separates_mcp_lifetime_from_model_lifetime():
     assert llm.unload_calls == 1
     assert llm.loaded_models == ["model-a"]
     assert still_initialized is False
+
+
+def test_chat_response_window_uses_configured_deadline(monkeypatch):
+    runtime = AmbientRuntime(transcription_queue=queue.Queue())
+    monkeypatch.setattr(app, "CHAT_RESPONSE_WAIT_SECONDS", 120.0)
+
+    runtime._start_chat_response_window(now=100.0)
+
+    assert runtime._chat_response_window_active(now=219.999)
+    assert not runtime._chat_response_window_active(now=220.0)
+
+
+def test_restore_chat_residency_keeps_chat_loaded_and_opens_window(monkeypatch):
+    runtime = AmbientRuntime(transcription_queue=queue.Queue())
+    llm = _FakeModelManager()
+    monkeypatch.setattr(app, "CHAT_MODEL", "resident-chat-model")
+    monkeypatch.setattr(app, "CHAT_RESPONSE_WAIT_SECONDS", 120.0)
+    monkeypatch.setattr(app.time, "monotonic", lambda: 50.0)
+
+    initialized = asyncio.run(
+        runtime._restore_chat_residency(
+            llm_adapter=llm,
+            services_initialized=True,
+            reason="background work finished",
+        )
+    )
+
+    assert initialized is True
+    assert llm.loaded_models == ["resident-chat-model"]
+    assert llm.unload_calls == 0
+    assert runtime._chat_response_deadline == 170.0
+
+
+def test_startup_chat_restore_does_not_open_response_window(monkeypatch):
+    runtime = AmbientRuntime(transcription_queue=queue.Queue())
+    llm = _FakeModelManager()
+    monkeypatch.setattr(app, "CHAT_MODEL", "resident-chat-model")
+
+    initialized = asyncio.run(
+        runtime._restore_chat_residency(
+            llm_adapter=llm,
+            services_initialized=False,
+            reason="runtime startup",
+            open_response_window=False,
+        )
+    )
+
+    assert initialized is True
+    assert llm.loaded_models == ["resident-chat-model"]
+    assert runtime._chat_response_deadline is None
 
 
 def test_ambient_runtime_stop_only_signals_shutdown():

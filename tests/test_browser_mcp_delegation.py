@@ -42,10 +42,11 @@ class _Chunk:
 
 
 class _BrowserFlowProvider:
-    def __init__(self, *, fail_child: bool = False):
+    def __init__(self, *, fail_child: bool = False, exit_browser: bool = True):
         self.current_model = "main-model"
         self.parent_model = "main-model"
         self.fail_child = fail_child
+        self.exit_browser = exit_browser
         self.calls = []
         self.events = []
         self.browser_turn = 0
@@ -92,8 +93,23 @@ class _BrowserFlowProvider:
 
             return _tool_stream()
 
+        finish_call = SimpleNamespace(
+            index=0,
+            id="finish-browser-task-1",
+            function=SimpleNamespace(
+                name="finish_browser_task",
+                arguments=json.dumps(
+                    {
+                        "exit_browser": self.exit_browser,
+                        "status": "completed",
+                        "summary": "Opened example.com.",
+                    }
+                ),
+            ),
+        )
+
         async def _result_stream():
-            yield _Chunk(content="Completed the browser task.")
+            yield _Chunk(tool_calls=[finish_call])
 
         return _result_stream()
 
@@ -153,7 +169,8 @@ def test_use_browser_isolates_tools_and_restores_parent():
         llm_provider=provider,
         tool_bridge=main_bridge,
         browser_tool_bridge=browser_bridge,
-        browser_model="browser-model",
+        browser_agent_model="browser-model",
+        browser_headless=True,
     )
 
     asyncio.run(service.initialize_tools())
@@ -171,7 +188,10 @@ def test_use_browser_isolates_tools_and_restores_parent():
                     "function": {
                         "name": "use_browser",
                         "arguments": json.dumps(
-                            {"task": "Open example.com and report its title", "headless": True}
+                            {
+                                "task": "Open example.com and report its title",
+                                "headless": False,
+                            }
                         ),
                     },
                 }
@@ -180,7 +200,18 @@ def test_use_browser_isolates_tools_and_restores_parent():
         )
     )
 
-    assert result == [("use_browser", "Completed the browser task.")]
+    assert result == [
+        (
+            "use_browser",
+            json.dumps(
+                {
+                    "status": "completed",
+                    "summary": "Opened example.com.",
+                    "browser_exited": True,
+                }
+            ),
+        )
+    ]
     assert browser_bridge.headless_calls == [True]
     assert browser_bridge.sessions[0].executions == [
         ("browser_navigate", {"url": "https://example.com"})
@@ -195,9 +226,44 @@ def test_use_browser_isolates_tools_and_restores_parent():
     ]
     assert all(
         [tool["function"]["name"] for tool in call["tools"]]
-        == ["browser_navigate", "browser_click"]
+        == ["browser_navigate", "browser_click", "finish_browser_task"]
         for call in provider.calls
     )
+    finish_schema = provider.calls[0]["tools"][-1]["function"]["parameters"]
+    assert finish_schema["required"] == ["exit_browser", "status", "summary"]
+    assert finish_schema["additionalProperties"] is False
+
+
+def test_finish_browser_task_can_return_without_closing_browser():
+    provider = _BrowserFlowProvider(exit_browser=False)
+    browser_bridge = _BrowserBridge()
+    service = LLMInteractionService(
+        llm_provider=provider,
+        tool_bridge=_MainToolBridge(),
+        browser_tool_bridge=browser_bridge,
+        browser_agent_model="browser-model",
+        browser_headless=False,
+    )
+
+    result = asyncio.run(
+        service._run_browser_agent(
+            task="Open example.com and leave it open",
+            agent_depth=0,
+        )
+    )
+
+    assert json.loads(result) == {
+        "status": "completed",
+        "summary": "Opened example.com.",
+        "browser_exited": False,
+    }
+    assert browser_bridge.sessions[0].cleaned is False
+    assert service._retained_browser_sessions == [browser_bridge.sessions[0]]
+
+    asyncio.run(service.cleanup_browser_sessions())
+
+    assert browser_bridge.sessions[0].cleaned is True
+    assert service._retained_browser_sessions == []
 
 
 def test_browser_failure_still_cleans_up_and_restores_parent():
@@ -207,14 +273,13 @@ def test_browser_failure_still_cleans_up_and_restores_parent():
         llm_provider=provider,
         tool_bridge=_MainToolBridge(),
         browser_tool_bridge=browser_bridge,
-        browser_model="browser-model",
+        browser_agent_model="browser-model",
     )
 
     with pytest.raises(RuntimeError, match="child model failed"):
         asyncio.run(
             service._run_browser_agent(
                 task="Open example.com",
-                headless=False,
                 agent_depth=0,
             )
         )
@@ -231,15 +296,15 @@ def test_browser_timeout_still_cleans_up_and_restores_parent():
         llm_provider=provider,
         tool_bridge=_MainToolBridge(),
         browser_tool_bridge=browser_bridge,
-        browser_model="browser-model",
+        browser_agent_model="browser-model",
         browser_task_timeout_seconds=0.001,
+        browser_headless=True,
     )
 
     with pytest.raises(TimeoutError):
         asyncio.run(
             service._run_browser_agent(
                 task="Open example.com",
-                headless=True,
                 agent_depth=0,
             )
         )
@@ -254,7 +319,7 @@ def test_browser_agent_cannot_delegate_again():
         llm_provider=_BrowserFlowProvider(),
         tool_bridge=_MainToolBridge(),
         browser_tool_bridge=_BrowserBridge(),
-        browser_model="browser-model",
+        browser_agent_model="browser-model",
     )
     service._tools = [_tool("use_browser"), _tool("browser_navigate")]
 

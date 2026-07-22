@@ -2,6 +2,8 @@ import asyncio
 import gc
 import json
 import logging
+from collections import deque
+from datetime import datetime, timezone
 from pathlib import Path
 import queue
 import re
@@ -12,6 +14,8 @@ from typing import Optional
 from application.services.passive_observer_followup_service import PassiveObserverFollowupService
 from application.services.reflection_service import ReflectionService
 from application.services.llm_interaction_service import LLMInteractionService
+from application.services.interaction_trace import interaction_trace
+from application.services.scheduled_task_service import ScheduledTaskService
 from application.services.passive_observer_service import PassiveObserverService
 from application.services.semantic_deduplication_service import SemanticDeduplicationService
 from application.services.semantic_memory_service import SemanticMemoryService
@@ -27,6 +31,7 @@ from infrastructure.adapter.BrowserMCPToolAdapter import BrowserMCPToolAdapter
 from infrastructure.adapter.MCPToolAdapter import MCPToolAdapter
 from infrastructure.adapter.MSSScreenCaptureAdapter import MssScreenCaptureAdapter
 from infrastructure.adapter.SQLiteBenchmarkAdapter import SQLiteBenchmarkAdapter
+from infrastructure.adapter.SQLiteChatAdapter import ChatEventBroker, SQLiteChatAdapter
 from infrastructure.adapter.SQLiteInteractionLogAdapter import SQLiteInteractionLogAdapter
 from infrastructure.adapter.SQLiteMemoryAdapter import SQLiteMemoryAdapter
 from infrastructure.adapter.SQLiteTaskQueueAdapter import SQLiteTaskQueueAdapter
@@ -64,12 +69,14 @@ REPORTER_MODEL = CONFIG.get_model("reporter_model", DEFAULT_MODEL)
 TODOIST_EXECUTION_MODEL = CONFIG.get_model("todoist_execution_model", DEFAULT_MODEL)
 REFLECTION_MODEL = CONFIG.get_model("reflection_model", DEFAULT_MODEL)
 TRANSCRIPT_PROCESSING_MODEL = CONFIG.get_model("transcript_processing_model", FOLLOWUP_EXECUTION_MODEL)
-BROWSER_MODEL = CONFIG.get_model("browser_model", FOLLOWUP_EXECUTION_MODEL)
+BROWSER_AGENT_MODEL = CONFIG.get_model("browser_agent_model", FOLLOWUP_EXECUTION_MODEL)
+CHAT_MODEL = CONFIG.get_model("chat_model", FOLLOWUP_EXECUTION_MODEL)
 USER_DATA_DIR = Path(CONFIG.get_str("runtime", "user_data_dir", "D:\\USER_DATA"))
 PROJECT_ROOT = Path(__file__).parent.parent
 MEMORY_ROOT = USER_DATA_DIR / "memory"
 MEMORY_DB_PATH = USER_DATA_DIR / "database" / "memory.db"
 INTERACTION_LOG_DB_PATH = USER_DATA_DIR / "database" / "interaction_logs.db"
+CHAT_DB_PATH = Path(CONFIG.get_str("chat", "db_path", str(USER_DATA_DIR / "database" / "chat.db")))
 BENCHMARK_DB_PATH = Path(CONFIG.get_str("benchmarking", "db_path", str(PROJECT_ROOT / "database" / "benchmarking.db")))
 TRAINING_DATA_ROOT = Path(CONFIG.get_str("training_data", "root", "D:\\TRAINING_DATA"))
 TRAINING_DATA_DB_PATH = Path(
@@ -86,7 +93,6 @@ PERFORM_QUEUE_TASKS = CONFIG.get_bool("runtime", "perform_queue_tasks", False)
 SCREENSHOT_QUEUE_MAXLEN = CONFIG.get_int("passive_observer", "screenshot_queue_maxlen", 180)
 PASSIVE_OBSERVER_SSIM_THRESHOLD = CONFIG.get_float("passive_observer", "ssim_threshold", 0.92)
 PASSIVE_OBSERVER_SSIM_COMPARE_COUNT = CONFIG.get_int("passive_observer", "ssim_compare_count", 4)
-MAX_SCREENSHOTS_PER_IDLE_CYCLE = CONFIG.get_int("passive_observer", "max_screenshots_per_idle_cycle", 6)
 PASSIVE_OBSERVER_FAST_ROUTING_ENABLED = CONFIG.get_bool("passive_observer", "fast_routing_enabled", True)
 PASSIVE_OBSERVER_FULL_VLM_SSIM_THRESHOLD = CONFIG.get_float("passive_observer", "full_vlm_ssim_threshold", 0.70)
 PASSIVE_OBSERVER_FAST_MODEL_RETRY_COUNT = CONFIG.get_int("passive_observer", "fast_model_retry_count", 2)
@@ -98,11 +104,19 @@ LOG_API_BUFFER_SIZE = CONFIG.get_int("log_api", "buffer_size", 2000)
 MCP_CONFIG_PATH = CONFIG.get_str("runtime", "mcp_config_path", "mcp.json")
 BROWSER_MCP_SERVER_NAME = CONFIG.get_str("browser", "server_name", "playwright")
 BROWSER_TASK_TIMEOUT_SECONDS = CONFIG.get_float("browser", "task_timeout_seconds", 180.0)
+BROWSER_HEADLESS = CONFIG.get_bool("browser", "headless", False)
 BROWSER_PROFILE_DIR = CONFIG.get_str(
     "browser",
     "persistent_profile_dir",
     str(USER_DATA_DIR / "browser" / "profile"),
 )
+CHAT_HISTORY_MESSAGE_LIMIT = CONFIG.get_int("chat", "history_message_limit", 40)
+CHAT_STREAM_CHECKPOINT_SECONDS = CONFIG.get_float("chat", "stream_checkpoint_seconds", 0.25)
+CHAT_RESPONSE_WAIT_SECONDS = max(
+    0.0,
+    CONFIG.get_float("chat", "response_wait_seconds", 120.0),
+)
+CHAT_AUTH_TOKEN = CONFIG.get_str("chat", "auth_token", "").strip()
 TODOIST_ENABLED = CONFIG.get_bool("todoist", "enabled", True)
 UPLOADS_DIR = Path(CONFIG.get_str("audio", "uploads_dir", str(USER_DATA_DIR / "uploads")))
 TRANSCRIPTIONS_DIR = Path(CONFIG.get_str("audio", "transcriptions_dir", str(USER_DATA_DIR / "transcriptions")))
@@ -195,6 +209,14 @@ class AmbientRuntime:
         "Do not ask the user for clarification if the brief already provides enough context to act. "
         "When the task is complete, state the concrete result."
     )
+    CHAT_SYSTEM_PROMPT = (
+        "You are Ambient AI in a direct conversation with the local user. "
+        "Answer informational questions clearly and use read-only tools when they help. "
+        "Use state-changing tools only when the user's current message explicitly requests the action. "
+        "For a clear request to do something at an exact future time, call schedule_task_at with a detailed "
+        "standalone task and an absolute ISO 8601 date-time. If the requested time is ambiguous, ask a short "
+        "clarifying question instead of guessing. Execute explicitly requested immediate tasks now."
+    )
 
     def __init__(   
         self,
@@ -202,16 +224,23 @@ class AmbientRuntime:
         gpu_lock: Optional[threading.Lock] = None,
         audio_active_event: Optional[threading.Event] = None,
         llm_active_event: Optional[threading.Event] = None,
+        chat_store: Optional[SQLiteChatAdapter] = None,
+        chat_event_broker: Optional[ChatEventBroker] = None,
     ):
         self.queue = transcription_queue
         self.gpu_lock = gpu_lock or threading.Lock()
         self.audio_active_event = audio_active_event or threading.Event()
         self.llm_active_event = llm_active_event or threading.Event()
+        self.chat_store = chat_store
+        self.chat_event_broker = chat_event_broker
         self.stop_event = threading.Event()
         self._screenshot_capture_stop_event = threading.Event()
         self._screenshot_capture_thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._tool_bridge: Optional[MCPToolAdapter] = None
+        self._chat_response_deadline: Optional[float] = None
+        self._deferred_followup_observations: deque = deque()
+        self._deferred_followup_activities: deque[str] = deque()
 
     def _drain_queue(self, target_queue: queue.Queue) -> None:
         while True:
@@ -239,6 +268,43 @@ class AmbientRuntime:
                     return True
                 raise
         return True
+
+    def _start_chat_response_window(self, now: Optional[float] = None) -> None:
+        started_at = time.monotonic() if now is None else now
+        self._chat_response_deadline = started_at + CHAT_RESPONSE_WAIT_SECONDS
+        logger.info(
+            "Chat model response window opened for %ss.",
+            CHAT_RESPONSE_WAIT_SECONDS,
+        )
+
+    def _chat_response_window_active(self, now: Optional[float] = None) -> bool:
+        if self._chat_response_deadline is None:
+            return False
+        current = time.monotonic() if now is None else now
+        return current < self._chat_response_deadline
+
+    async def _restore_chat_residency(
+        self,
+        *,
+        llm_adapter: LlamaCppAdapter,
+        services_initialized: bool,
+        reason: str,
+        open_response_window: bool = True,
+    ) -> bool:
+        """Make chat the resident model after one exclusive/background work unit."""
+        try:
+            services_initialized = await self._ensure_runtime(
+                llm_adapter=llm_adapter,
+                services_initialized=services_initialized,
+                reason=reason,
+                model_name=CHAT_MODEL,
+            )
+        except Exception:
+            logger.exception("Failed to restore the resident chat model: %s", reason)
+            return services_initialized
+        if open_response_window:
+            self._start_chat_response_window()
+        return services_initialized
 
     def _is_context_overflow_error(self, exc: Exception) -> bool:
         message = str(exc).lower()
@@ -348,6 +414,8 @@ class AmbientRuntime:
             current_response_path=str(CURRENT_RESPONSE_PATH),
         )
         tool_bridge = MCPToolAdapter()
+        task_queue = SQLiteTaskQueueAdapter()
+        scheduled_task_service = ScheduledTaskService(task_queue)
         browser_tool_bridge = BrowserMCPToolAdapter(
             config_path=MCP_CONFIG_PATH,
             server_name=BROWSER_MCP_SERVER_NAME,
@@ -358,8 +426,10 @@ class AmbientRuntime:
             llm_provider=logged_llm,
             tool_bridge=tool_bridge,
             browser_tool_bridge=browser_tool_bridge,
-            browser_model=BROWSER_MODEL,
+            browser_agent_model=BROWSER_AGENT_MODEL,
             browser_task_timeout_seconds=BROWSER_TASK_TIMEOUT_SECONDS,
+            browser_headless=BROWSER_HEADLESS,
+            scheduled_task_service=scheduled_task_service,
             reporter_model=REPORTER_MODEL,
             artifact_root=str(ARTIFACTS_ROOT),
         )
@@ -393,7 +463,6 @@ class AmbientRuntime:
             per_entity_ttl_seconds=SEMANTIC_DEDUPE_TTL_BY_KIND,
             debug_log_reasoning=SEMANTIC_DEDUPE_DEBUG_LOG_REASONING,
         )
-        task_queue = SQLiteTaskQueueAdapter()
         reflection_service = (
             ReflectionService(
                 memory=memory_store,
@@ -553,6 +622,162 @@ class AmbientRuntime:
             self._screenshot_capture_thread.join(timeout=5.0)
             self._screenshot_capture_thread = None
 
+    def _publish_chat_event(self, message_id: str, event: dict) -> None:
+        if self.chat_event_broker is not None:
+            self.chat_event_broker.publish(message_id, event)
+
+    async def _process_pending_chat_turn(
+        self,
+        *,
+        llm_adapter: LlamaCppAdapter,
+        llm_service: LLMInteractionService,
+        services_initialized: bool,
+    ) -> tuple[bool, bool]:
+        if self.chat_store is None:
+            return False, services_initialized
+        turn = self.chat_store.claim_next_turn()
+        if turn is None:
+            return False, services_initialized
+
+        message_id = turn["id"]
+        session_id = turn["session_id"]
+        user_message = turn["user_message"]
+        self._publish_chat_event(message_id, {"type": "status", "status": "running"})
+        streamed_parts: list[str] = []
+        last_checkpoint = time.monotonic()
+
+        def on_event(event: dict) -> None:
+            nonlocal last_checkpoint
+            if event.get("type") == "delta":
+                streamed_parts.append(str(event.get("content", "")))
+                now = time.monotonic()
+                if now - last_checkpoint >= CHAT_STREAM_CHECKPOINT_SECONDS:
+                    self.chat_store.update_partial(message_id, "".join(streamed_parts))
+                    last_checkpoint = now
+            self._publish_chat_event(message_id, event)
+
+        try:
+            services_initialized = await self._ensure_runtime(
+                llm_adapter=llm_adapter,
+                services_initialized=services_initialized,
+                reason="answering direct chat message",
+                model_name=CHAT_MODEL,
+            )
+            history = self.chat_store.conversation_history(
+                session_id,
+                before_message_id=user_message["id"],
+                limit=CHAT_HISTORY_MESSAGE_LIMIT,
+            )
+            llm_service.restore_conversation(
+                system_prompt=self.CHAT_SYSTEM_PROMPT,
+                messages=history,
+            )
+            with interaction_trace(
+                "direct_chat",
+                {
+                    "chat_session_id": session_id,
+                    "chat_message_id": message_id,
+                },
+            ):
+                with self.gpu_lock:
+                    result = await llm_service.run_interaction(
+                        user_input=user_message["content"],
+                        system_prompt=self.CHAT_SYSTEM_PROMPT,
+                        model=CHAT_MODEL,
+                        report_policy="silent",
+                        event_callback=on_event,
+                    )
+            self.chat_store.complete_message(message_id, result)
+            self._publish_chat_event(
+                message_id,
+                {
+                    "type": "done",
+                    "message": self.chat_store.get_message(message_id),
+                },
+            )
+        except Exception as exc:
+            logger.exception("Direct chat message %s failed.", message_id)
+            self.chat_store.fail_message(message_id, str(exc))
+            self._publish_chat_event(
+                message_id,
+                {"type": "error", "error": str(exc)},
+            )
+        finally:
+            llm_service.reset_context()
+            self._start_chat_response_window()
+        return True, services_initialized
+
+    async def _process_due_scheduled_task(
+        self,
+        *,
+        llm_adapter: LlamaCppAdapter,
+        llm_service: LLMInteractionService,
+        task_queue: SQLiteTaskQueueAdapter,
+        services_initialized: bool,
+    ) -> tuple[bool, bool]:
+        now_utc = datetime.now(timezone.utc)
+        due_tasks = task_queue.get_due_tasks(now_utc.isoformat())
+        if not due_tasks:
+            return False, services_initialized
+        task = due_tasks[0]
+        if not task_queue.claim_task(task.id):
+            return False, services_initialized
+
+        metadata = {}
+        if task.metadata_json:
+            try:
+                metadata = json.loads(task.metadata_json)
+            except json.JSONDecodeError:
+                metadata = {}
+        session_id = str(metadata.get("origin_chat_session_id") or "").strip()
+        scheduled_at = datetime.fromisoformat(task.run_at_utc) if task.run_at_utc else now_utc
+        lateness_seconds = max(0, int((now_utc - scheduled_at).total_seconds()))
+
+        try:
+            services_initialized = await self._ensure_runtime(
+                llm_adapter=llm_adapter,
+                services_initialized=services_initialized,
+                reason="executing exact-time scheduled task",
+                model_name=FOLLOWUP_EXECUTION_MODEL,
+            )
+            llm_service.reset_context()
+            with interaction_trace(
+                "scheduled_chat_task",
+                {
+                    "scheduled_task_id": task.id,
+                    "chat_session_id": session_id or None,
+                    "scheduled_lateness_seconds": lateness_seconds,
+                },
+            ):
+                with self.gpu_lock:
+                    result = await llm_service.run_interaction(
+                        user_input=task.description,
+                        system_prompt=self.FOLLOWUP_EXECUTION_PROMPT,
+                        model=FOLLOWUP_EXECUTION_MODEL,
+                        report_policy="auto_surface",
+                    )
+            task_queue.mark_task_complete(task.id)
+            if self.chat_store is not None and session_id and self.chat_store.get_session(session_id):
+                late_note = f" (started {lateness_seconds}s late)" if lateness_seconds > 5 else ""
+                self.chat_store.append_scheduled_result(
+                    session_id=session_id,
+                    task_id=task.id,
+                    content=f"Scheduled task completed{late_note}:\n\n{result}",
+                )
+        except Exception as exc:
+            logger.exception("Scheduled task %s failed.", task.id)
+            task_queue.mark_task_complete(task.id, status="failed")
+            if self.chat_store is not None and session_id and self.chat_store.get_session(session_id):
+                self.chat_store.append_scheduled_result(
+                    session_id=session_id,
+                    task_id=task.id,
+                    content=f"Scheduled task failed: {exc}",
+                    failed=True,
+                )
+        finally:
+            llm_service.reset_context()
+        return True, services_initialized
+
     async def run_loop(self):
         (
             llm_adapter,
@@ -579,6 +804,12 @@ class AmbientRuntime:
             self.stop_event.clear()
             self._tool_bridge = tool_bridge
             await self._initialize_mcp_tools(tool_bridge, llm_service)
+            services_initialized = await self._restore_chat_residency(
+                llm_adapter=llm_adapter,
+                services_initialized=services_initialized,
+                reason="keeping direct chat ready at runtime startup",
+                open_response_window=False,
+            )
             self._start_screenshot_capture_loop(
                 passive_observer=passive_observer,
                 screenshot_queue=screenshot_queue,
@@ -609,12 +840,48 @@ class AmbientRuntime:
                     last_idle_cycle_at = 0.0
                     if self.stop_event.is_set():
                         break
+                    services_initialized = await self._restore_chat_residency(
+                        llm_adapter=llm_adapter,
+                        services_initialized=services_initialized,
+                        reason="ASR pipeline finished",
+                    )
 
-                while True:
-                    try:
-                        transcript_path = self.queue.get_nowait()
-                    except queue.Empty:
+                handled_chat, services_initialized = await self._process_pending_chat_turn(
+                    llm_adapter=llm_adapter,
+                    llm_service=llm_service,
+                    services_initialized=services_initialized,
+                )
+                if handled_chat:
+                    if await self._sleep_or_stop(0.1):
                         break
+                    continue
+
+                if self._chat_response_window_active():
+                    if await self._sleep_or_stop(0.25):
+                        break
+                    continue
+
+                handled_scheduled, services_initialized = await self._process_due_scheduled_task(
+                    llm_adapter=llm_adapter,
+                    llm_service=llm_service,
+                    task_queue=task_queue,
+                    services_initialized=services_initialized,
+                )
+                if handled_scheduled:
+                    services_initialized = await self._restore_chat_residency(
+                        llm_adapter=llm_adapter,
+                        services_initialized=services_initialized,
+                        reason="scheduled task work unit finished",
+                    )
+                    if await self._sleep_or_stop(0.1):
+                        break
+                    continue
+
+                try:
+                    transcript_path = self.queue.get_nowait()
+                except queue.Empty:
+                    transcript_path = None
+                if transcript_path is not None:
                     if ALWAYS_ON_MODE:
                         logger.info("Transcript produced at %s. Processing immediately in always_on mode.", transcript_path)
                         try:
@@ -652,6 +919,15 @@ class AmbientRuntime:
                             transcript_path,
                         )
                     self.queue.task_done()
+                    if ALWAYS_ON_MODE:
+                        services_initialized = await self._restore_chat_residency(
+                            llm_adapter=llm_adapter,
+                            services_initialized=services_initialized,
+                            reason="transcript work unit finished",
+                        )
+                        if await self._sleep_or_stop(0.1):
+                            break
+                        continue
 
                 now = time.monotonic()
                 runtime_active_now = user_idle_now or ALWAYS_ON_MODE
@@ -691,7 +967,12 @@ class AmbientRuntime:
                         except Exception:
                             logger.exception("Todoist task execution failed.")
                         last_idle_cycle_at = now
-                        if await self._sleep_or_stop(1):
+                        services_initialized = await self._restore_chat_residency(
+                            llm_adapter=llm_adapter,
+                            services_initialized=services_initialized,
+                            reason="Todoist work unit finished",
+                        )
+                        if await self._sleep_or_stop(0.1):
                             break
                         continue
 
@@ -702,20 +983,9 @@ class AmbientRuntime:
                     and runtime_active_now
                     and not screenshot_queue.is_empty()
                 ):
-                    processed_screenshots = 0
-                    while processed_screenshots < MAX_SCREENSHOTS_PER_IDLE_CYCLE and not screenshot_queue.is_empty():
-                        if not ALWAYS_ON_MODE and not system_idle_service.is_user_idle():
-                            user_idle_now = False
-                            logger.info("User activity resumed during screenshot backlog processing. Pausing idle mode.")
-                            break
-                        job = screenshot_queue.dequeue()
-                        if job is None:
-                            break
+                    job = screenshot_queue.dequeue()
+                    if job is not None and Path(job.screenshot_path).exists():
                         try:
-                            if not Path(job.screenshot_path).exists():
-                                logger.warning("Queued screenshot no longer exists, skipping: %s", job.screenshot_path)
-                                processed_screenshots += 1
-                                continue
                             logger.debug(
                                 "Processing queued screenshot similarity_score=%s path=%s",
                                 job.similarity_score,
@@ -741,46 +1011,82 @@ class AmbientRuntime:
                                     observation.app_name or observation.page_hint or "screen",
                                 )
                                 if ALWAYS_ON_MODE and passive_followup is not None:
-                                    followup_result = await passive_followup.process_observations(
-                                        observations=[observation],
-                                        model=PASSIVE_FOLLOWUP_MODEL,
-                                        mark_sent=False,
-                                        apply_memory_updates=False,
-                                    )
-                                    logger.info(
-                                        "Always-on follow-up processed observation %s with %s queued and %s do-now activities.",
-                                        observation.observation_id,
-                                        len(followup_result.get("queued_activities", [])),
-                                        len(followup_result.get("do_now_activities", [])),
-                                    )
-                                    for activity in followup_result.get("do_now_activities", []):
-                                        logger.info("Executing always-on passive follow-up do-now activity: %s", activity)
-                                        services_initialized = await self._ensure_runtime(
-                                            llm_adapter=llm_adapter,
-                                            services_initialized=services_initialized,
-                                            reason="executing always-on passive follow-up do-now activity",
-                                            model_name=FOLLOWUP_EXECUTION_MODEL,
-                                        )
-                                        llm_service.reset_context()
-                                        try:
-                                            with self.gpu_lock:
-                                                result = await llm_service.run_interaction(
-                                                    user_input=activity,
-                                                    system_prompt=self.FOLLOWUP_EXECUTION_PROMPT,
-                                                    model=FOLLOWUP_EXECUTION_MODEL,
-                                                    report_policy="auto_surface",
-                                                )
-                                        finally:
-                                            llm_service.reset_context()
-                                        logger.info("Always-on do-now activity completed with result: %s", result[:500])
+                                    self._deferred_followup_observations.append(observation)
                         except Exception:
                             logger.exception("Queued passive observer screenshot processing failed.")
-                        processed_screenshots += 1
+                        services_initialized = await self._restore_chat_residency(
+                            llm_adapter=llm_adapter,
+                            services_initialized=services_initialized,
+                            reason="screenshot work unit finished",
+                        )
+                        if await self._sleep_or_stop(0.1):
+                            break
+                        continue
+                    if job is not None:
+                        logger.warning("Queued screenshot no longer exists, skipping: %s", job.screenshot_path)
 
                 if runtime_active_now and now - last_idle_cycle_at >= idle_cycle_interval:
+                    idle_unit_attempted = False
+                    idle_unit_completed = False
                     try:
-                        # Perform Important Do-Now follow-up tasks
-                        if passive_followup is not None and not ALWAYS_ON_MODE:
+                        if self._deferred_followup_observations and passive_followup is not None:
+                            observation = self._deferred_followup_observations.popleft()
+                            idle_unit_attempted = True
+                            services_initialized = await self._ensure_runtime(
+                                llm_adapter=llm_adapter,
+                                services_initialized=services_initialized,
+                                reason="processing deferred always-on passive follow-up",
+                                model_name=PASSIVE_FOLLOWUP_MODEL,
+                            )
+                            with self.gpu_lock:
+                                followup_result = await passive_followup.process_observations(
+                                    observations=[observation],
+                                    model=PASSIVE_FOLLOWUP_MODEL,
+                                    mark_sent=False,
+                                    apply_memory_updates=False,
+                                )
+                            self._deferred_followup_activities.extend(
+                                str(activity)
+                                for activity in followup_result.get("do_now_activities", [])
+                                if str(activity).strip()
+                            )
+                            idle_unit_completed = True
+                            logger.info(
+                                "Always-on follow-up processed observation %s with %s queued and %s do-now activities.",
+                                observation.observation_id,
+                                len(followup_result.get("queued_activities", [])),
+                                len(followup_result.get("do_now_activities", [])),
+                            )
+
+                        if not idle_unit_attempted and self._deferred_followup_activities:
+                            activity = self._deferred_followup_activities.popleft()
+                            idle_unit_attempted = True
+                            logger.info("Executing deferred passive follow-up activity: %s", activity)
+                            services_initialized = await self._ensure_runtime(
+                                llm_adapter=llm_adapter,
+                                services_initialized=services_initialized,
+                                reason="executing deferred passive follow-up activity",
+                                model_name=FOLLOWUP_EXECUTION_MODEL,
+                            )
+                            llm_service.reset_context()
+                            try:
+                                with self.gpu_lock:
+                                    result = await llm_service.run_interaction(
+                                        user_input=activity,
+                                        system_prompt=self.FOLLOWUP_EXECUTION_PROMPT,
+                                        model=FOLLOWUP_EXECUTION_MODEL,
+                                        report_policy="auto_surface",
+                                    )
+                                idle_unit_completed = True
+                                logger.info("Deferred do-now activity completed with result: %s", result[:500])
+                            finally:
+                                llm_service.reset_context()
+
+                        if (
+                            not idle_unit_attempted
+                            and passive_followup is not None
+                            and not ALWAYS_ON_MODE
+                        ):
                             services_initialized = await self._ensure_runtime(
                                 llm_adapter=llm_adapter,
                                 services_initialized=services_initialized,
@@ -788,7 +1094,21 @@ class AmbientRuntime:
                                 model_name=PASSIVE_FOLLOWUP_MODEL,
                             )
                             with self.gpu_lock:
-                                followup_result = await passive_followup.maybe_queue_followup(model=PASSIVE_FOLLOWUP_MODEL)
+                                followup_result = await passive_followup.maybe_queue_followup(
+                                    model=PASSIVE_FOLLOWUP_MODEL
+                                )
+                            self._deferred_followup_activities.extend(
+                                str(activity)
+                                for activity in followup_result.get("do_now_activities", [])
+                                if str(activity).strip()
+                            )
+                            idle_unit_attempted = bool(
+                                followup_result.get("processed_observation_ids")
+                                or followup_result.get("unique_activities")
+                                or followup_result.get("queued_activities")
+                                or followup_result.get("do_now_activities")
+                            )
+                            idle_unit_completed = idle_unit_attempted
                             logger.info(
                                 "Passive observer follow-up processed %s observations, %s unique activities, %s useful activities, %s queued, %s do-now.",
                                 len(followup_result.get("processed_observation_ids", [])),
@@ -797,30 +1117,15 @@ class AmbientRuntime:
                                 len(followup_result.get("queued_activities", [])),
                                 len(followup_result.get("do_now_activities", [])),
                             )
-                            for activity in followup_result.get("do_now_activities", []):
-                                logger.info("Executing passive follow-up do-now activity: %s", activity)
-                                services_initialized = await self._ensure_runtime(
-                                    llm_adapter=llm_adapter,
-                                    services_initialized=services_initialized,
-                                    reason="executing passive follow-up do-now activity",
-                                    model_name=FOLLOWUP_EXECUTION_MODEL,
-                                )
-                                llm_service.reset_context()
-                                try:
-                                    with self.gpu_lock:
-                                        result = await llm_service.run_interaction(
-                                            user_input=activity,
-                                            system_prompt=self.FOLLOWUP_EXECUTION_PROMPT,
-                                            model=FOLLOWUP_EXECUTION_MODEL,
-                                            report_policy="auto_surface",
-                                        )
-                                finally:
-                                    llm_service.reset_context()
-                                logger.info("Do-now activity completed with result: %s", result[:500])
-                        #Perform queued follow-up tasks
+
                         queue_task_execution_allowed = user_idle_now or PERFORM_QUEUE_TASKS
-                        pending_tasks = task_queue.get_pending_tasks() if queue_task_execution_allowed else []
+                        pending_tasks = (
+                            task_queue.get_pending_tasks()
+                            if not idle_unit_attempted and queue_task_execution_allowed
+                            else []
+                        )
                         if pending_tasks:
+                            idle_unit_attempted = True
                             task = pending_tasks[0]
                             logger.info("Executing queued follow-up task ID %s with tool-enabled LLM interaction.", task.id)
                             services_initialized = await self._ensure_runtime(
@@ -841,16 +1146,22 @@ class AmbientRuntime:
                             except Exception as exc:
                                 if self._is_context_overflow_error(exc):
                                     self._quarantine_overflowed_task(task_queue, task, exc)
+                                    idle_unit_completed = True
                                 else:
                                     raise
                             else:
+                                idle_unit_completed = True
                                 logger.info("Queued follow-up task %s completed with result: %s", task.id, result[:500])
                                 task_queue.mark_task_complete(task.id)
                                 self._mark_dedupe_item_completed(semantic_dedupe, task)
                             finally:
                                 llm_service.reset_context()
 
-                        if reflection_service is not None and not ALWAYS_ON_MODE:
+                        if (
+                            not idle_unit_attempted
+                            and reflection_service is not None
+                            and not ALWAYS_ON_MODE
+                        ):
                             services_initialized = await self._ensure_runtime(
                                 llm_adapter=llm_adapter,
                                 services_initialized=services_initialized,
@@ -859,7 +1170,9 @@ class AmbientRuntime:
                             )
                             with self.gpu_lock:
                                 reflection_result = await reflection_service.run_if_due(model=REFLECTION_MODEL)
-                            if reflection_result.get("ran"):
+                            idle_unit_attempted = bool(reflection_result.get("ran"))
+                            idle_unit_completed = idle_unit_attempted
+                            if idle_unit_attempted:
                                 logger.info(
                                     "Reflection service ran: cleaned_changed=%s, generated=%s, queued=%s, skipped=%s.",
                                     reflection_result.get("cleaned_user_info_changed"),
@@ -867,7 +1180,12 @@ class AmbientRuntime:
                                     len(reflection_result.get("queued_tasks", [])),
                                     len(reflection_result.get("skipped_tasks", [])),
                                 )
-                        if user_biodata_service is not None and not ALWAYS_ON_MODE:
+
+                        if (
+                            not idle_unit_attempted
+                            and user_biodata_service is not None
+                            and not ALWAYS_ON_MODE
+                        ):
                             services_initialized = await self._ensure_runtime(
                                 llm_adapter=llm_adapter,
                                 services_initialized=services_initialized,
@@ -875,22 +1193,34 @@ class AmbientRuntime:
                                 model_name=USER_BIODATA_MODEL,
                             )
                             with self.gpu_lock:
-                                biodata_result = await user_biodata_service.update_biodata(model=USER_BIODATA_MODEL)
+                                biodata_result = await user_biodata_service.update_biodata(
+                                    model=USER_BIODATA_MODEL
+                                )
+                            idle_unit_attempted = bool(
+                                biodata_result.get("processed_observation_ids")
+                                or biodata_result.get("entries")
+                            )
+                            idle_unit_completed = idle_unit_attempted
                             logger.info(
                                 "User BioData update processed %s observations and appended %s entries.",
                                 len(biodata_result.get("processed_observation_ids", [])),
                                 len(biodata_result.get("entries", [])),
                             )
                     except Exception:
-                        logger.exception("Idle follow-up cycle failed.")
+                        idle_unit_attempted = True
+                        logger.exception("Idle follow-up work unit failed.")
                     last_idle_cycle_at = now
 
-                if not user_idle_now and not ALWAYS_ON_MODE:
-                    services_initialized = await self._release_runtime(
+                    services_initialized = await self._restore_chat_residency(
                         llm_adapter=llm_adapter,
                         services_initialized=services_initialized,
-                        reason="user is active; freeing up VRAM",
+                        reason="idle background work check finished",
+                        open_response_window=idle_unit_attempted,
                     )
+                    if idle_unit_attempted or idle_unit_completed:
+                        if await self._sleep_or_stop(0.1):
+                            break
+                        continue
 
                 if await self._sleep_or_stop(1):
                     break
@@ -906,6 +1236,7 @@ class AmbientRuntime:
                     services_initialized=services_initialized,
                     reason="application shutdown",
                 )
+            await llm_service.cleanup_browser_sessions()
             await tool_bridge.cleanup()
             self._tool_bridge = None
             self.llm_active_event.clear()
@@ -923,8 +1254,20 @@ class AmbientRuntime:
 
 
 if __name__ == "__main__":
+    chat_store = SQLiteChatAdapter(db_path=str(CHAT_DB_PATH))
+    recovered_chat_messages = chat_store.recover_interrupted()
+    if recovered_chat_messages:
+        logger.warning("Marked %s interrupted chat response(s) as failed.", recovered_chat_messages)
+    chat_event_broker = ChatEventBroker()
+    recovered_scheduled_tasks = SQLiteTaskQueueAdapter().recover_interrupted()
+    if recovered_scheduled_tasks:
+        logger.warning("Marked %s interrupted scheduled task(s) as failed.", recovered_scheduled_tasks)
     runtime_log_started = False
     if LOG_API_ENABLED:
+        if LOG_API_HOST not in {"127.0.0.1", "localhost", "::1"} and not CHAT_AUTH_TOKEN:
+            raise RuntimeError(
+                "A non-loopback runtime dashboard requires [chat] auth_token to protect action-capable APIs."
+            )
         interaction_store = SQLiteInteractionLogAdapter(db_path=str(INTERACTION_LOG_DB_PATH))
         training_store = SQLiteTrainingDataAdapter(db_path=str(TRAINING_DATA_DB_PATH))
         training_service = TrainingDataService(
@@ -946,6 +1289,9 @@ if __name__ == "__main__":
             training_store=training_store,
             training_service=training_service,
             media_roots=[str(USER_DATA_DIR), str(TRAINING_DATA_ROOT)],
+            chat_store=chat_store,
+            chat_event_broker=chat_event_broker,
+            auth_token=CHAT_AUTH_TOKEN,
         )
         logger.info("Runtime log server started at http://%s:%s/logs", LOG_API_HOST, LOG_API_PORT)
         runtime_log_started = True
@@ -966,6 +1312,8 @@ if __name__ == "__main__":
         gpu_lock=gpu_lock,
         audio_active_event=audio_active_event,
         llm_active_event=llm_active_event,
+        chat_store=chat_store,
+        chat_event_broker=chat_event_broker,
     )
 
     audio_thread = threading.Thread(

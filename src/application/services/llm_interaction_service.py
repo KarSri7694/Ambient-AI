@@ -7,7 +7,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from application.ports.LLMProvider import LLMProvider
 from application.ports.tool_bridge_port import (
@@ -20,6 +20,7 @@ from application.services.interaction_trace import (
     current_interaction_source,
     interaction_trace,
 )
+from application.services.scheduled_task_service import ScheduledTaskService
 from utils.kv_state_handling import KVStateControl
 
 
@@ -30,6 +31,7 @@ class AgentFrame:
     depth: int = 0
     tools: Optional[List[Dict[str, Any]]] = None
     tool_bridge: Optional[Any] = None
+    browser_exit_requested: Optional[bool] = None
 
 
 class LLMInteractionService:
@@ -43,7 +45,37 @@ class LLMInteractionService:
     AGENT_DEPTH = 0
     MAX_AGENT_DEPTH = 3
     MAX_ITERATIONS = 25
-    TERMINAL_TOOL_NAMES = {"restore_previous_agent"}
+    TERMINAL_TOOL_NAMES = {"restore_previous_agent", "finish_browser_task"}
+    FINISH_BROWSER_TASK_TOOL = {
+        "type": "function",
+        "function": {
+            "name": "finish_browser_task",
+            "description": (
+                "Finish the delegated browser task and return control to the main model. "
+                "Use exit_browser=false to leave the current browser running, including "
+                "ongoing media playback; use true to close it."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "exit_browser": {
+                        "type": "boolean",
+                        "description": "Whether to close the controlled browser before returning.",
+                    },
+                    "status": {
+                        "type": "string",
+                        "description": "Concise completion state such as completed, blocked, or failed.",
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "Concrete result and material actions performed for the main model.",
+                    },
+                },
+                "required": ["exit_browser", "status", "summary"],
+                "additionalProperties": False,
+            },
+        },
+    }
     PARENT_DIR = Path(__file__).parent.parent.parent.parent
     kv_state_dir = PARENT_DIR / "model_kv_states"
     kv_control = KVStateControl(kv_state_dir)
@@ -71,8 +103,12 @@ class LLMInteractionService:
         "- Do not broaden the task, visit unrelated sites, or attempt to spawn another agent.\n"
         "- Do not bypass authentication, CAPTCHA, two-factor authentication, security warnings, "
         "or confirmation screens. Return a clear blocker instead.\n"
-        "- When finished, return a concise result containing completion status, material actions "
-        "performed, requested information, and any blocker.\n"
+        "- When the task reaches a terminal state, call finish_browser_task exactly once.\n"
+        "- Set exit_browser=false when the user needs the visible browser or media playback to "
+        "remain open; otherwise set it to true.\n"
+        "- In status and summary, provide the completion state, material actions performed, "
+        "requested information, and any blocker.\n"
+        "- Do not continue taking snapshots or other actions after the requested outcome has been verified.\n"
     )
     REPORTER_PROMPT = (
         "Create a user-facing report for an ambient agent execution.\n"
@@ -96,20 +132,25 @@ class LLMInteractionService:
         llm_provider: LLMProvider,
         tool_bridge: ToolBridgePort,
         browser_tool_bridge: Optional[BrowserToolBridgePort] = None,
-        browser_model: Optional[str] = None,
+        browser_agent_model: Optional[str] = None,
         browser_task_timeout_seconds: float = 180.0,
+        browser_headless: bool = False,
+        scheduled_task_service: Optional[ScheduledTaskService] = None,
         reporter_model: Optional[str] = None,
         artifact_root: Optional[str] = None,
     ):
         self.llm = llm_provider
         self.tool_bridge = tool_bridge
         self.browser_tool_bridge = browser_tool_bridge
-        self.browser_model = browser_model
+        self.browser_agent_model = browser_agent_model
         self.browser_task_timeout_seconds = browser_task_timeout_seconds
+        self.browser_headless = browser_headless
+        self.scheduled_task_service = scheduled_task_service
         self.logger = logging.getLogger(self.__class__.__name__)
         self._tools: Optional[List[Dict[str, Any]]] = None
         self._frame_stack: List[AgentFrame] = [AgentFrame(tool_bridge=tool_bridge)]
         self._browser_lock = asyncio.Lock()
+        self._retained_browser_sessions: List[BrowserToolSessionPort] = []
         self.reporter_model = reporter_model
         self.artifact_root = Path(artifact_root) if artifact_root else (self.PARENT_DIR / "artifacts")
         self.artifact_root.mkdir(parents=True, exist_ok=True)
@@ -140,6 +181,16 @@ class LLMInteractionService:
             raise RuntimeError("Cannot pop root agent frame.")
         return self._frame_stack.pop()
 
+    async def cleanup_browser_sessions(self) -> None:
+        """Close browser sessions deliberately retained by finish_browser_task."""
+        sessions = list(self._retained_browser_sessions)
+        self._retained_browser_sessions.clear()
+        for session in sessions:
+            try:
+                await session.cleanup()
+            except Exception:
+                self.logger.exception("Failed to close retained browser MCP session.")
+
     async def initialize_tools(self, force_refresh: bool = False) -> None:
         """Fetch available tools from the tool bridge and cache them."""
         if self._tools is not None and not force_refresh:
@@ -157,6 +208,18 @@ class LLMInteractionService:
     def restore_context(self, messages: List[Dict[str, Any]]) -> None:
         """Restore a previously saved message history."""
         self._frame.messages = list(messages)
+
+    def restore_conversation(
+        self,
+        *,
+        system_prompt: str,
+        messages: List[Dict[str, Any]],
+    ) -> None:
+        """Restore a persisted conversation with a fresh dated system prompt."""
+        self._frame.messages = [
+            {"role": "system", "content": self._build_system_prompt(system_prompt)},
+            *[dict(message) for message in messages],
+        ]
 
     def _strip_think_tags(self, text: str) -> str:
         """Remove leaked Qwen/llama.cpp thinking tags from assistant text."""
@@ -262,7 +325,6 @@ class LLMInteractionService:
         self,
         *,
         task: str,
-        headless: bool,
         agent_depth: int,
     ) -> str:
         if agent_depth != 0:
@@ -271,7 +333,7 @@ class LLMInteractionService:
             raise ValueError("use_browser requires a non-empty task.")
         if self.browser_tool_bridge is None:
             raise RuntimeError("Browser MCP delegation is not configured.")
-        if not self.browser_model:
+        if not self.browser_agent_model:
             raise RuntimeError("No browser model is configured.")
 
         async with self._browser_lock:
@@ -285,17 +347,28 @@ class LLMInteractionService:
 
             browser_session: Optional[BrowserToolSessionPort] = None
             child_frame_pushed = False
+            exit_browser = True
             browser_result = ""
             primary_error: Optional[BaseException] = None
             try:
-                browser_session = await self.browser_tool_bridge.open_session(headless=headless)
+                if self._retained_browser_sessions:
+                    browser_session = self._retained_browser_sessions.pop()
+                    self.logger.info("Reusing retained browser MCP session.")
+                else:
+                    browser_session = await self.browser_tool_bridge.open_session(
+                        headless=self.browser_headless
+                    )
                 browser_tools = await browser_session.get_all_tools()
                 if not browser_tools:
                     raise RuntimeError("The browser MCP server did not expose any safe tools.")
+                browser_tools = [
+                    *browser_tools,
+                    copy.deepcopy(self.FINISH_BROWSER_TASK_TOOL),
+                ]
 
-                await self.llm.load_model(self.browser_model)
+                await self.llm.load_model(self.browser_agent_model)
                 self._push_frame(
-                    model=self.browser_model,
+                    model=self.browser_agent_model,
                     depth=agent_depth + 1,
                     tools=browser_tools,
                     tool_bridge=browser_session,
@@ -310,7 +383,7 @@ class LLMInteractionService:
                     self.run_interaction(
                         user_input="You have been given this browser task:\n" + task.strip(),
                         system_prompt=self.BROWSER_AGENT_PROMPT,
-                        model=self.browser_model,
+                        model=self.browser_agent_model,
                         agent_depth=agent_depth + 1,
                         allowed_tool_names=allowed_tool_names,
                         report_policy="silent",
@@ -321,15 +394,22 @@ class LLMInteractionService:
                 primary_error = exc
             finally:
                 if child_frame_pushed:
+                    exit_browser = self._frame.browser_exit_requested is not False
                     self._pop_frame()
 
                 cleanup_error: Optional[BaseException] = None
                 if browser_session is not None:
-                    try:
-                        await browser_session.cleanup()
-                    except BaseException as exc:
-                        cleanup_error = exc
-                        self.logger.exception("Failed to close browser MCP session.")
+                    if primary_error is None and not exit_browser:
+                        self._retained_browser_sessions.append(browser_session)
+                        self.logger.info(
+                            "Browser agent returned control while leaving the browser session open."
+                        )
+                    else:
+                        try:
+                            await browser_session.cleanup()
+                        except BaseException as exc:
+                            cleanup_error = exc
+                            self.logger.exception("Failed to close browser MCP session.")
 
                 restore_error: Optional[BaseException] = None
                 try:
@@ -368,6 +448,18 @@ class LLMInteractionService:
         )
         return preamble + system_prompt
 
+    def _emit_event(
+        self,
+        event_callback: Optional[Callable[[Dict[str, Any]], None]],
+        event: Dict[str, Any],
+    ) -> None:
+        if event_callback is None:
+            return
+        try:
+            event_callback(event)
+        except Exception:
+            self.logger.exception("Interaction event callback failed.")
+
     async def run_interaction(
         self,
         user_input: str,
@@ -377,6 +469,7 @@ class LLMInteractionService:
         agent_depth: int = 0,
         allowed_tool_names: Optional[set[str]] = None,
         report_policy: str = "silent",
+        event_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> str:
         """
         Run a full LLM interaction: send user input, stream response,
@@ -420,7 +513,10 @@ class LLMInteractionService:
                     image=image_path if iteration == 1 else "",
                 )
 
-                assistant_text, tool_calls = await self._consume_stream(completion)
+                assistant_text, tool_calls = await self._consume_stream(
+                    completion,
+                    event_callback=event_callback,
+                )
 
                 if not tool_calls:
                     self._frame.messages.append({"role": "assistant", "content": assistant_text})
@@ -448,9 +544,13 @@ class LLMInteractionService:
                     tool_calls,
                     agent_depth=agent_depth,
                     allowed_tool_names=allowed_tool_names,
+                    event_callback=event_callback,
                 )
                 tools_used.extend(name for name, _ in tool_results)
-                if any(name in self.TERMINAL_TOOL_NAMES for name, _ in tool_results):
+                if any(
+                    name in self.TERMINAL_TOOL_NAMES and not result.startswith("Error:")
+                    for name, result in tool_results
+                ):
                     self.logger.info("Terminal tool executed; ending interaction loop.")
                     terminal_result = "\n".join(result for _, result in tool_results)
                     await self._attach_user_report(
@@ -479,7 +579,11 @@ class LLMInteractionService:
             )
             return assistant_text
 
-    async def _consume_stream(self, completion) -> tuple[str, List[Dict]]:
+    async def _consume_stream(
+        self,
+        completion,
+        event_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> tuple[str, List[Dict]]:
         """
         Consume a streaming completion iterator.
         Returns (assistant_text, tool_calls_list).
@@ -499,6 +603,10 @@ class LLMInteractionService:
                 content = self._strip_think_tags(delta.content)
                 if content:
                     assistant_text += content
+                    self._emit_event(
+                        event_callback,
+                        {"type": "delta", "content": content},
+                    )
 
             reasoning = getattr(delta, "reasoning_content", None)
             if reasoning:
@@ -541,6 +649,7 @@ class LLMInteractionService:
         tool_calls: List[Dict],
         agent_depth: int = 0,
         allowed_tool_names: Optional[set[str]] = None,
+        event_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> List[tuple[str, str]]:
         """
         Execute tool calls, append results to history, and return the tool outputs.
@@ -555,6 +664,10 @@ class LLMInteractionService:
 
             self.logger.info("Calling tool: %s", tool_name)
             self.logger.info("Arguments: %s", tool_args_str)
+            self._emit_event(
+                event_callback,
+                {"type": "tool_started", "tool_name": tool_name},
+            )
 
             try:
                 tool_args = json.loads(tool_args_str) if tool_args_str else {}
@@ -575,14 +688,48 @@ class LLMInteractionService:
                     continue
                 if tool_name == "use_browser":
                     task = tool_args.get("task", "")
-                    headless = tool_args.get("headless", False)
-                    if not isinstance(headless, bool):
-                        raise ValueError("use_browser headless must be a boolean.")
                     response_content = await self._run_browser_agent(
                         task=str(task),
-                        headless=headless,
                         agent_depth=agent_depth,
                     )
+                elif tool_name == "finish_browser_task":
+                    if agent_depth == 0:
+                        raise RuntimeError(
+                            "finish_browser_task can only be called by the delegated browser agent."
+                        )
+                    exit_browser = tool_args.get("exit_browser")
+                    status = tool_args.get("status")
+                    summary = tool_args.get("summary")
+                    if not isinstance(exit_browser, bool):
+                        raise ValueError("finish_browser_task exit_browser must be a boolean.")
+                    if not isinstance(status, str) or not status.strip():
+                        raise ValueError("finish_browser_task status must be a non-empty string.")
+                    if not isinstance(summary, str) or not summary.strip():
+                        raise ValueError("finish_browser_task summary must be a non-empty string.")
+                    self._frame.browser_exit_requested = exit_browser
+                    response_content = json.dumps(
+                        {
+                            "status": status.strip(),
+                            "summary": summary.strip(),
+                            "browser_exited": exit_browser,
+                        },
+                        ensure_ascii=False,
+                    )
+                elif tool_name == "schedule_task_at":
+                    if self.scheduled_task_service is None:
+                        raise RuntimeError("Exact-time task scheduling is not configured.")
+                    metadata = current_interaction_metadata()
+                    scheduled = self.scheduled_task_service.schedule(
+                        task=str(tool_args.get("task", "")),
+                        run_at=str(tool_args.get("run_at", "")),
+                        priority=str(tool_args.get("priority", "medium")),
+                        metadata={
+                            "source": current_interaction_source(),
+                            "origin_chat_session_id": metadata.get("chat_session_id"),
+                            "origin_chat_message_id": metadata.get("chat_message_id"),
+                        },
+                    )
+                    response_content = json.dumps(scheduled, ensure_ascii=False)
                 elif tool_name == "load_agent":
                     if agent_depth >= self.MAX_AGENT_DEPTH:
                         response_content = (
@@ -693,6 +840,14 @@ class LLMInteractionService:
                     response_content = await active_tool_bridge.execute_tool(tool_name, tool_args)
             except Exception as e:
                 response_content = f"Error: {str(e)}"
+            self._emit_event(
+                event_callback,
+                {
+                    "type": "tool_finished",
+                    "tool_name": tool_name,
+                    "ok": not response_content.startswith("Error:"),
+                },
+            )
             tool_results.append((tool_name, response_content))
 
             self._frame.messages.append(
