@@ -10,14 +10,18 @@ import torch
 import gc
 import torchaudio
 import logging
+import hashlib
+import json
+import uuid
 from collections import defaultdict
+from datetime import timezone
 from audio_preprocessor import AudioPreprocessor
 from infrastructure.adapter.ASR_Adapter import WhisperAdapter as asr_adapter
 from infrastructure.adapter.pyannoteAdapter import PyannoteAdapter
 from infrastructure.adapter.ecapaVoxcelebAdapter import EcapaVoxcelebAdapter
 from infrastructure.adapter.SQLiteVoiceAdapter import SQLiteVoiceAdapter
 from application.services.system_idle_service import SystemIdleService
-from core.models import DiarizationResult, TranscriptionResult
+from core.models import AmbientEvent, DiarizationResult, InferenceRequest, TranscriptionResult
 from config import CONFIG
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -209,13 +213,34 @@ class Handler(FileSystemEventHandler):
         self.processing_queue.put(event.src_path)
 
 class AudioAgentService:
-    def __init__(self, upload_dir: str = str(UPLOAD_DIR), voice_db: str = VOICE_DB, gpu_lock: threading.Lock = None, audio_active_event: threading.Event = None, llm_active_event: threading.Event= None):
+    def __init__(
+        self,
+        upload_dir: str = str(UPLOAD_DIR),
+        voice_db: str = VOICE_DB,
+        gpu_lock: threading.Lock = None,
+        audio_active_event: threading.Event = None,
+        llm_active_event: threading.Event = None,
+        capture_store=None,
+        capture_control=None,
+        autonomy_store=None,
+        resource_governor=None,
+        asr_model_name: str = "ambient_asr",
+        deferred_asr_max_audio_seconds: float = 300.0,
+    ):
         self.upload_dir = upload_dir
         self.voice_db = voice_db
         self.transcription_queue = queue.Queue()
         self.gpu_lock = gpu_lock or threading.Lock()
         self.audio_active_event = audio_active_event or threading.Event()
         self.llm_active_event = llm_active_event or threading.Event()
+        self.capture_store = capture_store
+        self.capture_control = capture_control
+        self.autonomy_store = autonomy_store
+        self.resource_governor = resource_governor
+        self.asr_model_name = str(asr_model_name or "ambient_asr")
+        self.deferred_asr_max_audio_seconds = max(30.0, float(deferred_asr_max_audio_seconds))
+        self._asr_window_audio_seconds = 0.0
+        self._asr_window_started_at = 0.0
         self.audio_agent = AudioAgent(
             transcription_queue=self.transcription_queue
             )
@@ -243,48 +268,187 @@ class AudioAgentService:
                 target_queue.task_done()
 
     def _process_uploads(self):
-        logging.info("Audio pipeline is waiting for uploads and user idle.")
+        logging.info("Audio pipeline is continuously capturing; heavy ASR is resource-gated.")
         while not self.stop_event.is_set():
-            if not ALWAYS_ON_MODE and not self.system_idle_service.is_user_idle():
+            if self.capture_control is not None and self.capture_control.is_paused():
                 self.audio_active_event.clear()
-                if self.stop_event.wait(1):
+                if self.stop_event.wait(0.5):
                     break
                 continue
-
             try:
                 file_path = self.processing_queue.get(timeout=1)
             except queue.Empty:
-                continue
+                file_path = None
 
-            if file_path is None:
+            if file_path is None and self.stop_event.is_set():
                 self.processing_queue.task_done()
                 break
+            if file_path is not None:
+                if self.autonomy_store is not None and self.resource_governor is not None:
+                    try:
+                        self._persist_audio_capture(file_path)
+                    except Exception:
+                        logging.exception("Failed to persist raw audio capture before ASR: %s", file_path)
+                        if Path(file_path).exists() and not self.stop_event.wait(1.0):
+                            self.processing_queue.put(file_path)
+                    finally:
+                        self.processing_queue.task_done()
+                else:
+                    try:
+                        self._process_audio_path(file_path)
+                    finally:
+                        self.processing_queue.task_done()
+                    continue
 
-            self.audio_active_event.set()
-            self.llm_active_event.clear()
-            if ALWAYS_ON_MODE:
-                logging.info("Audio file received. ASR pipeline is active in always_on mode.")
-            else:
-                logging.info("Audio file received while system is idle. ASR pipeline is active.")
+            if self.autonomy_store is not None and self.resource_governor is not None:
+                self._process_deferred_audio_once()
+                continue
+            if file_path is None:
+                continue
 
-            try:
-                with self.gpu_lock:
-                    self.audio_agent.run(file_path)
-            except Exception:
-                logging.exception(f"Failed to process file: {file_path}")
-            finally:
-                self.audio_agent.release_all_models()
-                self.audio_active_event.clear()
-                self.processing_queue.task_done()
-                logging.info("ASR pipeline finished. Returning to idle wait.")
         self.audio_active_event.clear()
         self.llm_active_event.clear()
         self.audio_agent.release_all_models()
-    
+
+    def _persist_audio_capture(self, file_path: str) -> None:
+        path = Path(file_path)
+        self._wait_for_stable_file(path)
+        stat = path.stat()
+        try:
+            info = torchaudio.info(str(path))
+            duration = float(info.num_frames / info.sample_rate) if info.sample_rate else 0.0
+        except Exception:
+            duration = 0.0
+        source_ref = str(path)
+        if self.capture_store is not None:
+            source_ref = self.capture_store.store_file(file_path, kind="audio", delete_source=True)
+        if self.autonomy_store is None:
+            return
+        occurred_at = datetime.now(timezone.utc).isoformat()
+        fingerprint = hashlib.sha256(
+            f"{path.name}|{stat.st_size}|{stat.st_mtime_ns}".encode("utf-8")
+        ).hexdigest()
+        self.autonomy_store.enqueue_event(
+            AmbientEvent(
+                event_id=uuid.uuid4().hex,
+                event_type="audio_capture_pending",
+                source_kind="audio_capture",
+                source_ref=source_ref,
+                occurred_at=occurred_at,
+                payload_json=json.dumps(
+                    {"audio_ref": source_ref, "duration_seconds": duration, "original_name": path.name}
+                ),
+                confidence=0.7,
+                privacy_label="sensitive_audio",
+                fingerprint=fingerprint,
+                status="pending",
+                priority=0.7,
+                available_at=occurred_at,
+            )
+        )
+
+    def _wait_for_stable_file(self, path: Path, *, timeout_seconds: float = 5.0) -> None:
+        deadline = time.monotonic() + max(0.1, timeout_seconds)
+        previous_size = -1
+        stable_checks = 0
+        while time.monotonic() < deadline:
+            size = path.stat().st_size
+            if size > 0 and size == previous_size:
+                stable_checks += 1
+                if stable_checks >= 2:
+                    return
+            else:
+                stable_checks = 0
+            previous_size = size
+            if self.stop_event.wait(0.1):
+                raise RuntimeError("audio capture stopped before the segment finished writing")
+        raise TimeoutError(f"audio segment did not stabilize before storage: {path}")
+
+    def _process_deferred_audio_once(self) -> None:
+        now = time.monotonic()
+        if self._asr_window_started_at and (
+            now - self._asr_window_started_at >= 90.0
+            or self._asr_window_audio_seconds >= self.deferred_asr_max_audio_seconds
+        ):
+            if now - self._asr_window_started_at < 150.0:
+                return
+            self._asr_window_started_at = 0.0
+            self._asr_window_audio_seconds = 0.0
+        event = self.autonomy_store.claim_next_event(
+            lease_seconds=600, event_types=["audio_capture_pending"]
+        )
+        if event is None:
+            self._asr_window_started_at = 0.0
+            self._asr_window_audio_seconds = 0.0
+            return
+        request = InferenceRequest(
+            workload="deferred_asr",
+            model_name=self.asr_model_name,
+            background=True,
+            user_active=not self.system_idle_service.is_user_idle(),
+            priority=70,
+        )
+        lease = self.resource_governor.request_lease(request)
+        if not lease.acquired:
+            self.autonomy_store.defer_event(event.event_id, reason=lease.decision.reason, delay_seconds=30)
+            return
+        payload = json.loads(event.payload_json or "{}")
+        audio_ref = str(payload.get("audio_ref") or event.source_ref)
+        duration = float(payload.get("duration_seconds") or 0.0)
+        if not self._asr_window_started_at:
+            self._asr_window_started_at = now
+        try:
+            self.audio_active_event.set()
+            deadline = time.monotonic() + 15.0
+            while self.llm_active_event.is_set() and time.monotonic() < deadline:
+                if self.stop_event.wait(0.1):
+                    self.autonomy_store.defer_event(
+                        event.event_id,
+                        reason="ASR shutdown interrupted resource acquisition",
+                        delay_seconds=15,
+                    )
+                    return
+            if self.llm_active_event.is_set():
+                self.autonomy_store.defer_event(
+                    event.event_id,
+                    reason="resident LLM did not release memory for deferred ASR",
+                    delay_seconds=15,
+                )
+                return
+            if audio_ref.startswith("capture://") and self.capture_store is not None:
+                with self.capture_store.materialize(audio_ref) as materialized:
+                    self._process_audio_path(materialized, archive_after=False)
+            else:
+                self._process_audio_path(audio_ref, archive_after=False)
+            self.autonomy_store.complete_event(event.event_id)
+            self._asr_window_audio_seconds += max(0.0, duration)
+        except Exception as exc:
+            logging.exception("Deferred ASR failed for %s", audio_ref)
+            self.autonomy_store.retry_event(event.event_id, error_text=str(exc), delay_seconds=60)
+        finally:
+            self.audio_agent.release_all_models()
+            self.audio_active_event.clear()
+            lease.__exit__(None, None, None)
+
+    def _process_audio_path(self, file_path: str, *, archive_after: bool = True) -> None:
+        self.audio_active_event.set()
+        try:
+            with self.gpu_lock:
+                self.audio_agent.run(file_path)
+        except Exception:
+            logging.exception("Failed to process file: %s", file_path)
+            raise
+        finally:
+            if archive_after and self.capture_store is not None and Path(file_path).exists():
+                self.capture_store.store_file(file_path, kind="audio", delete_source=True)
+            self.audio_agent.release_all_models()
+            self.audio_active_event.clear()
+
     def start_service(self):
         self.stop_event.clear()
         self.observer = Observer()
-        self.observer.schedule(Handler(self.processing_queue), str(UPLOAD_DIR), recursive=False)
+        Path(self.upload_dir).mkdir(parents=True, exist_ok=True)
+        self.observer.schedule(Handler(self.processing_queue), str(self.upload_dir), recursive=False)
         self.worker_thread.start()
         self.observer.start()
         

@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict
+from typing import Any, Optional, List, Dict
 from datetime import datetime
 
 @dataclass(frozen=True)
@@ -562,6 +562,158 @@ class ActivityRunDetail:
     links: List[ActivityLink] = field(default_factory=list)
     tags: List[str] = field(default_factory=list)
     traces: List[ActivityTraceLink] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class AmbientEvent:
+    """One durable, semantically meaningful input to the autonomy coordinator."""
+    event_id: str
+    event_type: str
+    source_kind: str
+    source_ref: str
+    occurred_at: str
+    payload_json: str
+    confidence: float
+    privacy_label: str
+    fingerprint: str
+    status: str = "pending"
+    priority: float = 0.5
+    attempt_count: int = 0
+    available_at: str = ""
+    leased_at: Optional[str] = None
+    lease_expires_at: Optional[str] = None
+    processed_at: Optional[str] = None
+    error_text: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class OpportunityCandidate:
+    """A judged opportunity for useful proactive work."""
+    opportunity_id: str
+    fingerprint: str
+    title: str
+    goal: str
+    rationale: str
+    source_event_ids: List[str]
+    expected_value: float
+    urgency: float
+    confidence: float
+    cost_of_wrong: float
+    personalization_benefit: float
+    evidence_gaps: List[str] = field(default_factory=list)
+    status: str = "discovered"
+    created_at: str = ""
+    updated_at: str = ""
+    expires_at: Optional[str] = None
+    metadata_json: str = "{}"
+
+
+@dataclass(frozen=True)
+class ActionStep:
+    """A single policy-evaluated step in an autonomous action plan."""
+    step_id: str
+    capability: str
+    tool_name: str
+    arguments: Dict[str, Any]
+    reversible: bool
+    external_effect: bool
+    risk_class: str
+    verification_rule: str
+    idempotency_key: str
+    estimated_cost: float = 0.0
+    status: str = "pending"
+
+
+@dataclass(frozen=True)
+class ActionPlan:
+    """A bounded plan produced for one opportunity."""
+    plan_id: str
+    opportunity_id: str
+    steps: List[ActionStep]
+    status: str
+    created_at: str
+    updated_at: str
+    metadata_json: str = "{}"
+
+
+@dataclass(frozen=True)
+class PolicyDecision:
+    """Deterministic authorization result for a proposed tool action."""
+    decision: str
+    capability: str
+    matched_rule: str
+    rationale: str
+    requires_approval: bool = False
+    constraints: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ApprovalGrant:
+    """A scoped approval for one or more bounded action attempts."""
+    approval_id: str
+    capability: str
+    action_fingerprint: str
+    constraints_json: str
+    status: str
+    created_at: str
+    expires_at: str
+    approver: str
+    reusable: bool = False
+    used_at: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ProactiveInboxItem:
+    """A durable user-facing result or approval request."""
+    inbox_id: str
+    opportunity_id: str
+    title: str
+    summary: str
+    detailed_report: str
+    status: str
+    confidence: float
+    why_now: str
+    sources_json: str
+    personalization_json: str
+    actions_json: str
+    created_at: str
+    updated_at: str
+    feedback: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ResourceSnapshot:
+    """Point-in-time host resource telemetry used before model loading."""
+    captured_at: str
+    total_ram_mb: int
+    available_ram_mb: int
+    available_ram_percent: float
+    total_vram_mb: Optional[int] = None
+    free_vram_mb: Optional[int] = None
+    gpu_telemetry_available: bool = False
+    user_idle: bool = False
+
+
+@dataclass(frozen=True)
+class InferenceRequest:
+    """A model workload admitted from live telemetry, never footprint estimates."""
+    workload: str
+    model_name: str
+    background: bool
+    user_active: bool
+    priority: int = 50
+    heavy: bool = True
+
+
+@dataclass(frozen=True)
+class ResourceDecision:
+    """Allow/defer result produced by the resource governor."""
+    allowed: bool
+    reason: str
+    preset: str
+    snapshot: ResourceSnapshot
+    available_ram_mb: int
+    free_vram_mb: Optional[int]
 
 
 @dataclass(frozen=True)

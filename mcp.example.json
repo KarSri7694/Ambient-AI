@@ -1,0 +1,25 @@
+{
+  "mcpServers": {
+    "local_tools": {
+      "command": "fastmcp",
+      "args": ["run", "src/MCP_tools.py"],
+      "env": {
+        "TODOIST_API_TOKEN": "%TODOIST_API_TOKEN%",
+        "GEMINI_API_KEY": "%GEMINI_API_KEY%"
+      }
+    },
+    "finance": {
+      "command": "fastmcp",
+      "args": ["run", "src/finance_tools.py"]
+    },
+    "tavily": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "https://mcp.tavily.com/mcp/?tavilyApiKey=%TAVILY_API_KEY%"]
+    },
+    "playwright": {
+      "command": "npx",
+      "args": ["-y", "@playwright/mcp@latest"],
+      "exposure": "browser_agent"
+    }
+  }
+}

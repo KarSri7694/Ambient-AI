@@ -191,7 +191,9 @@ def get_current_datetime():
 
 @mcp.tool
 def add_task(content :Annotated[str, "The content of the reminder/to-do to be added"] ,
-             due_datetime : Annotated[str, "Due date and time in YYYY-MM-DDTHH:MM:SS format"] ):
+             due_datetime : Annotated[str, "Due date and time in YYYY-MM-DDTHH:MM:SS format"],
+             source_url: Annotated[str, "Authoritative source URL for an inferred deadline"] = "",
+             source_verified: Annotated[bool, "True only when the deadline was verified from source_url"] = False):
     """
     Add a reminder or to-do task to Todoist with an optional due date. 
     If due date is not given, add the due datetime of 5 hours from the current date and time   
@@ -199,7 +201,11 @@ def add_task(content :Annotated[str, "The content of the reminder/to-do to be ad
     api = TodoistAPI(TODOIST_API_TOKEN)
     try:
         parsed_due_date_time = datetime.datetime.fromisoformat(due_datetime)
-        metadata = {"due_datetime": parsed_due_date_time.isoformat()}
+        metadata = {
+            "due_datetime": parsed_due_date_time.isoformat(),
+            "source_url": source_url,
+            "source_verified": bool(source_verified),
+        }
         dedupe = _evaluate_creation_candidate(
             entity_kind="todoist_reminder",
             source_kind="mcp_add_task",

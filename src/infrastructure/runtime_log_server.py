@@ -1,10 +1,11 @@
 import asyncio
-import hmac
+import hashlib
 import json
 import logging
 import mimetypes
 import queue
 import threading
+import uuid
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -12,7 +13,7 @@ from typing import Any, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from application.services.training_data_service import TrainingDataService
@@ -20,6 +21,7 @@ from infrastructure.adapter.SQLiteBenchmarkAdapter import SQLiteBenchmarkAdapter
 from infrastructure.adapter.SQLiteChatAdapter import ChatEventBroker, SQLiteChatAdapter
 from infrastructure.adapter.SQLiteInteractionLogAdapter import SQLiteInteractionLogAdapter
 from infrastructure.adapter.SQLiteTaskQueueAdapter import SQLiteTaskQueueAdapter
+from core.models import AmbientEvent
 from infrastructure.adapter.SQLiteTrainingDataAdapter import SQLiteTrainingDataAdapter
 
 
@@ -155,7 +157,10 @@ def create_runtime_log_app(
     media_roots: Optional[list[str]] = None,
     chat_store: SQLiteChatAdapter | None = None,
     chat_event_broker: ChatEventBroker | None = None,
-    auth_token: str = "",
+    autonomy_store: Any = None,
+    capture_store: Any = None,
+    capture_control: Any = None,
+    resource_governor: Any = None,
 ) -> FastAPI:
     app = FastAPI(title="Ambient Runtime Logs")
     normalized_media_roots = [Path(root) for root in (media_roots or [])]
@@ -163,16 +168,18 @@ def create_runtime_log_app(
         app.mount("/runtime-ui", StaticFiles(directory=str(UI_ROOT)), name="runtime_ui")
 
     @app.middleware("http")
-    async def protect_api(request: Request, call_next):
-        if request.url.path.startswith("/api/") and auth_token:
-            authorization = request.headers.get("authorization", "")
-            expected = f"Bearer {auth_token}"
-            cookie_token = request.cookies.get("ambient_auth", "")
-            if not (
-                hmac.compare_digest(authorization, expected)
-                or hmac.compare_digest(cookie_token, auth_token)
-            ):
-                return JSONResponse(status_code=401, content={"detail": "invalid_auth_token"})
+    async def enforce_same_origin(request: Request, call_next):
+        path = request.url.path
+        state_changing = request.method.upper() in {"POST", "PUT", "PATCH", "DELETE"}
+        if path.startswith("/api/") and state_changing:
+            from urllib.parse import urlsplit
+
+            request_host = (request.headers.get("host") or "").lower()
+            if not request_host:
+                return JSONResponse(status_code=400, content={"detail": "host header required"})
+            origin = request.headers.get("origin")
+            if origin and (urlsplit(origin).netloc or "").lower() != request_host:
+                return JSONResponse(status_code=401, content={"detail": "origin does not match host"})
         return await call_next(request)
 
     @app.get("/healthz")
@@ -545,7 +552,227 @@ def create_runtime_log_app(
         mime_type, _ = mimetypes.guess_type(str(resolved))
         return FileResponse(path=str(resolved), media_type=mime_type or "application/octet-stream")
 
+    @app.get("/api/autonomy/opportunities")
+    def list_opportunities(
+        limit: int = Query(default=50, ge=1, le=500),
+        status: str | None = Query(default=None),
+    ) -> dict[str, Any]:
+        rows = autonomy_store.list_opportunities(limit=limit, status=status) if autonomy_store is not None else []
+        return {"opportunities": [_as_dict(row) for row in rows], "count": len(rows)}
+
+    @app.get("/api/autonomy/inbox")
+    def list_proactive_inbox(
+        limit: int = Query(default=50, ge=1, le=500),
+        status: str | None = Query(default=None),
+    ) -> dict[str, Any]:
+        rows = autonomy_store.list_inbox_items(limit=limit, status=status) if autonomy_store is not None else []
+        return {"items": [_as_dict(row) for row in rows], "count": len(rows)}
+
+    @app.post("/api/autonomy/inbox/{inbox_id}/feedback")
+    async def proactive_inbox_feedback(inbox_id: str, request: Request) -> dict[str, Any]:
+        if autonomy_store is None:
+            raise HTTPException(status_code=503, detail="autonomy_store_unavailable")
+        body = await request.json()
+        try:
+            updated = autonomy_store.record_feedback(inbox_id, str(body.get("feedback") or ""))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"ok": updated}
+
+    @app.get("/api/autonomy/policies")
+    def list_capability_policies() -> dict[str, Any]:
+        rows = autonomy_store.list_policies() if autonomy_store is not None else []
+        return {"policies": rows, "count": len(rows)}
+
+    @app.put("/api/autonomy/policies/{capability}")
+    async def update_capability_policy(capability: str, request: Request) -> dict[str, Any]:
+        if autonomy_store is None:
+            raise HTTPException(status_code=503, detail="autonomy_store_unavailable")
+        body = await request.json()
+        try:
+            policy = autonomy_store.set_policy(
+                capability,
+                str(body.get("decision") or ""),
+                body.get("constraints") if isinstance(body.get("constraints"), dict) else None,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"ok": True, "policy": policy}
+
+    @app.get("/api/autonomy/calibration/{capability}")
+    def get_calibration(capability: str) -> dict[str, Any]:
+        if autonomy_store is None:
+            raise HTTPException(status_code=503, detail="autonomy_store_unavailable")
+        return autonomy_store.calibration_stats(capability)
+
+    @app.post("/api/autonomy/calibration/{capability}/outcomes")
+    async def add_calibration_outcome(capability: str, request: Request) -> dict[str, Any]:
+        if autonomy_store is None:
+            raise HTTPException(status_code=503, detail="autonomy_store_unavailable")
+        body = await request.json()
+        autonomy_store.record_calibration_outcome(
+            capability,
+            correct=bool(body.get("correct")),
+            source_ref=str(body.get("source_ref") or "") or None,
+        )
+        return {"ok": True, **autonomy_store.calibration_stats(capability)}
+
+    @app.get("/api/autonomy/approvals")
+    def list_autonomy_approvals(
+        status: str | None = Query(default=None),
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> dict[str, Any]:
+        rows = autonomy_store.list_approvals(status=status, limit=limit) if autonomy_store is not None else []
+        return {"approvals": [_as_dict(row) for row in rows], "count": len(rows)}
+
+    @app.post("/api/autonomy/approvals/{approval_id}/decision")
+    async def decide_autonomy_approval(approval_id: str, request: Request) -> dict[str, Any]:
+        if autonomy_store is None:
+            raise HTTPException(status_code=503, detail="autonomy_store_unavailable")
+        body = await request.json()
+        approved = bool(body.get("approved"))
+        changed = autonomy_store.decide_approval(
+            approval_id, approved=approved, approver="local_user"
+        )
+        if changed and approved:
+            approval = next(
+                (item for item in autonomy_store.list_approvals(limit=500) if item.approval_id == approval_id),
+                None,
+            )
+            if approval is not None:
+                details = _safe_json(approval.constraints_json, {})
+                now = datetime.now().astimezone().isoformat()
+                autonomy_store.enqueue_event(
+                    AmbientEvent(
+                        event_id=uuid.uuid4().hex,
+                        event_type="approval_granted",
+                        source_kind="local_approval",
+                        source_ref=approval_id,
+                        occurred_at=now,
+                        payload_json=json.dumps(details, ensure_ascii=False),
+                        confidence=1.0,
+                        privacy_label="private",
+                        fingerprint=hashlib.sha256(f"approval|{approval_id}".encode("utf-8")).hexdigest(),
+                        priority=1.0,
+                        available_at=now,
+                    )
+                )
+        return {"ok": changed, "approved": approved}
+
+    @app.get("/api/privacy/status")
+    def privacy_status() -> dict[str, Any]:
+        storage = (
+            capture_store.storage_status()
+            if capture_store is not None and hasattr(capture_store, "storage_status")
+            else {"capture_size_bytes": capture_store.size_bytes() if capture_store is not None else 0}
+        )
+        return {
+            "capture": capture_control.status() if capture_control is not None else {"paused": False},
+            "raw_retention": (
+                "indefinite_plain"
+            ),
+            **storage,
+        }
+
+    @app.get("/api/runtime/resources")
+    def runtime_resources() -> dict[str, Any]:
+        if resource_governor is None:
+            raise HTTPException(status_code=503, detail="resource_governor_unavailable")
+        payload = resource_governor.status()
+        if autonomy_store is not None and hasattr(autonomy_store, "event_counts"):
+            payload["event_counts"] = autonomy_store.event_counts()
+        return payload
+
+    @app.put("/api/runtime/resource-policy")
+    async def update_runtime_resource_policy(request: Request) -> dict[str, Any]:
+        if resource_governor is None:
+            raise HTTPException(status_code=503, detail="resource_governor_unavailable")
+        body = await request.json()
+        try:
+            preset = resource_governor.set_preset(str(body.get("preset") or ""))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"ok": True, "preset": preset, **resource_governor.status()}
+
+    @app.post("/api/privacy/capture/{action}")
+    def privacy_capture_action(action: str, request: Request) -> dict[str, Any]:
+        if capture_control is None:
+            raise HTTPException(status_code=503, detail="capture_control_unavailable")
+        if action == "pause":
+            capture_control.pause()
+        elif action == "resume":
+            capture_control.resume()
+        else:
+            raise HTTPException(status_code=400, detail="action_must_be_pause_or_resume")
+        if autonomy_store is not None:
+            autonomy_store.audit("local_user", f"capture.{action}", "global", {})
+        return {"ok": True, **capture_control.status()}
+
+    @app.put("/api/privacy/capture/exclusions")
+    async def privacy_capture_exclusions(request: Request) -> dict[str, Any]:
+        if capture_control is None:
+            raise HTTPException(status_code=503, detail="capture_control_unavailable")
+        body = await request.json()
+        apps = body.get("apps")
+        domains = body.get("domains")
+        if apps is not None and not isinstance(apps, list):
+            raise HTTPException(status_code=400, detail="apps_must_be_a_list")
+        if domains is not None and not isinstance(domains, list):
+            raise HTTPException(status_code=400, detail="domains_must_be_a_list")
+        capture_control.set_exclusions(apps=apps, domains=domains)
+        if autonomy_store is not None:
+            autonomy_store.audit(
+                "local_user",
+                "capture.exclusions_updated",
+                "global",
+                capture_control.status(),
+            )
+        return {"ok": True, **capture_control.status()}
+
+    @app.get("/api/privacy/captures")
+    def read_capture_file(request: Request, uri: str = Query(..., min_length=10)) -> Response:
+        if capture_store is None:
+            raise HTTPException(status_code=503, detail="capture_store_unavailable")
+        try:
+            data, metadata = capture_store.read_bytes(uri)
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=404, detail="capture_not_found") from exc
+        if autonomy_store is not None:
+            autonomy_store.audit(
+                "local_user", "capture.viewed", uri, {"kind": metadata.get("kind")}
+            )
+        headers = {"Content-Disposition": f'attachment; filename="{metadata.get("original_name", "ambient.bin")}"'}
+        return Response(content=data, media_type=metadata.get("mime_type") or "application/octet-stream", headers=headers)
+
+    @app.get("/api/privacy/captures/export")
+    def export_capture_file(request: Request, uri: str = Query(..., min_length=10)) -> Response:
+        if capture_store is None:
+            raise HTTPException(status_code=503, detail="capture_store_unavailable")
+        try:
+            data, filename = capture_store.read_stored_file(uri)
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=404, detail="capture_not_found") from exc
+        if autonomy_store is not None:
+            autonomy_store.audit(
+                "local_user", "capture.exported", uri, {}
+            )
+        return Response(
+            content=data,
+            media_type="application/octet-stream",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    @app.delete("/api/privacy/captures")
+    def delete_capture_file(request: Request, uri: str = Query(..., min_length=10)) -> dict[str, Any]:
+        if capture_store is None:
+            raise HTTPException(status_code=503, detail="capture_store_unavailable")
+        deleted = capture_store.delete(uri)
+        if autonomy_store is not None:
+            autonomy_store.audit("local_user", "capture.deleted", uri, {"deleted": deleted})
+        return {"ok": deleted}
+
     @app.get("/reports", response_class=HTMLResponse)
+    @app.get("/inbox", response_class=HTMLResponse)
     @app.get("/chat", response_class=HTMLResponse)
     @app.get("/", response_class=HTMLResponse)
     @app.get("/logs", response_class=HTMLResponse)
@@ -559,7 +786,7 @@ def create_runtime_log_app(
 
 def start_runtime_log_server(
     *,
-    host: str = "0.0.0.0",
+    host: str = "127.0.0.1",
     port: int = 8765,
     max_entries: int = 2000,
     report_store: SQLiteInteractionLogAdapter | None = None,
@@ -570,13 +797,19 @@ def start_runtime_log_server(
     media_roots: Optional[list[str]] = None,
     chat_store: SQLiteChatAdapter | None = None,
     chat_event_broker: ChatEventBroker | None = None,
-    auth_token: str = "",
+    autonomy_store: Any = None,
+    capture_store: Any = None,
+    capture_control: Any = None,
+    resource_governor: Any = None,
 ) -> RuntimeLogBuffer:
     global _SERVER_THREAD, _SERVER
     log_buffer = configure_runtime_log_streaming(max_entries=max_entries)
     with _SERVER_LOCK:
         if _SERVER_THREAD is not None and _SERVER_THREAD.is_alive():
             return log_buffer
+
+        if host not in {"127.0.0.1", "localhost", "::1"}:
+            raise RuntimeError("The unauthenticated runtime API may only bind to loopback.")
 
         app = create_runtime_log_app(
             log_buffer,
@@ -588,7 +821,10 @@ def start_runtime_log_server(
             media_roots=media_roots,
             chat_store=chat_store,
             chat_event_broker=chat_event_broker,
-            auth_token=auth_token,
+            autonomy_store=autonomy_store,
+            capture_store=capture_store,
+            capture_control=capture_control,
+            resource_governor=resource_governor,
         )
 
         def _serve() -> None:

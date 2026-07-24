@@ -753,34 +753,6 @@ audio {
   font-size: 1.08rem;
 }
 
-.chat-auth-panel {
-  padding: 12px 14px;
-  border-bottom: 1px solid var(--line);
-  color: var(--muted);
-  font-size: 0.78rem;
-}
-
-.chat-auth-panel label {
-  display: block;
-  margin-bottom: 6px;
-  font-weight: 760;
-}
-
-.chat-token-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 6px;
-  margin-bottom: 5px;
-}
-
-.chat-token-row input {
-  min-width: 0;
-  border: 1px solid var(--line-strong);
-  border-radius: 6px;
-  padding: 8px 9px;
-  background: var(--surface-raised);
-}
-
 .chat-session-list {
   display: grid;
   gap: 6px;

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 import threading
-from typing import Deque, Optional
+from typing import Callable, Deque, Optional
 
 import numpy as np
 from PIL import Image
@@ -27,16 +27,24 @@ class ScreenshotQueueService:
         ssim_threshold: float = 0.92,
         ssim_compare_count: int = 4,
         logger: logging.Logger | None = None,
+        discard_handler: Callable[[str, str], None] | None = None,
     ):
         self.maxlen = maxlen
         self.ssim_threshold = max(0.0, min(1.0, ssim_threshold))
         self.ssim_compare_count = max(0, ssim_compare_count)
         self.logger = logger or logging.getLogger(self.__class__.__name__)
+        self.discard_handler = discard_handler
         self._queue: Deque[ScreenshotJob] = deque()
         self._recent_images: Deque[np.ndarray] = deque(maxlen=self.ssim_compare_count)
         self._lock = threading.Lock()
 
-    def enqueue(self, screenshot_path: str, captured_at: str | None = None) -> Optional[ScreenshotJob]:
+    def enqueue(
+        self,
+        screenshot_path: str,
+        captured_at: str | None = None,
+        *,
+        retain: bool = True,
+    ) -> Optional[ScreenshotJob]:
         candidate = self._load_similarity_image(screenshot_path)
         with self._lock:
             similarity_score = self._best_similarity(candidate) if candidate is not None else None
@@ -49,17 +57,22 @@ class ScreenshotQueueService:
             )
             if candidate is not None and similarity_score is not None and similarity_score >= self.ssim_threshold:
                 self.logger.info("Skipped queued screenshot because it is too similar to a recent capture: %s", screenshot_path)
+                if self.discard_handler is not None:
+                    self.discard_handler(screenshot_path, "similar_capture")
                 return None
 
-            if len(self._queue) >= self.maxlen:
+            if retain and len(self._queue) >= self.maxlen:
                 dropped = self._queue.popleft()
                 self.logger.info("Dropped oldest queued screenshot due to queue overflow: %s", dropped.screenshot_path)
+                if self.discard_handler is not None:
+                    self.discard_handler(dropped.screenshot_path, "queue_overflow")
             job = ScreenshotJob(
                 screenshot_path=screenshot_path,
                 captured_at=captured_at or datetime.now().isoformat(),
                 similarity_score=similarity_score,
             )
-            self._queue.append(job)
+            if retain:
+                self._queue.append(job)
             if candidate is not None and self.ssim_compare_count > 0:
                 self._recent_images.append(candidate)
             return job

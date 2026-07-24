@@ -1,6 +1,6 @@
 # Ambient AI
 
-**A fully local ambient agent for audio, screen context, and idle-time autonomy.**
+**A local-first ambient agent that continuously judges when context warrants useful action.**
 
 ## Overview
 Ambient AI is a local-first agent that listens to ongoing audio, optionally observes the screen, builds context over time, and executes bounded autonomous work when appropriate.
@@ -8,10 +8,10 @@ Ambient AI is a local-first agent that listens to ongoing audio, optionally obse
 The current runtime is optimized around:
 
 - Transcript ingestion and classification
-- Passive screen observation and follow-up queueing
+- Passive screen observation and durable context events
 - Proactive research packaging
-- Idle-time and night-mode task execution
-- MCP-backed tool use for local automation
+- Policy-bounded actions and approvals
+- A coherent, capability-filtered tool surface
 
 It is not a chat app with manual modes anymore. `src/app.py` runs the ambient runtime manager directly.
 
@@ -21,16 +21,19 @@ The main runtime in [src/app.py](src/app.py) manages:
 - A primary llama.cpp server for the main chat/tool model via `API_BASE_URL` (default `http://localhost:8080`)
 - A separate llama.cpp server for embeddings and reranking via `SEMANTIC_API_BASE_URL` (default `http://localhost:8081`)
 - Transcript processing from the audio pipeline
-- Idle detection and ambient runtime loading/unloading
+- Durable context-event ingestion and opportunity judgment during active and idle use
 - Optional passive screen observation when `PASSIVE_OBSERVER_ENABLED=true`
-- Night-mode execution during the configured window (`20:00-23:00` in the current code)
+- Exact-time work represented as policy-checked events rather than execution bypasses
+- Continuous lightweight capture separated from resource-gated, bounded inference
 
 Key subsystems:
 
 - `LLMInteractionService`: tool-calling interaction loop, sub-agent loading, and direct-handled tools such as `capture_screen`
 - `PassiveObserverService`: screenshot capture and visual observation persistence
-- `PassiveObserverFollowupService`: queues durable follow-up tasks from unsent observations
-- `NightModeService`: executes external tasks, queued night tasks, proactive research, queue dedupe, and reflection
+- `AutonomyCoordinatorService`: turns context events into deduplicated opportunities, research, and inbox results
+- `CapabilityPolicyService`: applies user policy tiers, approvals, budgets, and high-risk action boundaries to every tool call
+- `PlainCaptureStore`: directly readable raw-context retention under the configured capture directory
+- `ResourceGovernorService` and `ModelResidencyManager`: RAM/VRAM admission control and single-model residency
 - `AmbientReflectionService`: bounded agenda/task/notification shaping
 
 ## Architecture
@@ -70,10 +73,10 @@ High-level storage/runtime components:
 - On-demand `capture_screen` tool for the active model turn
 
 ### Autonomy
-- Simple task execution for low-risk tasks
-- Proactive research queue and research vault
-- Night queue execution with semantic deduplication
-- Ambient agenda / reflection layer
+- Continuous screen/transcript/scheduled-task event evaluation; idle state only affects resource priority
+- Shadow and active judgment modes with durable leasing, retry, dead-letter, and semantic deduplication
+- General proactive research and personalized planning delivered to the Proactive Inbox
+- Typed capability packs, per-capability policy tiers, scoped approvals, and idempotent external writes
 
 ### Tools
 Configured MCP tools currently include:
@@ -111,14 +114,13 @@ $env:PASSIVE_OBSERVER_ENABLED="true"   # optional
 $env:USER_DATA_DIR="D:\USER_DATA"      # optional
 ```
 
-Current code-level defaults in `src/app.py`:
+Important runtime defaults in `src/app.py` and `config.example.ini`:
 
 - `DEFAULT_MODEL = "Qwen-3.5-9B-Mythos-Distilled-Q4_K_M-Vision"`
 - `EMBEDDING_MODEL_PATH = "EmbeddingGemma"`
 - `RERANKER_MODEL_PATH = "JinaReranker"`
-- `USER_IDLE_THRESHOLD_SECONDS = 20`
-- `NIGHT_MODE_START_HOUR = 20`
-- `NIGHT_MODE_END_HOUR = 23`
+- autonomy starts in `shadow` mode
+- 120 weighted tool calls/hour, 60 web queries/day, and 30 inbox cards/day
 
 ### MCP Configuration
 The runtime reads MCP server definitions from [mcp.json](mcp.json).
@@ -149,19 +151,45 @@ for an exact future time are scheduled through `schedule_task_at`; overdue tasks
 run the next time Ambient AI is available and publish their result to both the
 originating conversation and Reports.
 
-For access from another device on the LAN, set `[log_api] host = 0.0.0.0` and
-configure a strong `[chat] auth_token`. The runtime refuses non-loopback startup
-without that token. Keep the dashboard on a trusted network.
+The dashboard has no login or security database and is deliberately restricted to
+loopback (`127.0.0.1`, `localhost`, or `::1`). Non-loopback binding is refused.
+
+Raw screenshots, processed audio, transcripts, and ambient model inputs are stored as
+ordinary files under `USER_DATA_DIR/captures`. Raw data is retained indefinitely and is
+never pruned automatically; the loopback-only capture APIs provide audited viewing,
+export, and manual deletion. The dashboard also exposes a global capture
+pause switch, live application/domain exclusions, and storage-pressure warnings.
+
+### Resource-aware inference
+
+Ambient awareness does not require heavy models to remain loaded. Window metadata,
+UI Automation text, screenshots, and audio segments are persisted as plain files first.
+Screenshots are taken during normal lightweight capture, but vision analysis waits for
+a granted resource lease. Audio uses the same durable queue and defers ASR under memory
+pressure. Deferred work is not counted as a failure and is never dropped.
+
+No per-model memory estimates are configured or hardcoded. Before a model transition,
+the governor checks current measured RAM and VRAM against the selected preset. After the
+real model loads, it measures again and immediately unloads the model if the remaining
+headroom is unsafe. In `balanced`, active work reserves 768 MB of VRAM and 2 GB of host
+RAM; idle work reserves 512 MB of VRAM and 1.5 GB of host RAM. The dashboard exposes live
+telemetry, the loaded model, deferred counts, and `capture_only`, `balanced`, and
+`aggressive` presets.
 
 ## Running
 Ambient AI currently expects multiple local processes.
 
-### 1. Start the main llama.cpp server
-Example:
+### 1. Start the main llama.cpp router
+
+Ambient AI manages model residency through llama.cpp's `/models/load` and
+`/models/unload` endpoints, so start the server in router mode before `src/app.py`:
 
 ```powershell
-llama-server -m <main-model> --host 0.0.0.0 --port 8080 --slots --slot-save-path .\model_kv_states
+llama-server --models-preset .\models_preset.ini --models-max 1 --no-models-autoload --host 127.0.0.1 --port 8080 --api-key testkey
 ```
+
+Ambient AI does not start this process automatically. If it is unavailable, capture
+continues and the runtime logs a clear error, but judgment and research remain deferred.
 
 ### 2. Start the semantic llama.cpp server
 Example:
@@ -186,10 +214,12 @@ python src/realtime_audio_input.py
 
 ## Notes on Current Behavior
 - Passive observation is optional and controlled by `PASSIVE_OBSERVER_ENABLED`.
-- Ambient idle/night execution does not depend on passive observer being enabled.
+- Startup never loads a full chat, vision, judgment, research, or ASR model.
+- Opportunity judgment does not wait for user idle; idle detection is only a resource and interruption hint.
+- Active-use inference runs only when the stricter resource headroom test passes; otherwise capture continues and work queues durably.
 - Screen capture for the active model turn is available through the `capture_screen` tool.
-- Night-mode queue dedupe now keeps only semantically unique tasks before execution.
-- Passive follow-up only evaluates unsent observations and marks reviewed observations as sent.
+- Scheduled work enters the same policy gateway as inferred and interactive work.
+- Repeated context is coalesced into evolving opportunities, and negative inbox feedback suppresses recurrence.
 
 ## Development Notes
 Useful test entry points:
@@ -198,14 +228,8 @@ Useful test entry points:
 pytest tests/test_night_mode.py -q
 pytest tests/test_passive_observer.py -q
 pytest tests/test_llm_interaction_service.py -q
+pytest tests/test_autonomy_control_plane.py -q
 ```
-
-## Roadmap
-Near-term architecture gaps still visible in the codebase:
-
-- Continuous active-use ambient behavior is still weaker than idle-time behavior
-- Cross-modal context exists, but execution is still queue-heavy
-- Tool/action autonomy is still conservative for many real workflows
 
 ## License
 This project is licensed under the MIT License.

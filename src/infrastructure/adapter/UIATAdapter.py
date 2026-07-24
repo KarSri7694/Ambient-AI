@@ -35,6 +35,7 @@ class UIATAdapter:
             "is_chromium": False,
             "visible_items": [],
             "visible_text_summary": "",
+            "foreground_url": None,
             "contains_dialog": False,
             "contains_notification": False,
             "contains_editable_fields": False,

@@ -13,6 +13,7 @@ Usage:
 import sys
 import time
 import ctypes
+import re
 import uiautomation as auto
 
 
@@ -526,6 +527,18 @@ def inspect_foreground_window(mode: str = "interactive_only") -> dict:
         for row in rows
     ]
     visible_text_summary = "\n".join(item["name"] for item in items[:80])
+    foreground_url = None
+    url_pattern = re.compile(r"https?://[^\s]+", re.IGNORECASE)
+    domain_pattern = re.compile(r"^(?:www\.)?[a-z0-9-]+(?:\.[a-z0-9-]+)+(?::\d+)?(?:/\S*)?$", re.IGNORECASE)
+    for item in items:
+        candidate = str(item.get("name") or "").strip()
+        match = url_pattern.search(candidate)
+        if match:
+            foreground_url = match.group(0).rstrip(",.;)")
+            break
+        if domain_pattern.match(candidate) and " " not in candidate:
+            foreground_url = "https://" + candidate
+            break
     lowered = visible_text_summary.lower()
     return {
         "ok": True,
@@ -536,6 +549,7 @@ def inspect_foreground_window(mode: str = "interactive_only") -> dict:
         "is_chromium": chromium,
         "visible_items": items,
         "visible_text_summary": visible_text_summary,
+        "foreground_url": foreground_url,
         "contains_dialog": any(keyword in lowered for keyword in ("dialog", "confirm", "warning", "permission")),
         "contains_notification": any(keyword in lowered for keyword in ("notification", "reminder", "alert", "error")),
         "contains_editable_fields": any(isinstance(item["name"], str) and item["name"] for item in items),

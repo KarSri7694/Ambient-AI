@@ -105,29 +105,26 @@ def test_chat_store_marks_interrupted_responses_failed(tmp_path):
     assert "stopped" in message["error_text"]
 
 
-def test_chat_api_requires_token_and_supports_terminal_sse(tmp_path):
+def test_loopback_chat_api_supports_terminal_sse_without_authentication(tmp_path):
     store = SQLiteChatAdapter(str(tmp_path / "chat.db"))
     broker = ChatEventBroker()
     app = create_runtime_log_app(
         RuntimeLogBuffer(),
         chat_store=store,
         chat_event_broker=broker,
-        auth_token="secret-token",
     )
     client = TestClient(app)
 
-    assert client.get("/api/chat/sessions").status_code == 401
-    headers = {"Authorization": "Bearer secret-token"}
-    session = client.post("/api/chat/sessions", headers=headers, json={}).json()["session"]
+    assert client.get("/api/chat/sessions").status_code == 200
+    session = client.post("/api/chat/sessions", json={}).json()["session"]
     turn = client.post(
         f"/api/chat/sessions/{session['id']}/messages",
-        headers=headers,
         json={"content": "hello"},
     ).json()
     assistant_id = turn["assistant_message"]["id"]
     store.complete_message(assistant_id, "world")
 
-    response = client.get(f"/api/chat/messages/{assistant_id}/events", headers=headers)
+    response = client.get(f"/api/chat/messages/{assistant_id}/events")
     assert response.status_code == 200
     assert "event: snapshot" in response.text
     assert "event: done" in response.text

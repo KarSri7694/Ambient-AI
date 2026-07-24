@@ -15,11 +15,15 @@
       </div>
       <nav class="tabs" aria-label="Dashboard sections">
         <button class="tab active" data-tab="chat" type="button">Chat</button>
+        <button class="tab" data-tab="inbox" type="button">Proactive Inbox</button>
         <button class="tab" data-tab="reports" type="button">Reports</button>
         <button class="tab" data-tab="benchmarks" type="button">Benchmarks</button>
         <button class="tab" data-tab="training" type="button">Training</button>
         <button class="tab" data-tab="logs" type="button">Logs</button>
       </nav>
+      <button id="captureToggleButton" class="button" type="button">Pause capture</button>
+      <span id="captureStatus" class="chip">capture active</span>
+      <span id="resourceStatus" class="chip">resources checking</span>
       <div class="status-wrap">
         <span class="live-dot" aria-hidden="true"></span>
         <span id="status">connecting...</span>
@@ -36,14 +40,6 @@
                 <h2>Ambient AI</h2>
               </div>
               <button id="newChatButton" class="button primary" type="button">New</button>
-            </div>
-            <div id="chatAuthPanel" class="chat-auth-panel">
-              <label for="chatTokenInput">LAN access token</label>
-              <div class="chat-token-row">
-                <input id="chatTokenInput" type="password" autocomplete="current-password" placeholder="Token, if configured" />
-                <button id="saveChatTokenButton" class="button" type="button">Use</button>
-              </div>
-              <small>Kept in this browser tab only.</small>
             </div>
             <div id="chatSessionsEmpty" class="empty-state compact">No conversations yet.</div>
             <div id="chatSessions" class="chat-session-list"></div>
@@ -75,6 +71,47 @@
             </form>
             <div class="composer-help">Enter to send · Shift+Enter for a new line · explicit action requests can use tools</div>
           </div>
+        </div>
+      </section>
+
+      <section id="inboxSection" class="section">
+        <div class="section-head">
+          <div>
+            <p class="section-kicker">Judgment-driven assistance</p>
+            <h2>Proactive Inbox</h2>
+          </div>
+          <div class="metric-strip">
+            <div><span id="inboxCount">0</span><small>Opportunities</small></div>
+          </div>
+        </div>
+        <div class="split-grid">
+          <div class="pane">
+            <div id="inboxEmpty" class="empty-state">No proactive opportunities yet.</div>
+            <div id="proactiveInbox" class="record-stack"></div>
+          </div>
+          <aside class="side-pane">
+            <div class="panel-head"><h3>Pending approvals</h3></div>
+            <div id="approvalsEmpty" class="empty-state compact">No actions need approval.</div>
+            <div id="pendingApprovals" class="record-stack"></div>
+            <div class="panel-head"><h3>Capability policies</h3></div>
+            <div id="capabilityPolicies" class="record-stack"></div>
+            <div class="panel-head"><h3>Capture exclusions</h3></div>
+            <label for="captureExcludedApps">Applications (comma separated)</label>
+            <input id="captureExcludedApps" type="text" placeholder="1password, signal" />
+            <label for="captureExcludedDomains">Domains (comma separated)</label>
+            <input id="captureExcludedDomains" type="text" placeholder="bank.example, health.example" />
+            <button id="saveCaptureExclusions" class="button" type="button">Save exclusions</button>
+            <small id="storagePressure"></small>
+            <div class="panel-head"><h3>Resource policy</h3></div>
+            <label for="resourcePreset">Inference preset</label>
+            <select id="resourcePreset">
+              <option value="capture_only">Capture only</option>
+              <option value="balanced">Balanced</option>
+              <option value="aggressive">Aggressive</option>
+            </select>
+            <small id="resourceDetails">Waiting for resource telemetry.</small>
+            <small id="deferredCount"></small>
+          </aside>
         </div>
       </section>
 

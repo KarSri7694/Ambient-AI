@@ -197,6 +197,13 @@ class SQLiteChatAdapter:
         claimed["user_message"] = dict(user_row)
         return claimed
 
+    def has_queued_turn(self) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM chat_messages WHERE role='assistant' AND status='queued' LIMIT 1"
+            ).fetchone()
+        return row is not None
+
     def conversation_history(
         self,
         session_id: str,
@@ -251,6 +258,13 @@ class SQLiteChatAdapter:
             conn.execute(
                 "UPDATE chat_messages SET status='failed', error_text=?, updated_at=? WHERE id=?",
                 (error_text[:2000], _utc_now(), message_id),
+            )
+
+    def defer_message(self, message_id: str, reason: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE chat_messages SET status='queued', error_text=?, updated_at=? WHERE id=? AND status='running'",
+                (reason[:2000], _utc_now(), message_id),
             )
 
     def append_scheduled_result(

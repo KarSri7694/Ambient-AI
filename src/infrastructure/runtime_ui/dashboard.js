@@ -13,7 +13,6 @@ const state = {
     model: "",
   },
   logCount: 0,
-  chatToken: sessionStorage.getItem("ambientChatToken") || "",
   chatSessions: [],
   selectedChatId: "",
   chatMessageKey: "",
@@ -22,15 +21,32 @@ const state = {
 
 const els = {
   status: document.getElementById("status"),
+  captureStatus: document.getElementById("captureStatus"),
+  resourceStatus: document.getElementById("resourceStatus"),
+  captureToggleButton: document.getElementById("captureToggleButton"),
+  captureExcludedApps: document.getElementById("captureExcludedApps"),
+  captureExcludedDomains: document.getElementById("captureExcludedDomains"),
+  saveCaptureExclusions: document.getElementById("saveCaptureExclusions"),
+  storagePressure: document.getElementById("storagePressure"),
+  resourcePreset: document.getElementById("resourcePreset"),
+  resourceDetails: document.getElementById("resourceDetails"),
+  deferredCount: document.getElementById("deferredCount"),
   tabs: Array.from(document.querySelectorAll(".tab")),
   sections: {
     chat: document.getElementById("chatSection"),
+    inbox: document.getElementById("inboxSection"),
     reports: document.getElementById("reportsSection"),
     benchmarks: document.getElementById("benchmarksSection"),
     training: document.getElementById("trainingSection"),
     logs: document.getElementById("logsSection"),
   },
   reports: document.getElementById("reports"),
+  proactiveInbox: document.getElementById("proactiveInbox"),
+  inboxEmpty: document.getElementById("inboxEmpty"),
+  inboxCount: document.getElementById("inboxCount"),
+  pendingApprovals: document.getElementById("pendingApprovals"),
+  approvalsEmpty: document.getElementById("approvalsEmpty"),
+  capabilityPolicies: document.getElementById("capabilityPolicies"),
   reportsEmpty: document.getElementById("reportsEmpty"),
   reportsCount: document.getElementById("reportsCount"),
   queuedTasks: document.getElementById("queuedTasks"),
@@ -70,9 +86,6 @@ const els = {
   modeAsr: document.getElementById("modeAsr"),
   logs: document.getElementById("logs"),
   logsCount: document.getElementById("logsCount"),
-  chatAuthPanel: document.getElementById("chatAuthPanel"),
-  chatTokenInput: document.getElementById("chatTokenInput"),
-  saveChatTokenButton: document.getElementById("saveChatTokenButton"),
   newChatButton: document.getElementById("newChatButton"),
   renameChatButton: document.getElementById("renameChatButton"),
   chatSessions: document.getElementById("chatSessions"),
@@ -174,23 +187,11 @@ async function getJson(url) {
   return response.json();
 }
 
-function authHeaders(extra = {}) {
-  const headers = { ...extra };
-  if (state.chatToken) headers.Authorization = `Bearer ${state.chatToken}`;
-  return headers;
-}
-
 async function apiFetch(url, options = {}) {
-  const response = await fetch(url, {
+  return fetch(url, {
     ...options,
-    headers: authHeaders(options.headers || {}),
+    credentials: "same-origin",
   });
-  if (response.status === 401) {
-    els.chatAuthPanel.classList.add("needs-token");
-    els.status.textContent = "access token required";
-    throw new Error("Invalid or missing access token");
-  }
-  return response;
 }
 
 function renderReports(items) {
@@ -454,6 +455,122 @@ function setTrainingMode(mode) {
   pollTraining(true);
 }
 
+function renderProactiveInbox(items) {
+  els.proactiveInbox.innerHTML = "";
+  els.inboxEmpty.style.display = items.length ? "none" : "block";
+  els.inboxCount.textContent = String(items.length);
+  for (const item of items) {
+    const card = document.createElement("article");
+    card.className = "record-card";
+    card.innerHTML = `
+      <div class="record-top">
+        <div class="chips">${chip(item.status)}${chip(`confidence ${Number(item.confidence || 0).toFixed(2)}`)}</div>
+        <div class="timestamp">${escapeHtml(formatDate(item.updated_at))}</div>
+      </div>
+      <h3 class="record-title">${escapeHtml(item.title)}</h3>
+      <p class="record-text">${escapeHtml(item.summary)}</p>
+      <div class="meta-grid"><div><strong>Why now</strong>${escapeHtml(item.why_now)}</div></div>
+      <details><summary>Evidence and sources</summary><pre>${escapeHtml(prettyJson(item.sources_json))}</pre></details>
+      <details><summary>Personalization used</summary><pre>${escapeHtml(prettyJson(item.personalization_json))}</pre></details>
+      <details><summary>Actions and verification</summary><pre>${escapeHtml(prettyJson(item.actions_json))}</pre></details>
+      <details><summary>Detailed result</summary><pre>${escapeHtml(item.detailed_report)}</pre></details>
+      <div class="toolbar" data-inbox-id="${escapeHtml(item.inbox_id)}">
+        <button class="button" data-feedback="useful" type="button">Useful</button>
+        <button class="button" data-feedback="not_useful" type="button">Not useful</button>
+        <button class="button" data-feedback="wrong_inference" type="button">Wrong inference</button>
+        <button class="button" data-feedback="too_intrusive" type="button">Too intrusive</button>
+        ${item.feedback ? chip(item.feedback) : ""}
+      </div>
+    `;
+    els.proactiveInbox.appendChild(card);
+  }
+}
+
+async function pollProactiveInbox() {
+  const [payload, approvalPayload, policyPayload] = await Promise.all([
+    getJson("/api/autonomy/inbox?limit=100"),
+    getJson("/api/autonomy/approvals?status=pending&limit=100"),
+    getJson("/api/autonomy/policies"),
+  ]);
+  renderProactiveInbox(payload.items || []);
+  renderApprovals(approvalPayload.approvals || []);
+  renderPolicies(policyPayload.policies || []);
+}
+
+async function pollPrivacy() {
+  const payload = await getJson("/api/privacy/status");
+  const paused = Boolean(payload.capture?.paused);
+  els.captureStatus.textContent = paused ? "capture paused" : "capture active";
+  els.captureStatus.classList.toggle("paused", paused);
+  els.captureToggleButton.textContent = paused ? "Resume capture" : "Pause capture";
+  els.captureToggleButton.dataset.action = paused ? "resume" : "pause";
+  if (document.activeElement !== els.captureExcludedApps) {
+    els.captureExcludedApps.value = (payload.capture?.excluded_apps || []).join(", ");
+  }
+  if (document.activeElement !== els.captureExcludedDomains) {
+    els.captureExcludedDomains.value = (payload.capture?.excluded_domains || []).join(", ");
+  }
+  els.storagePressure.textContent = payload.storage_pressure
+    ? "Storage pressure detected. Plain captures will not be auto-deleted."
+    : `Plain captures: ${Math.round(Number(payload.capture_size_bytes || 0) / 1048576)} MB · ${payload.capture_root || "capture folder"}`;
+}
+
+async function pollResources() {
+  const payload = await getJson("/api/runtime/resources");
+  const snapshot = payload.snapshot || {};
+  const residency = payload.residency || {};
+  const freeRamGb = Number(snapshot.available_ram_mb || 0) / 1024;
+  const freeVramGb = snapshot.free_vram_mb == null
+    ? null
+    : Number(snapshot.free_vram_mb) / 1024;
+  const loaded = residency.loaded_model || "on demand";
+  const active = payload.active_workload ? "inference active" : "capture ready";
+  els.resourceStatus.textContent = `${active} · ${loaded}`;
+  if (document.activeElement !== els.resourcePreset) {
+    els.resourcePreset.value = payload.preset || "balanced";
+  }
+  const vramText = freeVramGb == null ? "GPU telemetry unavailable" : `${freeVramGb.toFixed(1)} GB VRAM free`;
+  els.resourceDetails.textContent = `${freeRamGb.toFixed(1)} GB RAM free · ${vramText} · model: ${loaded}`;
+  const counts = payload.event_counts || {};
+  els.deferredCount.textContent = `${Number(counts.resource_deferred || 0)} resource-deferred · ${Number(counts.pending || 0)} pending events`;
+}
+
+function renderApprovals(items) {
+  els.pendingApprovals.innerHTML = "";
+  els.approvalsEmpty.style.display = items.length ? "none" : "block";
+  for (const item of items) {
+    const card = document.createElement("article");
+    card.className = "record-card";
+    card.innerHTML = `
+      <div class="record-top"><div class="chips">${chip(item.capability)}</div></div>
+      <p class="record-text">This bounded action needs your approval before it can run.</p>
+      <pre>${escapeHtml(prettyJson(item.constraints_json))}</pre>
+      <div class="toolbar" data-approval-id="${escapeHtml(item.approval_id)}">
+        <button class="button primary" data-approval-decision="approve" type="button">Approve once</button>
+        <button class="button" data-approval-decision="deny" type="button">Deny</button>
+      </div>
+    `;
+    els.pendingApprovals.appendChild(card);
+  }
+}
+
+function renderPolicies(items) {
+  els.capabilityPolicies.innerHTML = "";
+  for (const item of items) {
+    const card = document.createElement("article");
+    card.className = "record-card";
+    card.innerHTML = `
+      <strong>${escapeHtml(item.capability)}</strong>
+      <select data-policy-capability="${escapeHtml(item.capability)}">
+        ${["deny", "ask", "auto_reversible", "trusted_bounded"].map((decision) =>
+          `<option value="${decision}" ${decision === item.decision ? "selected" : ""}>${decision}</option>`
+        ).join("")}
+      </select>
+    `;
+    els.capabilityPolicies.appendChild(card);
+  }
+}
+
 function chatWelcomeMarkup() {
   return `
     <div class="chat-welcome">
@@ -701,17 +818,62 @@ function bindEvents() {
     });
   });
 
-  els.saveChatTokenButton.addEventListener("click", async () => {
-    state.chatToken = els.chatTokenInput.value.trim();
-    sessionStorage.setItem("ambientChatToken", state.chatToken);
-    document.cookie = `ambient_auth=${encodeURIComponent(state.chatToken)}; Path=/; SameSite=Strict`;
-    els.chatAuthPanel.classList.remove("needs-token");
-    try {
-      await pollChat();
-      els.status.textContent = "access granted";
-    } catch (error) {
-      els.status.textContent = "invalid access token";
-    }
+  els.proactiveInbox.addEventListener("click", async (event) => {
+    const button = event.target.closest("[data-feedback]");
+    if (!button) return;
+    const container = button.closest("[data-inbox-id]");
+    await apiFetch(`/api/autonomy/inbox/${container.dataset.inboxId}/feedback`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ feedback: button.dataset.feedback }),
+    });
+    await pollProactiveInbox();
+  });
+  els.pendingApprovals.addEventListener("click", async (event) => {
+    const button = event.target.closest("[data-approval-decision]");
+    if (!button) return;
+    const container = button.closest("[data-approval-id]");
+    await apiFetch(`/api/autonomy/approvals/${container.dataset.approvalId}/decision`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ approved: button.dataset.approvalDecision === "approve" }),
+    });
+    await pollProactiveInbox();
+  });
+  els.capabilityPolicies.addEventListener("change", async (event) => {
+    const select = event.target.closest("[data-policy-capability]");
+    if (!select) return;
+    await apiFetch(`/api/autonomy/policies/${encodeURIComponent(select.dataset.policyCapability)}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision: select.value }),
+    });
+    await pollProactiveInbox();
+  });
+  els.captureToggleButton.addEventListener("click", async () => {
+    const action = els.captureToggleButton.dataset.action || "pause";
+    await apiFetch(`/api/privacy/capture/${action}`, { method: "POST" });
+    await pollPrivacy();
+  });
+  els.saveCaptureExclusions.addEventListener("click", async () => {
+    const split = (value) => value.split(",").map((item) => item.trim()).filter(Boolean);
+    await apiFetch("/api/privacy/capture/exclusions", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        apps: split(els.captureExcludedApps.value),
+        domains: split(els.captureExcludedDomains.value),
+      }),
+    });
+    await pollPrivacy();
+  });
+  els.resourcePreset.addEventListener("change", async () => {
+    await apiFetch("/api/runtime/resource-policy", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ preset: els.resourcePreset.value }),
+    });
+    await pollResources();
   });
 
   els.newChatButton.addEventListener("click", createChatSession);
@@ -880,6 +1042,9 @@ async function poll() {
       pollBenchmarks(),
       pollTraining(),
       pollChat(),
+      pollProactiveInbox(),
+      pollPrivacy(),
+      pollResources(),
     ]);
     for (const entry of logPayload.entries || []) {
       appendLog(entry);
@@ -892,10 +1057,6 @@ async function poll() {
 }
 
 bindEvents();
-els.chatTokenInput.value = state.chatToken;
-if (state.chatToken) {
-  document.cookie = `ambient_auth=${encodeURIComponent(state.chatToken)}; Path=/; SameSite=Strict`;
-}
 setTrainingMode("llm");
 poll();
 setInterval(poll, 2000);

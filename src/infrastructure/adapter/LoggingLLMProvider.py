@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from application.ports.LLMProvider import LLMProvider
 from application.services.interaction_trace import current_interaction_metadata, current_interaction_source
+from application.services.resource_governor_service import ResourceUnavailableError
 from core.models import InteractionLogEntry
 from infrastructure.adapter.SQLiteInteractionLogAdapter import SQLiteInteractionLogAdapter
 
@@ -20,10 +21,14 @@ class LoggingLLMProvider(LLMProvider):
         provider: LLMProvider,
         log_store: SQLiteInteractionLogAdapter,
         current_response_path: str | None = None,
+        capture_store: Any = None,
+        residency_manager: Any = None,
     ):
         self.provider = provider
         self.log_store = log_store
         self.current_response_path = Path(current_response_path) if current_response_path else None
+        self.capture_store = capture_store
+        self.residency_manager = residency_manager
         self._current_response_state: Dict[str, Any] | None = None
         if self.current_response_path is not None:
             self.current_response_path.parent.mkdir(parents=True, exist_ok=True)
@@ -31,13 +36,53 @@ class LoggingLLMProvider(LLMProvider):
     def __getattr__(self, name: str):
         return getattr(self.provider, name)
 
+    def _messages_json(self, messages: Any, *, source: str, interaction_id: str) -> str:
+        serialized = json.dumps(copy.deepcopy(messages), ensure_ascii=False, indent=2)
+        if self.capture_store is not None and source.startswith(
+            ("autonomy", "passive_observer", "audio", "transcript")
+        ):
+            reference = self.capture_store.store_bytes(
+                serialized.encode("utf-8"),
+                original_name=f"llm_messages_{interaction_id}.json",
+                kind="llm_messages",
+                mime_type="application/json",
+            )
+            return json.dumps({"protected_payload_ref": reference})
+        return serialized
+
     async def load_model(self, model_name: str) -> None:
+        if self.residency_manager is not None:
+            source = current_interaction_source()
+            background = source.startswith(("autonomy", "passive_observer", "audio", "reflection"))
+            decision = await self.residency_manager.load_model(
+                model_name,
+                role=source or "interactive",
+                background=background,
+                user_active=not bool(current_interaction_metadata().get("user_idle")),
+            )
+            if not decision.allowed:
+                raise ResourceUnavailableError(decision)
+            return None
         return await self.provider.load_model(model_name)
 
+    async def unload_model(self) -> None:
+        if self.residency_manager is not None:
+            return await self.residency_manager.unload_model(reason="LLM interaction released model")
+        return await self.provider.unload_model()
+
     async def save_and_unload(self, messages: List[Dict[str, Any]]):
+        if self.residency_manager is not None:
+            return await self.residency_manager.save_and_unload(messages)
         return await self.provider.save_and_unload(messages)
 
     async def load_and_restore(self):
+        if self.residency_manager is not None:
+            source = current_interaction_source()
+            return await self.residency_manager.load_and_restore(
+                role=source or "state_restore",
+                background=source.startswith(("autonomy", "passive_observer", "audio", "reflection")),
+                user_active=not bool(current_interaction_metadata().get("user_idle")),
+            )
         return await self.provider.load_and_restore()
 
     def generate_response(self, prompt: str, image: str = "") -> str:
@@ -77,7 +122,7 @@ class LoggingLLMProvider(LLMProvider):
                     completed_at=datetime.now().isoformat(),
                     source=source,
                     model=getattr(self.provider, "currently_loaded_model", "") or "unknown",
-                    messages_json=json.dumps([{"role": "user", "content": prompt}], ensure_ascii=False, indent=2),
+                    messages_json=self._messages_json([{"role": "user", "content": prompt}], source=source, interaction_id=interaction_id),
                     image_path=image or None,
                     response_text=response,
                     duration_ms=int((perf_counter() - started) * 1000),
@@ -106,7 +151,7 @@ class LoggingLLMProvider(LLMProvider):
                     completed_at=datetime.now().isoformat(),
                     source=source,
                     model=getattr(self.provider, "currently_loaded_model", "") or "unknown",
-                    messages_json=json.dumps([{"role": "user", "content": prompt}], ensure_ascii=False, indent=2),
+                    messages_json=self._messages_json([{"role": "user", "content": prompt}], source=source, interaction_id=interaction_id),
                     image_path=image or None,
                     error_text=str(exc),
                     duration_ms=int((perf_counter() - started) * 1000),
@@ -213,7 +258,7 @@ class LoggingLLMProvider(LLMProvider):
                             completed_at=datetime.now().isoformat(),
                             source=source,
                             model=model,
-                            messages_json=json.dumps(copy.deepcopy(messages), ensure_ascii=False, indent=2),
+                            messages_json=self._messages_json(messages, source=source, interaction_id=interaction_id),
                             tools_json=json.dumps(tools, ensure_ascii=False, indent=2) if tools is not None else None,
                             image_path=image or None,
                             response_text="".join(response_text_parts) or None,
@@ -247,7 +292,7 @@ class LoggingLLMProvider(LLMProvider):
                             completed_at=datetime.now().isoformat(),
                             source=source,
                             model=model,
-                            messages_json=json.dumps(copy.deepcopy(messages), ensure_ascii=False, indent=2),
+                            messages_json=self._messages_json(messages, source=source, interaction_id=interaction_id),
                             tools_json=json.dumps(tools, ensure_ascii=False, indent=2) if tools is not None else None,
                             image_path=image or None,
                             response_text="".join(response_text_parts) or None,
@@ -282,7 +327,7 @@ class LoggingLLMProvider(LLMProvider):
                     completed_at=datetime.now().isoformat(),
                     source=source,
                     model=model,
-                    messages_json=json.dumps(copy.deepcopy(messages), ensure_ascii=False, indent=2),
+                    messages_json=self._messages_json(messages, source=source, interaction_id=interaction_id),
                     tools_json=json.dumps(tools, ensure_ascii=False, indent=2) if tools is not None else None,
                     image_path=image or None,
                     error_text=str(exc),
@@ -329,6 +374,7 @@ class LoggingLLMProvider(LLMProvider):
             "response_text": response_text,
             "interaction_run_id": interaction_run_id,
             "report": None,
+            "protected": source.startswith(("autonomy", "passive_observer", "audio", "transcript")),
         }
         self._flush_current_response_state()
 
@@ -336,6 +382,8 @@ class LoggingLLMProvider(LLMProvider):
         if self.current_response_path is None or self._current_response_state is None:
             return
         state = self._current_response_state
+        if state.get("protected"):
+            return
         lines = [
             f"status: {state['status']}",
             f"created_at: {state['created_at']}",

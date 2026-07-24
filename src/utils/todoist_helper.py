@@ -20,9 +20,14 @@ class TodoistHelper:
         self.logger = logging.getLogger(self.__class__.__name__)
         self.api_token = self._resolve_api_token()
         self.api = TodoistAPI(self.api_token) if self.api_token else None
-        if TODOIST_CONFIG_PATH.exists():
-            self.data = json.loads(TODOIST_CONFIG_PATH.read_text(encoding="utf-8"))
-        else:
+        try:
+            self.data = (
+                json.loads(TODOIST_CONFIG_PATH.read_text(encoding="utf-8"))
+                if TODOIST_CONFIG_PATH.exists()
+                else {"Project": DEFAULT_PROJECT_NAME, "Project ID": ""}
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            self.logger.warning("Todoist state is unavailable at %s: %s", TODOIST_CONFIG_PATH, exc)
             self.data = {"Project": DEFAULT_PROJECT_NAME, "Project ID": ""}
         if not self.data.get("Project"):
             self.data["Project"] = DEFAULT_PROJECT_NAME

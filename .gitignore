@@ -31,3 +31,6 @@ DEVLOG.md
 config.ini
 /benchmarking
 /.playwright-mcp
+audio_models_preset.ini
+model_details.csv
+Skills/powershell_skill.md

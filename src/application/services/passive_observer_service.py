@@ -82,6 +82,9 @@ Rules:
         fast_model_retry_count: int = 2,
         uiat_adapter: Optional[Any] = None,
         persist_observations: bool = True,
+        capture_store: Optional[Any] = None,
+        persist_payloads: bool = False,
+        capture_control: Optional[Any] = None,
         logger: logging.Logger | None = None,
     ):
         self.memory = memory
@@ -99,11 +102,28 @@ Rules:
         self.fast_model_retry_count = max(0, int(fast_model_retry_count))
         self.uiat_adapter = uiat_adapter
         self.persist_observations = bool(persist_observations)
+        self.capture_store = capture_store
+        self.persist_payloads = bool(persist_payloads)
+        self.capture_control = capture_control
         self.logger = logger or logging.getLogger(self.__class__.__name__)
 
     def capture_screenshot(self) -> str:
         screenshot_path = self._capture_path()
         return str(Path(self.screen_capture.capture_screenshot(str(screenshot_path))))
+
+    def capture_lightweight_context(self) -> Dict[str, Any]:
+        """Collect foreground metadata without invoking an embedding or vision model."""
+        payload = self._inspect_foreground_window()
+        return {
+            "window_title": payload.get("window_title"),
+            "window_class": payload.get("window_class"),
+            "app_name": payload.get("app_hint"),
+            "url": payload.get("foreground_url"),
+            "domain": payload.get("domain_hint"),
+            "accessible_text": str(payload.get("visible_text_summary") or "")[:4000],
+            "contains_dialog": bool(payload.get("contains_dialog")),
+            "contains_notification": bool(payload.get("contains_notification")),
+        }
 
     def _build_system_prompt(self, prompt: str) -> str:
         now = datetime.now()
@@ -122,26 +142,45 @@ Rules:
         recent_context: str,
         captured_at: str | None = None,
         similarity_score: float | None = None,
+        persisted_screenshot_path: str | None = None,
+        archive_source: bool = True,
+        uiat_context_override: Optional[Dict[str, Any]] = None,
     ) -> Optional[VisualObservation]:
-        parsed = await self._analyze(
-            screenshot_path=screenshot_path,
-            model=model,
-            recent_context=recent_context,
-            captured_at=captured_at,
-            similarity_score=similarity_score,
-        )
+        stored_screenshot_path = persisted_screenshot_path or screenshot_path
+        try:
+            parsed = await self._analyze(
+                screenshot_path=screenshot_path,
+                model=model,
+                recent_context=recent_context,
+                captured_at=captured_at,
+                similarity_score=similarity_score,
+                uiat_context_override=uiat_context_override,
+            )
+        finally:
+            if archive_source and self.capture_store is not None and Path(screenshot_path).exists():
+                stored_screenshot_path = self.capture_store.store_file(
+                    screenshot_path, kind="screenshot", delete_source=True
+                )
         if not parsed:
             return None
 
         app_name, page_hint = self._split_app_page(self._opt_text(parsed.get("app_page")))
 
+        raw_payload_json = json.dumps(parsed, ensure_ascii=False, indent=2)
+        if self.capture_store is not None and self.persist_payloads:
+            raw_payload_json = self.capture_store.store_bytes(
+                raw_payload_json.encode("utf-8"),
+                original_name=f"visual_payload_{uuid.uuid4().hex}.json",
+                kind="visual_model_payload",
+                mime_type="application/json",
+            )
         observation = VisualObservation(
             observation_id=uuid.uuid4().hex,
-            screenshot_path=screenshot_path,
+            screenshot_path=stored_screenshot_path,
             created_at=captured_at or datetime.now().isoformat(),
             observation_type="screen",
             app_name=app_name,
-            window_title=None,
+            window_title=self._opt_text(parsed.get("_uiat_window_title")),
             page_hint=page_hint,
             summary=self._opt_text(parsed.get("summary")) or "Passive observation captured.",
             detailed_description=self._opt_text(parsed.get("detailed_description")) or "",
@@ -154,7 +193,7 @@ Rules:
             suggested_research_topics=[],
             user_fact_hypotheses=[],
             confidence=0.0,
-            raw_payload_json=json.dumps(parsed, ensure_ascii=False, indent=2),
+            raw_payload_json=raw_payload_json,
         )
         if not self.persist_observations:
             self.logger.debug(
@@ -243,13 +282,14 @@ Rules:
         recent_context: str,
         captured_at: str | None = None,
         similarity_score: float | None = None,
+        uiat_context_override: Optional[Dict[str, Any]] = None,
     ) -> dict:
         if not Path(screenshot_path).exists():
             self.logger.warning("Passive observer screenshot missing before analysis: %s", screenshot_path)
             return {}
         recent_observations = self.memory.get_recent_visual_observations(limit=3)
         previous_observation = recent_observations[0] if recent_observations else None
-        uiat_context = self._inspect_foreground_window()
+        uiat_context = dict(uiat_context_override or self._inspect_foreground_window())
         route = self._route_screenshot(
             similarity_score=similarity_score,
             uiat_context=uiat_context,
@@ -285,6 +325,7 @@ Rules:
             if uiat_context:
                 parsed.setdefault("_uiat_window_title", uiat_context.get("window_title"))
                 parsed.setdefault("_uiat_domain", uiat_context.get("domain_hint"))
+                parsed.setdefault("_uiat_url", uiat_context.get("foreground_url"))
         return parsed if isinstance(parsed, dict) else {}
 
     def _inspect_foreground_window(self) -> Dict[str, Any]:
@@ -308,6 +349,7 @@ Rules:
 
     def _infer_domain_hint(self, uiat_context: Dict[str, Any]) -> Optional[str]:
         candidates = [
+            str(uiat_context.get("foreground_url") or ""),
             str(uiat_context.get("window_title") or ""),
             str(uiat_context.get("visible_text_summary") or ""),
         ]
@@ -362,10 +404,15 @@ Rules:
             domain_switched,
             has_override,
         )
-        if not has_override and (
+        excluded = (
             self._matches_policy(app_name, self.ignore_apps)
             or self._matches_policy(domain_hint, self.ignore_domains)
-        ):
+            or (
+                self.capture_control is not None
+                and self.capture_control.is_excluded(app_name=app_name, domain=domain_hint)
+            )
+        )
+        if excluded:
             self.logger.debug("Routing decision=skip reason=policy_ignore")
             return "skip"
         if has_override:
@@ -528,6 +575,8 @@ Rules:
             sorted(payload.keys()),
         )
         with interaction_trace("passive_observer", metadata={"image_path": screenshot_path, "model": model_name}):
+            if hasattr(self.llm, "load_model"):
+                await self.llm.load_model(model_name)
             completion = await self.llm.chat_completion_stream(
                 model=model_name,
                 messages=[
@@ -608,17 +657,6 @@ Rules:
 
     def _capture_path(self) -> Path:
         return self.screenshot_root / f"observer_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-
-    def _prune_screenshots(self, keep: int = 5) -> None:
-        screenshots = sorted(self.screenshot_root.glob("observer_*.png"), key=lambda path: path.stat().st_mtime, reverse=True)
-        for stale in screenshots[keep:]:
-            self._trim_screenshot(stale)
-
-    def _trim_screenshot(self, path: Path) -> None:
-        try:
-            path.unlink(missing_ok=True)
-        except OSError:
-            self.logger.debug("Failed to remove screenshot %s", path)
 
     async def _consume_stream_text(self, completion) -> str:
         parts: List[str] = []

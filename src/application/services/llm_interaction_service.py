@@ -21,6 +21,11 @@ from application.services.interaction_trace import (
     interaction_trace,
 )
 from application.services.scheduled_task_service import ScheduledTaskService
+from application.services.capability_policy_service import (
+    ApprovalRequiredError,
+    CapabilityPolicyService,
+    PolicyDeniedError,
+)
 from utils.kv_state_handling import KVStateControl
 
 
@@ -138,6 +143,7 @@ class LLMInteractionService:
         scheduled_task_service: Optional[ScheduledTaskService] = None,
         reporter_model: Optional[str] = None,
         artifact_root: Optional[str] = None,
+        capability_policy: Optional[CapabilityPolicyService] = None,
     ):
         self.llm = llm_provider
         self.tool_bridge = tool_bridge
@@ -152,6 +158,7 @@ class LLMInteractionService:
         self._browser_lock = asyncio.Lock()
         self._retained_browser_sessions: List[BrowserToolSessionPort] = []
         self.reporter_model = reporter_model
+        self.capability_policy = capability_policy
         self.artifact_root = Path(artifact_root) if artifact_root else (self.PARENT_DIR / "artifacts")
         self.artifact_root.mkdir(parents=True, exist_ok=True)
 
@@ -321,6 +328,10 @@ class LLMInteractionService:
                 filtered_tools.append(tool)
         return filtered_tools
 
+    def available_tool_definitions(self) -> List[Dict[str, Any]]:
+        """Return a defensive copy of the currently initialized tool surface."""
+        return copy.deepcopy(self._tools or [])
+
     async def _run_browser_agent(
         self,
         *,
@@ -483,7 +494,9 @@ class LLMInteractionService:
         interaction_run_id = existing_metadata.get("interaction_run_id") or uuid.uuid4().hex
         tools_used: List[str] = []
 
-        with interaction_trace(source_name, {"interaction_run_id": interaction_run_id}):
+        trace_metadata = dict(existing_metadata)
+        trace_metadata["interaction_run_id"] = interaction_run_id
+        with interaction_trace(source_name, trace_metadata):
             self._frame.model = model
             self._frame.depth = agent_depth
             if not self._frame.messages:
@@ -671,6 +684,7 @@ class LLMInteractionService:
 
             try:
                 tool_args = json.loads(tool_args_str) if tool_args_str else {}
+                idempotency_key = None
                 if allowed_tool_names is not None and tool_name not in allowed_tool_names:
                     response_content = (
                         f"Error: tool '{tool_name}' is not allowed in this interaction."
@@ -686,6 +700,42 @@ class LLMInteractionService:
                         }
                     )
                     continue
+                if self.capability_policy is not None and tool_name not in self.TERMINAL_TOOL_NAMES:
+                    metadata = current_interaction_metadata()
+                    source = current_interaction_source()
+                    observed_evidence = "\n".join(
+                        str(message.get("content") or "")
+                        for message in self._frame.messages
+                        if message.get("role") == "tool"
+                    )[-50000:]
+                    self.capability_policy.authorize_or_raise(
+                        tool_name=tool_name,
+                        arguments=tool_args,
+                        source=source,
+                        confidence=float(metadata.get("autonomy_confidence") or 1.0),
+                        explicit_user_request=bool(
+                            metadata.get("explicit_user_request")
+                            or source in {"direct_chat", "scheduled_chat_task"}
+                        ),
+                        evidence_context={"observed_text": observed_evidence},
+                    )
+                    idempotency_key, should_execute, prior_result = self.capability_policy.begin_execution(
+                        tool_name=tool_name,
+                        arguments=tool_args,
+                        scope=str(
+                            metadata.get("opportunity_id")
+                            or metadata.get("scheduled_task_id")
+                            or metadata.get("interaction_run_id")
+                            or tool_id
+                        ),
+                    )
+                    if not should_execute:
+                        response_content = prior_result or "Action already attempted; duplicate execution suppressed."
+                        tool_results.append((tool_name, response_content))
+                        self._frame.messages.append(
+                            {"role": "tool", "tool_call_id": tool_id, "name": tool_name, "content": response_content}
+                        )
+                        continue
                 if tool_name == "use_browser":
                     task = tool_args.get("task", "")
                     response_content = await self._run_browser_agent(
@@ -838,8 +888,18 @@ class LLMInteractionService:
                 else:
                     active_tool_bridge = self._frame.tool_bridge or self.tool_bridge
                     response_content = await active_tool_bridge.execute_tool(tool_name, tool_args)
+                if self.capability_policy is not None:
+                    self.capability_policy.finish_execution(
+                        idempotency_key,
+                        response_content,
+                        succeeded=not response_content.startswith("Error:"),
+                    )
             except Exception as e:
                 response_content = f"Error: {str(e)}"
+                if self.capability_policy is not None:
+                    self.capability_policy.finish_execution(
+                        locals().get("idempotency_key"), response_content, succeeded=False
+                    )
             self._emit_event(
                 event_callback,
                 {
