@@ -88,13 +88,18 @@ class ResourceGovernorService:
         preset: str = "balanced",
         critical_ram_mb: int = 2048,
         critical_ram_percent: float = 15.0,
+        critical_vram_mb: int = 512,
         audit: Optional[Callable[[str, str, str, dict], None]] = None,
         logger: logging.Logger | None = None,
     ):
         self.monitor = monitor
         self._preset = preset if preset in RESOURCE_PRESETS else "balanced"
-        self.critical_ram_mb = max(512, int(critical_ram_mb))
+        # An explicit runtime threshold must be allowed to lower the preset's
+        # host-RAM reserve.  The previous 512 MB clamp also meant values such as
+        # 200 MB could never take effect even though config.py loaded them.
+        self.critical_ram_mb = max(1, int(critical_ram_mb))
         self.critical_ram_percent = max(1.0, float(critical_ram_percent))
+        self.critical_vram_mb = max(1, int(critical_vram_mb))
         self.audit = audit
         self.logger = logger or logging.getLogger(self.__class__.__name__)
         self._lease_lock = threading.Lock()
@@ -124,6 +129,14 @@ class ResourceGovernorService:
     def set_residency_status_provider(self, provider: Callable[[], dict[str, Any]]) -> None:
         self._residency_status_provider = provider
 
+    def _host_ram_reserve(self, preset_reserve_mb: int) -> int:
+        """Apply the configured RAM threshold as an upper bound on a preset."""
+        return min(int(preset_reserve_mb), self.critical_ram_mb)
+
+    def _vram_reserve(self, preset_reserve_mb: int) -> int:
+        """Apply the configured VRAM threshold as an upper bound on a preset."""
+        return min(int(preset_reserve_mb), self.critical_vram_mb)
+
     def evaluate(
         self,
         request: InferenceRequest,
@@ -150,17 +163,21 @@ class ResourceGovernorService:
             allowed, reason = False, "GPU telemetry is unavailable for model inference"
         else:
             if snapshot.gpu_telemetry_available:
-                vram_reserve = preset["active_vram_mb"] if request.user_active else preset["idle_vram_mb"]
+                preset_vram_reserve = (
+                    preset["active_vram_mb"] if request.user_active else preset["idle_vram_mb"]
+                )
+                vram_reserve = self._vram_reserve(preset_vram_reserve)
                 if use_post_load_floor:
-                    gpu_ram_reserve = (
+                    preset_ram_reserve = (
                         preset["post_load_active_ram_mb"]
                         if request.user_active
                         else preset["post_load_idle_ram_mb"]
                     )
                 else:
-                    gpu_ram_reserve = (
+                    preset_ram_reserve = (
                         preset["gpu_active_ram_mb"] if request.user_active else preset["gpu_idle_ram_mb"]
                     )
+                gpu_ram_reserve = self._host_ram_reserve(preset_ram_reserve)
                 if snapshot.free_vram_mb is None or snapshot.free_vram_mb < int(vram_reserve):
                     allowed = False
                     reason = f"only {snapshot.free_vram_mb or 0} MB VRAM is free; {vram_reserve} MB is reserved"
@@ -171,7 +188,10 @@ class ResourceGovernorService:
                         f"{gpu_ram_reserve} MB is reserved"
                     )
             else:
-                ram_reserve_mb = preset["active_ram_mb"] if request.user_active else preset["idle_ram_mb"]
+                preset_ram_reserve = (
+                    preset["active_ram_mb"] if request.user_active else preset["idle_ram_mb"]
+                )
+                ram_reserve_mb = self._host_ram_reserve(preset_ram_reserve)
                 ram_reserve_percent = (
                     preset["active_ram_percent"] if request.user_active else preset["idle_ram_percent"]
                 )
@@ -274,6 +294,11 @@ class ResourceGovernorService:
             deferred = self._deferred_count
         payload = {
             "preset": self.preset,
+            "thresholds": {
+                "critical_ram_mb": self.critical_ram_mb,
+                "critical_ram_percent": self.critical_ram_percent,
+                "critical_vram_mb": self.critical_vram_mb,
+            },
             "snapshot": asdict(snapshot),
             "critical_pressure": self.is_critical(snapshot),
             "active_workload": active.workload if active else None,
@@ -356,6 +381,7 @@ class ModelResidencyManager:
         )
         decision = self.governor.evaluate(request, force_snapshot=True)
         if not decision.allowed:
+            self.governor._log_deferral(request, decision)
             self.governor._audit("resource.model_load_denied", model_name, self.governor._decision_details(request, decision))
             return decision
         async with self._transition_lock:
@@ -382,6 +408,7 @@ class ModelResidencyManager:
             if not post_load_decision.allowed:
                 await self.provider.unload_model()
                 self._last_transition_at = time.monotonic()
+                self.governor._log_deferral(request, post_load_decision)
                 self.governor._audit(
                     "resource.model_unloaded_after_unsafe_load",
                     model_name,

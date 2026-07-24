@@ -184,6 +184,7 @@ CAPTURE_STORAGE_ROOT = Path(
 RESOURCE_PRESET = CONFIG.get_str("resource_governor", "preset", "balanced").strip().lower()
 RESOURCE_CRITICAL_RAM_MB = CONFIG.get_int("resource_governor", "critical_ram_mb", 2048)
 RESOURCE_CRITICAL_RAM_PERCENT = CONFIG.get_float("resource_governor", "critical_ram_percent", 15.0)
+RESOURCE_CRITICAL_VRAM_MB = CONFIG.get_int("resource_governor", "critical_vram_mb", 512)
 RESOURCE_RECOVERY_STABLE_SECONDS = CONFIG.get_float("resource_governor", "recovery_stable_seconds", 30.0)
 RESOURCE_TRANSITION_COOLDOWN_SECONDS = CONFIG.get_float("resource_governor", "transition_cooldown_seconds", 60.0)
 RESOURCE_BATCH_MAX_EVENTS = CONFIG.get_int("resource_governor", "batch_max_events", 8)
@@ -298,6 +299,7 @@ class AmbientRuntime:
             monitor=WindowsResourceMonitor(), preset=RESOURCE_PRESET,
             critical_ram_mb=RESOURCE_CRITICAL_RAM_MB,
             critical_ram_percent=RESOURCE_CRITICAL_RAM_PERCENT,
+            critical_vram_mb=RESOURCE_CRITICAL_VRAM_MB,
         )
         self.stop_event = threading.Event()
         self._screenshot_capture_stop_event = threading.Event()
@@ -1620,6 +1622,7 @@ if __name__ == "__main__":
         preset=RESOURCE_PRESET,
         critical_ram_mb=RESOURCE_CRITICAL_RAM_MB,
         critical_ram_percent=RESOURCE_CRITICAL_RAM_PERCENT,
+        critical_vram_mb=RESOURCE_CRITICAL_VRAM_MB,
         audit=autonomy_api_store.audit,
     )
     chat_store = SQLiteChatAdapter(db_path=str(CHAT_DB_PATH))

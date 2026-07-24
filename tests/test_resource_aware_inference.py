@@ -121,6 +121,79 @@ def test_model_admission_uses_live_vram_without_per_model_estimates():
     assert "VRAM" in denied.reason
 
 
+def test_configured_critical_ram_caps_preset_host_ram_reserve():
+    monitor = _MutableMonitor(available_ram_mb=335, free_vram_mb=5_994)
+    governor = ResourceGovernorService(
+        monitor=monitor,
+        preset="balanced",
+        critical_ram_mb=200,
+        critical_ram_percent=3,
+    )
+    request = InferenceRequest(
+        workload="ambient_inference_batch",
+        model_name="ambient-model",
+        background=True,
+        user_active=True,
+    )
+
+    decision = governor.evaluate(request)
+
+    assert governor.critical_ram_mb == 200
+    assert decision.allowed is True
+
+
+def test_configured_critical_ram_is_reported_as_admission_reserve():
+    monitor = _MutableMonitor(available_ram_mb=199, free_vram_mb=5_994)
+    governor = ResourceGovernorService(
+        monitor=monitor,
+        preset="balanced",
+        critical_ram_mb=200,
+        critical_ram_percent=3,
+    )
+
+    decision = governor.evaluate(
+        InferenceRequest(
+            workload="ambient_inference_batch",
+            model_name="ambient-model",
+            background=True,
+            user_active=True,
+        )
+    )
+
+    assert decision.allowed is False
+    assert "200 MB is reserved" in decision.reason
+
+
+def test_configured_critical_vram_caps_preset_reserve_after_model_load():
+    monitor = _MutableMonitor(available_ram_mb=4_000, free_vram_mb=5_994)
+    provider = _ModelProvider()
+    governor = ResourceGovernorService(
+        monitor=monitor,
+        preset="balanced",
+        critical_ram_mb=200,
+        critical_ram_percent=3,
+        critical_vram_mb=512,
+    )
+    manager = ModelResidencyManager(provider=provider, governor=governor)
+
+    original_load = provider.load_model
+
+    async def load_and_leave_604_mb_vram(model_name):
+        await original_load(model_name)
+        monitor.free_vram_mb = 604
+
+    provider.load_model = load_and_leave_604_mb_vram
+
+    decision = asyncio.run(
+        manager.load_model("chat-model", role="direct_chat", user_active=True)
+    )
+
+    assert decision.allowed is True
+    assert provider.current == "chat-model"
+    assert provider.unloads == []
+    assert governor.status()["thresholds"]["critical_vram_mb"] == 512
+
+
 def test_resource_deferral_is_visible_and_audit_failure_is_nonfatal(caplog):
     monitor = _MutableMonitor(available_ram_mb=1_500, free_vram_mb=5_000)
 
