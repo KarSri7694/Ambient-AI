@@ -1,5 +1,6 @@
 import sqlite3
 from contextlib import contextmanager
+from datetime import date, timedelta
 from pathlib import Path
 from typing import List, Optional
 
@@ -145,17 +146,65 @@ class SQLiteInteractionLogAdapter:
         limit: int = 500,
         offset: int = 0,
         source: Optional[str] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        sort_order: str = "desc",
     ) -> List[InteractionLogEntry]:
+        where, params = self._entry_filters(
+            source=source,
+            date_from=date_from,
+            date_to=date_to,
+        )
+        direction = "ASC" if str(sort_order).lower() == "asc" else "DESC"
         query = "SELECT * FROM interaction_logs"
-        params: List[object] = []
-        if source:
-            query += " WHERE source = ?"
-            params.append(source)
-        query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+        if where:
+            query += " WHERE " + " AND ".join(where)
+        query += f" ORDER BY created_at {direction}, interaction_id {direction} LIMIT ? OFFSET ?"
         params.extend([limit, offset])
         with self._managed_connection() as conn:
             rows = conn.execute(query, params).fetchall()
         return [self._from_row(row) for row in rows]
+
+    def count_entries(
+        self,
+        *,
+        source: Optional[str] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+    ) -> int:
+        where, params = self._entry_filters(
+            source=source,
+            date_from=date_from,
+            date_to=date_to,
+        )
+        query = "SELECT COUNT(*) FROM interaction_logs"
+        if where:
+            query += " WHERE " + " AND ".join(where)
+        with self._managed_connection() as conn:
+            row = conn.execute(query, params).fetchone()
+        return int(row[0]) if row is not None else 0
+
+    @staticmethod
+    def _entry_filters(
+        *,
+        source: Optional[str],
+        date_from: Optional[str],
+        date_to: Optional[str],
+    ) -> tuple[List[str], List[object]]:
+        where: List[str] = []
+        params: List[object] = []
+        if source:
+            where.append("source = ?")
+            params.append(source)
+        if date_from:
+            date.fromisoformat(date_from)
+            where.append("created_at >= ?")
+            params.append(f"{date_from}T00:00:00")
+        if date_to:
+            next_day = date.fromisoformat(date_to) + timedelta(days=1)
+            where.append("created_at < ?")
+            params.append(f"{next_day.isoformat()}T00:00:00")
+        return where, params
 
     def get_by_interaction_id(self, interaction_id: str) -> Optional[InteractionLogEntry]:
         with self._managed_connection() as conn:

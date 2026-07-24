@@ -5,7 +5,7 @@ import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 
 def _utc_now() -> str:
@@ -318,6 +318,18 @@ class ChatEventBroker:
         self.max_queue_size = max_queue_size
         self._lock = threading.Lock()
         self._subscribers: Dict[str, list[queue.Queue]] = defaultdict(list)
+        self._turn_enqueued_callback: Optional[Callable[[], None]] = None
+
+    def set_turn_enqueued_callback(self, callback: Optional[Callable[[], None]]) -> None:
+        """Register a thread-safe wake-up hook for the runtime scheduler."""
+        with self._lock:
+            self._turn_enqueued_callback = callback
+
+    def notify_turn_enqueued(self) -> None:
+        with self._lock:
+            callback = self._turn_enqueued_callback
+        if callback is not None:
+            callback()
 
     def subscribe(self, message_id: str) -> queue.Queue:
         subscriber: queue.Queue = queue.Queue(maxsize=self.max_queue_size)

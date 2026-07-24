@@ -34,3 +34,6 @@ config.ini
 audio_models_preset.ini
 model_details.csv
 Skills/powershell_skill.md
+src/infrastructure/runtime_ui/node_modules/
+src/infrastructure/runtime_ui/.vite/
+src/infrastructure/runtime_ui/*.tsbuildinfo

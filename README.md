@@ -154,6 +154,18 @@ originating conversation and Reports.
 The dashboard has no login or security database and is deliberately restricted to
 loopback (`127.0.0.1`, `localhost`, or `::1`). Non-loopback binding is refused.
 
+The React dashboard also includes an Interaction Logs tab backed by
+`interaction_logs.db`. Each model request is paired with its response, can be sorted
+or filtered by date, and displays its visual input when one was recorded. Protected
+ambient prompts remain hidden until explicitly revealed, and that reveal is audited.
+The light/dark preference is saved locally in the browser.
+
+The production frontend is committed under `src/infrastructure/runtime_ui/dist`, so
+Node.js is not required to run Ambient AI. To work on the frontend, use Node.js 20.19+
+or 22.12+ and run `npm install`, `npm run dev`, `npm test`, or `npm run build` from
+`src/infrastructure/runtime_ui`. The development server proxies API calls to the local
+runtime on port 8765.
+
 Raw screenshots, processed audio, transcripts, and ambient model inputs are stored as
 ordinary files under `USER_DATA_DIR/captures`. Raw data is retained indefinitely and is
 never pruned automatically; the loopback-only capture APIs provide audited viewing,

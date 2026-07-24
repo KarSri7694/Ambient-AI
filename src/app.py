@@ -132,10 +132,6 @@ BROWSER_PROFILE_DIR = CONFIG.get_str(
 from infrastructure.plain_capture_store import PlainCaptureStore
 CHAT_HISTORY_MESSAGE_LIMIT = CONFIG.get_int("chat", "history_message_limit", 40)
 CHAT_STREAM_CHECKPOINT_SECONDS = CONFIG.get_float("chat", "stream_checkpoint_seconds", 0.25)
-CHAT_RESPONSE_WAIT_SECONDS = max(
-    0.0,
-    CONFIG.get_float("chat", "response_wait_seconds", 120.0),
-)
 TODOIST_ENABLED = CONFIG.get_bool("todoist", "enabled", True)
 UPLOADS_DIR = Path(CONFIG.get_str("audio", "uploads_dir", str(USER_DATA_DIR / "uploads")))
 TRANSCRIPTIONS_DIR = Path(CONFIG.get_str("audio", "transcriptions_dir", str(USER_DATA_DIR / "transcriptions")))
@@ -305,11 +301,13 @@ class AmbientRuntime:
         self._screenshot_capture_stop_event = threading.Event()
         self._screenshot_capture_thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._chat_wakeup_event = asyncio.Event()
         self._tool_bridge: Optional[MCPToolAdapter] = None
-        self._chat_response_deadline: Optional[float] = None
         self._chat_resource_backoff_until = 0.0
         self._deferred_followup_observations: deque = deque()
         self._deferred_followup_activities: deque[str] = deque()
+        if self.chat_event_broker is not None:
+            self.chat_event_broker.set_turn_enqueued_callback(self._notify_chat_queued)
 
     def _drain_queue(self, target_queue: queue.Queue) -> None:
         while True:
@@ -323,6 +321,33 @@ class AmbientRuntime:
     def stop_service(self) -> None:
         self.stop_event.set()
         self._screenshot_capture_stop_event.set()
+        self._notify_chat_queued()
+
+    def _notify_chat_queued(self) -> None:
+        """Wake the runtime loop without interrupting an active model request."""
+        loop = self._loop
+        if loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(self._chat_wakeup_event.set)
+
+    def _chat_turn_ready(self, now: Optional[float] = None) -> bool:
+        if self.chat_store is None:
+            return False
+        current = time.monotonic() if now is None else now
+        return current >= self._chat_resource_backoff_until and self.chat_store.has_queued_turn()
+
+    async def _wait_for_chat_or_timeout(self, seconds: float) -> bool:
+        """Sleep asynchronously, waking immediately when the chat API queues work."""
+        self._chat_wakeup_event.clear()
+        if self._chat_turn_ready() or self.stop_event.is_set():
+            return self.stop_event.is_set()
+        try:
+            await asyncio.wait_for(
+                self._chat_wakeup_event.wait(),
+                timeout=max(0.0, float(seconds)),
+            )
+        except asyncio.TimeoutError:
+            pass
+        return self.stop_event.is_set()
 
     async def _sleep_or_stop(self, seconds: float) -> bool:
         deadline = time.monotonic() + max(0.0, seconds)
@@ -338,27 +363,12 @@ class AmbientRuntime:
                 raise
         return True
 
-    def _start_chat_response_window(self, now: Optional[float] = None) -> None:
-        started_at = time.monotonic() if now is None else now
-        self._chat_response_deadline = started_at + CHAT_RESPONSE_WAIT_SECONDS
-        logger.info(
-            "Chat model response window opened for %ss.",
-            CHAT_RESPONSE_WAIT_SECONDS,
-        )
-
-    def _chat_response_window_active(self, now: Optional[float] = None) -> bool:
-        if self._chat_response_deadline is None:
-            return False
-        current = time.monotonic() if now is None else now
-        return current < self._chat_response_deadline
-
     async def _restore_chat_residency(
         self,
         *,
         llm_adapter: ModelResidencyManager,
         services_initialized: bool,
         reason: str,
-        open_response_window: bool = True,
     ) -> bool:
         """Restore only the configured tiny chat model when memory is healthy."""
         try:
@@ -382,10 +392,6 @@ class AmbientRuntime:
         except Exception:
             logger.exception("Failed to restore the lightweight chat model: %s", reason)
             return services_initialized
-        if open_response_window and services_initialized:
-            self._start_chat_response_window()
-        elif not services_initialized:
-            self._chat_response_deadline = None
         return services_initialized
 
     def _is_context_overflow_error(self, exc: Exception) -> bool:
@@ -483,10 +489,19 @@ class AmbientRuntime:
         services_initialized: bool,
         reason: str,
         model_name: str,
+        role: str = "interactive",
+        background: bool = False,
+        user_active: bool = True,
     ) -> bool:
         if not services_initialized:
             logger.info("Loading ambient runtime: %s", reason)
-        await self._ensure_llm_ready(llm_adapter, model_name)
+        await self._ensure_llm_ready(
+            llm_adapter,
+            model_name,
+            role=role,
+            background=background,
+            user_active=user_active,
+        )
         return True
 
     async def _release_runtime(
@@ -823,7 +838,7 @@ class AmbientRuntime:
     ) -> tuple[bool, bool]:
         if self.chat_store is None:
             return False, services_initialized
-        if time.monotonic() < self._chat_resource_backoff_until:
+        if not self._chat_turn_ready():
             return False, services_initialized
         turn = self.chat_store.claim_next_turn()
         if turn is None:
@@ -836,7 +851,6 @@ class AmbientRuntime:
         streamed_parts: list[str] = []
         last_checkpoint = time.monotonic()
         chat_model = LIGHTWEIGHT_CHAT_MODEL or CHAT_MODEL
-        deferred_for_resources = False
 
         def on_event(event: dict) -> None:
             nonlocal last_checkpoint
@@ -880,6 +894,7 @@ class AmbientRuntime:
                         event_callback=on_event,
                     )
             self.chat_store.complete_message(message_id, result)
+            self._chat_resource_backoff_until = 0.0
             self._publish_chat_event(
                 message_id,
                 {
@@ -888,7 +903,6 @@ class AmbientRuntime:
                 },
             )
         except ResourceUnavailableError as exc:
-            deferred_for_resources = True
             self._chat_resource_backoff_until = time.monotonic() + RESOURCE_DEFER_SECONDS
             self.chat_store.defer_message(message_id, f"Queued until resources are available: {exc}")
             self._publish_chat_event(
@@ -896,6 +910,7 @@ class AmbientRuntime:
                 {"type": "status", "status": "resource_deferred", "reason": str(exc)},
             )
         except Exception as exc:
+            self._chat_resource_backoff_until = 0.0
             logger.exception("Direct chat message %s failed.", message_id)
             self.chat_store.fail_message(message_id, str(exc))
             self._publish_chat_event(
@@ -904,8 +919,6 @@ class AmbientRuntime:
             )
         finally:
             llm_service.reset_context()
-            if not deferred_for_resources:
-                self._start_chat_response_window()
         return True, services_initialized
 
     async def _process_due_scheduled_task(
@@ -1038,7 +1051,6 @@ class AmbientRuntime:
                 llm_adapter=llm_adapter,
                 services_initialized=services_initialized,
                 reason="keeping direct chat ready at runtime startup",
-                open_response_window=False,
             )
             self._start_screenshot_capture_loop(
                 passive_observer=passive_observer,
@@ -1087,11 +1099,6 @@ class AmbientRuntime:
                 )
                 if handled_chat:
                     if await self._sleep_or_stop(0.1):
-                        break
-                    continue
-
-                if self._chat_response_window_active():
-                    if await self._sleep_or_stop(0.25):
                         break
                     continue
 
@@ -1323,16 +1330,42 @@ class AmbientRuntime:
                                 {"user_idle": user_idle_now, "resource_preset": self.resource_governor.preset},
                             ):
                                 with self.gpu_lock:
-                                    autonomy_result = await autonomy_coordinator.process_batch(
-                                        model=FOLLOWUP_EXECUTION_MODEL,
-                                        llm_service=llm_service,
-                                        personalization_context=memory_store.get_recent_context(),
-                                        max_events=RESOURCE_BATCH_MAX_EVENTS,
-                                        max_seconds=RESOURCE_BATCH_MAX_SECONDS,
-                                        should_preempt=(
-                                            chat_store.has_queued_turn if chat_store is not None else None
-                                        ),
-                                    )
+                                    if self._chat_turn_ready():
+                                        autonomy_result = {
+                                            "processed": False,
+                                            "count": 0,
+                                            "preempted": True,
+                                        }
+                                    else:
+                                        try:
+                                            services_initialized = await self._ensure_runtime(
+                                                llm_adapter=llm_adapter,
+                                                services_initialized=services_initialized,
+                                                reason="processing ambient inference backlog",
+                                                model_name=FOLLOWUP_EXECUTION_MODEL,
+                                                role="ambient_inference_batch",
+                                                background=True,
+                                                user_active=not user_idle_now,
+                                            )
+                                        except ResourceUnavailableError as exc:
+                                            autonomy_coordinator.defer_next(
+                                                reason=exc.decision.reason,
+                                                delay_seconds=RESOURCE_DEFER_SECONDS,
+                                            )
+                                            autonomy_result = {
+                                                "processed": False,
+                                                "count": 0,
+                                                "resource_deferred": True,
+                                            }
+                                        else:
+                                            autonomy_result = await autonomy_coordinator.process_batch(
+                                                model=FOLLOWUP_EXECUTION_MODEL,
+                                                llm_service=llm_service,
+                                                personalization_context=memory_store.get_recent_context(),
+                                                max_events=RESOURCE_BATCH_MAX_EVENTS,
+                                                max_seconds=RESOURCE_BATCH_MAX_SECONDS,
+                                                should_preempt=self._chat_turn_ready,
+                                            )
                             if autonomy_result.get("processed"):
                                 logger.info(
                                     "Autonomy coordinator processed %s event(s) in %.2fs.",
@@ -1342,9 +1375,7 @@ class AmbientRuntime:
                         finally:
                             lease.__exit__(None, None, None)
                             backlog_remaining = autonomy_coordinator.has_ready_work()
-                            chat_waiting = bool(
-                                chat_store is not None and chat_store.has_queued_turn()
-                            )
+                            chat_waiting = self._chat_turn_ready()
                             if backlog_remaining and not chat_waiting:
                                 services_initialized = bool(
                                     llm_adapter.status().get("loaded_model")
@@ -1366,7 +1397,6 @@ class AmbientRuntime:
                                     llm_adapter=llm_adapter,
                                     services_initialized=services_initialized,
                                     reason="ambient backlog drained or chat preempted",
-                                    open_response_window=False,
                                 )
                         if autonomy_result.get("processed"):
                             if await self._sleep_or_stop(0.1):
@@ -1563,14 +1593,13 @@ class AmbientRuntime:
                         llm_adapter=llm_adapter,
                         services_initialized=services_initialized,
                         reason="idle background work check finished",
-                        open_response_window=idle_unit_attempted,
                     )
                     if idle_unit_attempted or idle_unit_completed:
                         if await self._sleep_or_stop(0.1):
                             break
                         continue
 
-                if await self._sleep_or_stop(1):
+                if await self._wait_for_chat_or_timeout(1):
                     break
         except asyncio.CancelledError:
             self.stop_event.set()

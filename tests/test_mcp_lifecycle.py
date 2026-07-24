@@ -48,6 +48,7 @@ from infrastructure.adapter.MCPToolAdapter import (
     expand_environment_references,
     resolve_server_config,
 )
+from infrastructure.adapter.SQLiteChatAdapter import ChatEventBroker
 
 
 class _FakeLLMProvider:
@@ -220,22 +221,51 @@ def test_ambient_runtime_separates_mcp_lifetime_from_model_lifetime():
     assert still_initialized is False
 
 
-def test_chat_response_window_uses_configured_deadline(monkeypatch):
-    runtime = AmbientRuntime(transcription_queue=queue.Queue())
-    monkeypatch.setattr(app, "CHAT_RESPONSE_WAIT_SECONDS", 120.0)
+def test_resource_deferred_chat_does_not_preempt_background_work():
+    class _QueuedChatStore:
+        def has_queued_turn(self):
+            return True
 
-    runtime._start_chat_response_window(now=100.0)
+    runtime = AmbientRuntime(
+        transcription_queue=queue.Queue(),
+        chat_store=_QueuedChatStore(),
+    )
+    runtime._chat_resource_backoff_until = 200.0
 
-    assert runtime._chat_response_window_active(now=219.999)
-    assert not runtime._chat_response_window_active(now=220.0)
+    assert runtime._chat_turn_ready(now=199.0) is False
+    assert runtime._chat_turn_ready(now=200.0) is True
 
 
-def test_restore_chat_residency_keeps_chat_loaded_and_opens_window(monkeypatch):
+def test_chat_enqueue_wakes_async_runtime_wait():
+    class _QueuedChatStore:
+        queued = False
+
+        def has_queued_turn(self):
+            return self.queued
+
+    async def exercise():
+        store = _QueuedChatStore()
+        broker = ChatEventBroker()
+        runtime = AmbientRuntime(
+            transcription_queue=queue.Queue(),
+            chat_store=store,
+            chat_event_broker=broker,
+        )
+        runtime._loop = asyncio.get_running_loop()
+        waiter = asyncio.create_task(runtime._wait_for_chat_or_timeout(10.0))
+        await asyncio.sleep(0)
+        store.queued = True
+        broker.notify_turn_enqueued()
+        stopped = await asyncio.wait_for(waiter, timeout=0.5)
+        return stopped
+
+    assert asyncio.run(exercise()) is False
+
+
+def test_restore_chat_residency_keeps_chat_loaded_without_blocking_window(monkeypatch):
     runtime = AmbientRuntime(transcription_queue=queue.Queue())
     llm = _FakeModelManager()
     monkeypatch.setattr(app, "CHAT_MODEL", "resident-chat-model")
-    monkeypatch.setattr(app, "CHAT_RESPONSE_WAIT_SECONDS", 120.0)
-    monkeypatch.setattr(app.time, "monotonic", lambda: 50.0)
 
     initialized = asyncio.run(
         runtime._restore_chat_residency(
@@ -248,26 +278,6 @@ def test_restore_chat_residency_keeps_chat_loaded_and_opens_window(monkeypatch):
     assert initialized is True
     assert llm.loaded_models == ["resident-chat-model"]
     assert llm.unload_calls == 0
-    assert runtime._chat_response_deadline == 170.0
-
-
-def test_startup_chat_restore_does_not_open_response_window(monkeypatch):
-    runtime = AmbientRuntime(transcription_queue=queue.Queue())
-    llm = _FakeModelManager()
-    monkeypatch.setattr(app, "CHAT_MODEL", "resident-chat-model")
-
-    initialized = asyncio.run(
-        runtime._restore_chat_residency(
-            llm_adapter=llm,
-            services_initialized=False,
-            reason="runtime startup",
-            open_response_window=False,
-        )
-    )
-
-    assert initialized is True
-    assert llm.loaded_models == ["resident-chat-model"]
-    assert runtime._chat_response_deadline is None
 
 
 def test_ambient_runtime_stop_only_signals_shutdown():

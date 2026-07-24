@@ -7,9 +7,9 @@ import queue
 import threading
 import uuid
 from collections import deque
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -25,7 +25,8 @@ from core.models import AmbientEvent
 from infrastructure.adapter.SQLiteTrainingDataAdapter import SQLiteTrainingDataAdapter
 
 
-UI_ROOT = Path(__file__).resolve().parent / "runtime_ui"
+UI_SOURCE_ROOT = Path(__file__).resolve().parent / "runtime_ui"
+UI_ROOT = UI_SOURCE_ROOT / "dist"
 UI_INDEX_PATH = UI_ROOT / "index.html"
 
 
@@ -118,6 +119,119 @@ def _safe_json(value: Optional[str], fallback: Any) -> Any:
         return json.loads(value)
     except json.JSONDecodeError:
         return fallback
+
+
+def _message_content_text(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            if not isinstance(item, dict):
+                parts.append(str(item))
+                continue
+            text_value = item.get("text") or item.get("content")
+            if isinstance(text_value, str):
+                parts.append(text_value)
+            elif str(item.get("type") or "").lower() in {"image", "image_url", "input_image"}:
+                parts.append("[image]")
+            else:
+                parts.append(json.dumps(item, ensure_ascii=False))
+        return "\n".join(part for part in parts if part)
+    if isinstance(content, dict):
+        return json.dumps(content, ensure_ascii=False, indent=2)
+    return str(content)
+
+
+def _normalize_messages(messages: Any) -> dict[str, Any]:
+    if not isinstance(messages, list):
+        return {"request": None, "context_messages": [], "malformed": True}
+    normalized: list[dict[str, str]] = []
+    for message in messages:
+        if isinstance(message, dict):
+            normalized.append(
+                {
+                    "role": str(message.get("role") or "unknown"),
+                    "content": _message_content_text(message.get("content")),
+                }
+            )
+        else:
+            normalized.append({"role": "unknown", "content": _message_content_text(message)})
+    request_index = next(
+        (index for index in range(len(normalized) - 1, -1, -1) if normalized[index]["role"] == "user"),
+        len(normalized) - 1,
+    )
+    if request_index < 0:
+        return {"request": None, "context_messages": [], "malformed": False}
+    return {
+        "request": normalized[request_index],
+        "context_messages": [message for index, message in enumerate(normalized) if index != request_index],
+        "malformed": False,
+    }
+
+
+def _interaction_input(
+    row: Any,
+    *,
+    capture_store: Any = None,
+    reveal_protected: bool = False,
+) -> dict[str, Any]:
+    try:
+        payload = json.loads(row.messages_json)
+    except (json.JSONDecodeError, TypeError):
+        return {
+            "protected": False,
+            "request": None,
+            "context_messages": [],
+            "malformed": True,
+        }
+    protected_ref = payload.get("protected_payload_ref") if isinstance(payload, dict) else None
+    if protected_ref:
+        if not reveal_protected:
+            return {
+                "protected": True,
+                "request": None,
+                "context_messages": [],
+                "malformed": False,
+            }
+        if capture_store is None:
+            raise HTTPException(status_code=503, detail="protected_input_unavailable")
+        try:
+            raw, metadata = capture_store.read_bytes(str(protected_ref))
+            if str(metadata.get("kind") or "") != "llm_messages":
+                raise ValueError("capture is not an LLM message payload")
+            payload = json.loads(raw.decode("utf-8"))
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=404, detail="protected_input_not_found") from exc
+    normalized = _normalize_messages(payload)
+    return {"protected": bool(protected_ref), **normalized}
+
+
+def _serialize_interaction(row: Any) -> dict[str, Any]:
+    return {
+        "interaction_id": row.interaction_id,
+        "interaction_run_id": row.interaction_run_id,
+        "created_at": row.created_at,
+        "completed_at": row.completed_at,
+        "source": row.source,
+        "model": row.model,
+        "duration_ms": row.duration_ms,
+        "input": _interaction_input(row),
+        "response_text": row.response_text,
+        "error_text": row.error_text,
+        "reasoning_text": row.reasoning_text,
+        "tools": _safe_json(row.tools_json, None),
+        "tool_calls": _safe_json(row.tool_calls_json, None),
+        "metadata": _safe_json(row.metadata_json, {}),
+        "report": _safe_json(row.report_json, None),
+        "has_image": bool(row.image_path),
+        "image_url": f"/api/interactions/{row.interaction_id}/image" if row.image_path else None,
+    }
 
 
 def _resolve_media_path(path_value: str, media_roots: list[Path]) -> Path:
@@ -241,6 +355,105 @@ def create_runtime_log_app(
                 )
         return {"reports": reports, "queued_tasks": queued_tasks, "count": len(reports)}
 
+    @app.get("/api/interactions")
+    def get_interactions(
+        date_from: date | None = Query(default=None),
+        date_to: date | None = Query(default=None),
+        sort: Literal["newest", "oldest"] = Query(default="newest"),
+        limit: int = Query(default=50, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict[str, Any]:
+        if report_store is None:
+            return {
+                "items": [],
+                "pagination": {"limit": limit, "offset": offset, "total": 0, "has_more": False},
+                "sort": sort,
+                "date_from": date_from.isoformat() if date_from else None,
+                "date_to": date_to.isoformat() if date_to else None,
+            }
+        if date_from and date_to and date_from > date_to:
+            raise HTTPException(status_code=422, detail="date_from must not be later than date_to")
+        from_value = date_from.isoformat() if date_from else None
+        to_value = date_to.isoformat() if date_to else None
+        rows = report_store.list_entries(
+            limit=limit,
+            offset=offset,
+            date_from=from_value,
+            date_to=to_value,
+            sort_order="asc" if sort == "oldest" else "desc",
+        )
+        total = report_store.count_entries(date_from=from_value, date_to=to_value)
+        return {
+            "items": [_serialize_interaction(row) for row in rows],
+            "pagination": {
+                "limit": limit,
+                "offset": offset,
+                "total": total,
+                "has_more": offset + len(rows) < total,
+            },
+            "sort": sort,
+            "date_from": from_value,
+            "date_to": to_value,
+        }
+
+    @app.get("/api/interactions/{interaction_id}/input")
+    def get_interaction_input(interaction_id: str) -> dict[str, Any]:
+        if report_store is None:
+            raise HTTPException(status_code=503, detail="interaction_store_unavailable")
+        row = report_store.get_by_interaction_id(interaction_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="interaction_not_found")
+        input_payload = _interaction_input(row, capture_store=capture_store, reveal_protected=True)
+        if input_payload.get("protected") and autonomy_store is not None:
+            autonomy_store.audit(
+                "local_user",
+                "interaction.input_viewed",
+                interaction_id,
+                {"source": row.source},
+            )
+        return {"interaction_id": interaction_id, "input": input_payload}
+
+    @app.get("/api/interactions/{interaction_id}/image")
+    def get_interaction_image(interaction_id: str) -> Response:
+        if report_store is None:
+            raise HTTPException(status_code=503, detail="interaction_store_unavailable")
+        row = report_store.get_by_interaction_id(interaction_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="interaction_not_found")
+        image_path = str(row.image_path or "").strip()
+        if not image_path:
+            raise HTTPException(status_code=404, detail="interaction_image_not_found")
+        if image_path.startswith("capture://"):
+            if capture_store is None:
+                raise HTTPException(status_code=404, detail="interaction_image_not_found")
+            try:
+                data, metadata = capture_store.read_bytes(image_path)
+            except (OSError, ValueError) as exc:
+                raise HTTPException(status_code=404, detail="interaction_image_not_found") from exc
+            response: Response = Response(
+                content=data,
+                media_type=str(metadata.get("mime_type") or "application/octet-stream"),
+                headers={"Content-Disposition": "inline"},
+            )
+        else:
+            if not normalized_media_roots:
+                raise HTTPException(status_code=404, detail="interaction_image_not_found")
+            resolved = _resolve_media_path(image_path, normalized_media_roots)
+            mime_type, _ = mimetypes.guess_type(str(resolved))
+            response = FileResponse(
+                path=str(resolved),
+                media_type=mime_type or "application/octet-stream",
+                headers={"Content-Disposition": "inline"},
+            )
+        if autonomy_store is not None:
+            autonomy_store.audit(
+                "local_user",
+                "interaction.image_viewed",
+                interaction_id,
+                {"source": row.source},
+            )
+        return response
+
     @app.get("/api/chat/sessions")
     def get_chat_sessions(limit: int = Query(default=100, ge=1, le=500)) -> dict[str, Any]:
         if chat_store is None:
@@ -292,6 +505,8 @@ def create_runtime_log_app(
             raise HTTPException(status_code=404, detail="session_not_found") from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if chat_event_broker is not None:
+            chat_event_broker.notify_turn_enqueued()
         assistant = turn["assistant_message"]
         return {
             **turn,
@@ -774,6 +989,7 @@ def create_runtime_log_app(
     @app.get("/reports", response_class=HTMLResponse)
     @app.get("/inbox", response_class=HTMLResponse)
     @app.get("/chat", response_class=HTMLResponse)
+    @app.get("/interactions", response_class=HTMLResponse)
     @app.get("/", response_class=HTMLResponse)
     @app.get("/logs", response_class=HTMLResponse)
     @app.get("/benchmarks", response_class=HTMLResponse)
