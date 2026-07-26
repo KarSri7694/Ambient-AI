@@ -60,19 +60,42 @@ if not TEMP_AUDIO_DIR.exists():
     TEMP_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
 class AudioAgent:
-    def __init__(self, transcription_queue: queue.Queue):
+    def __init__(
+        self,
+        transcription_queue: queue.Queue,
+        *,
+        voice_db: str = VOICE_DB,
+        transcriptions_dir: str = str(TRANSCRIPTIONS_DIR),
+        cleaned_audio_dir: str = str(CLEANED_AUDIO_DIR),
+        temp_audio_dir: str = str(TEMP_AUDIO_DIR),
+        asr_model: str = HIN2HINGLISH,
+        stage_callback=None,
+    ):
         self.preprocessor = None
         self.asr = None
         self.diarization = None
         self.encoder = None
         self.transcription_queue = transcription_queue
+        self.voice_db = voice_db
+        self.transcriptions_dir = Path(transcriptions_dir)
+        self.cleaned_audio_dir = Path(cleaned_audio_dir)
+        self.temp_audio_dir = Path(temp_audio_dir)
+        self.asr_model = asr_model
+        self.stage_callback = stage_callback
+        self.transcriptions_dir.mkdir(parents=True, exist_ok=True)
+        self.cleaned_audio_dir.mkdir(parents=True, exist_ok=True)
+        self.temp_audio_dir.mkdir(parents=True, exist_ok=True)
+
+    def _emit_stage(self, stage: str, payload=None):
+        if self.stage_callback is not None:
+            self.stage_callback(stage, payload or {})
 
     def preprocess_audio(self, audio_file_path):
-        self.preprocessor = AudioPreprocessor(temp_audio_dir=str(TEMP_AUDIO_DIR), cleaned_audio_dir=str(CLEANED_AUDIO_DIR))
+        self.preprocessor = AudioPreprocessor(temp_audio_dir=str(self.temp_audio_dir), cleaned_audio_dir=str(self.cleaned_audio_dir))
         return self.preprocessor.run(audio_file_path)
     
     def transcribe_audio(self, audio_file_path: str, vad_filter: bool, word_timestamps: bool, batch_size: int = 8)-> list[TranscriptionResult]:
-        self.asr = asr_adapter(model_size=HIN2HINGLISH, device="cuda")
+        self.asr = asr_adapter(model_size=self.asr_model, device="cuda")
         try:
             return self.asr.transcribe_audio(audio_file_path, vad_filter, word_timestamps, batch_size)
         finally:
@@ -169,13 +192,14 @@ class AudioAgent:
             return
         
         transcript_name = f"transcript_{datetime.now().strftime('%d%m%Y_%H%M%S')}.txt"
-        transcript_path = TRANSCRIPTIONS_DIR / transcript_name
+        transcript_path = self.transcriptions_dir / transcript_name
         with open(transcript_path, "w", encoding="utf-8") as f:
             for entry in final_transcript:
                 f.write(f"[{entry[0]:.4f} - {entry[1]:.4f}] -> {entry[2]}: {entry[3]}\n")
 
         logging.info(f"Final transcript for-{diarization_result[0].audio_file} saved to {transcript_name}")
         self.transcription_queue.put(str(transcript_path))
+        return str(transcript_path)
     
     def unload_model(self, attr_name: str):
         '''
@@ -190,15 +214,29 @@ class AudioAgent:
         
         
     def run(self, audio_file: str):
-        db = self.connect_db(VOICE_DB)
+        db = self.connect_db(self.voice_db)
+        self._emit_stage("preprocessing_started", {"audio_path": audio_file})
         processed_file = self.preprocess_audio(audio_file)
         if not os.path.exists(processed_file):
             raise FileNotFoundError(f"Processed audio not found: {processed_file}")
+        self._emit_stage("preprocessing_completed", {"processed_audio_path": processed_file})
         logging.info(f"Processed file: {processed_file}")
+        self._emit_stage("diarization_started", {"audio_path": processed_file})
         diarization_result = self.diarize_audio(processed_file)
+        self._emit_stage("diarization_completed", {"segments": [dict(item.__dict__) for item in diarization_result]})
+        self._emit_stage("asr_started", {"audio_path": processed_file})
         transcription_result = self.transcribe_audio(processed_file, vad_filter=False, word_timestamps= True)
+        self._emit_stage("asr_completed", {"segments": [dict(item.__dict__) for item in transcription_result]})
+        self._emit_stage("speaker_identification_started", {})
         diarization_result = self.compare_embeddings(db, diarization_result)
-        self.merge_transciptions_and_diarizations(transcription=transcription_result, diarization_result=diarization_result)
+        self._emit_stage("speaker_identification_completed", {"segments": [dict(item.__dict__) for item in diarization_result]})
+        transcript_path = self.merge_transciptions_and_diarizations(transcription=transcription_result, diarization_result=diarization_result)
+        return {
+            "processed_audio_path": processed_file,
+            "transcript_path": transcript_path,
+            "transcription": transcription_result,
+            "diarization": diarization_result,
+        }
         
 class Handler(FileSystemEventHandler):
     def __init__(self, processing_queue: queue.Queue):

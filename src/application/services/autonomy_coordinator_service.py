@@ -200,6 +200,7 @@ Requirements:
         model: str,
         llm_service,
         personalization_context: str,
+        event_callback=None,
     ) -> dict[str, Any]:
         if self.mode == "disabled":
             return {"processed": False, "reason": "disabled"}
@@ -315,6 +316,7 @@ Requirements:
                         model=model,
                         allowed_tool_names=allowed_names,
                         report_policy="auto_surface",
+                        event_callback=event_callback,
                     )
                 finally:
                     llm_service.reset_context()
@@ -378,6 +380,7 @@ Requirements:
         max_events: int = 8,
         max_seconds: float = 90.0,
         should_preempt=None,
+        event_callback=None,
     ) -> dict[str, Any]:
         started = time.monotonic()
         results: list[dict[str, Any]] = []
@@ -390,6 +393,7 @@ Requirements:
                 model=model,
                 llm_service=llm_service,
                 personalization_context=personalization_context,
+                event_callback=event_callback,
             )
             if not result.get("processed"):
                 break

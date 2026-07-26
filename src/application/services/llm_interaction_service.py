@@ -679,7 +679,12 @@ class LLMInteractionService:
             self.logger.info("Arguments: %s", tool_args_str)
             self._emit_event(
                 event_callback,
-                {"type": "tool_started", "tool_name": tool_name},
+                {
+                    "type": "tool_started",
+                    "tool_name": tool_name,
+                    "tool_call_id": tool_id,
+                    "arguments_json": tool_args_str,
+                },
             )
 
             try:
@@ -905,6 +910,9 @@ class LLMInteractionService:
                 {
                     "type": "tool_finished",
                     "tool_name": tool_name,
+                    "tool_call_id": tool_id,
+                    "arguments_json": tool_args_str,
+                    "result": response_content,
                     "ok": not response_content.startswith("Error:"),
                 },
             )

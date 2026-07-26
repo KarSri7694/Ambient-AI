@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Activity, BarChart3, Bot, BrainCircuit, Database, FileText, Inbox,
-  MessageSquare, Moon, Pause, Play, ScrollText, Sun,
+  MessageSquare, Moon, Pause, Play, ScrollText, Sun, TestTube2,
 } from "lucide-react";
 import { getJson, sendJson } from "./api";
 import { Badge, Button } from "./components/ui";
@@ -13,6 +13,7 @@ import { BenchmarksPage } from "./pages/BenchmarksPage";
 import { TrainingPage } from "./pages/TrainingPage";
 import { LogsPage } from "./pages/LogsPage";
 import { InteractionsPage } from "./pages/InteractionsPage";
+import { RealWorldTestsPage } from "./pages/RealWorldTestsPage";
 
 const routes = [
   { path: "/chat", label: "Chat", icon: MessageSquare },
@@ -20,6 +21,7 @@ const routes = [
   { path: "/inbox", label: "Proactive Inbox", icon: Inbox },
   { path: "/reports", label: "Reports", icon: FileText },
   { path: "/benchmarks", label: "Benchmarks", icon: BarChart3 },
+  { path: "/real-world-tests", label: "Real-world Tests", icon: TestTube2 },
   { path: "/training", label: "Training", icon: BrainCircuit },
   { path: "/logs", label: "Runtime Logs", icon: ScrollText },
 ] as const;
@@ -84,6 +86,7 @@ export function App() {
       case "/inbox": return <InboxPage privacy={privacy.data} resources={resources.data} />;
       case "/reports": return <ReportsPage />;
       case "/benchmarks": return <BenchmarksPage />;
+      case "/real-world-tests": return <RealWorldTestsPage />;
       case "/training": return <TrainingPage />;
       case "/logs": return <LogsPage />;
       default: return <ChatPage />;
