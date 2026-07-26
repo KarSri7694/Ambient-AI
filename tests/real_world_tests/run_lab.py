@@ -14,6 +14,7 @@ if str(SRC_ROOT) not in sys.path:
 from infrastructure.runtime_log_server import RuntimeLogBuffer, create_runtime_log_app
 from real_world_testing.lab import RealWorldLab
 from real_world_testing.runtime_lock import RuntimeOwnershipLock
+from rocm_tuning.service import RocmTuningService, config_from_ini
 
 
 def main() -> None:
@@ -29,7 +30,8 @@ def main() -> None:
         project_root=PROJECT_ROOT, config_path=args.config, data_root=args.data_root,
         suites_root=Path(__file__).parent / "suites",
     )
-    app = create_runtime_log_app(RuntimeLogBuffer(), real_world_lab=lab)
+    rocm_tuning = RocmTuningService(config=config_from_ini(args.config, project_root=PROJECT_ROOT))
+    app = create_runtime_log_app(RuntimeLogBuffer(), real_world_lab=lab, rocm_tuning_service=rocm_tuning)
     lock = RuntimeOwnershipLock(PROJECT_ROOT / ".ambient_data" / "runtime.lock", "real-world-lab")
     with lock:
         uvicorn.run(app, host=args.host, port=args.port, log_level="info")

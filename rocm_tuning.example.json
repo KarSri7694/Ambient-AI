@@ -1,0 +1,20 @@
+{
+  "data_root": ".ambient_data/rocm",
+  "llama_server_path": "D:\\path\\to\\llama-server.exe",
+  "tuning_port": 8091,
+  "api_key": "testkey",
+  "models": [
+    {
+      "name": "Ambient_Qwen25_VL_4B_ROCm",
+      "model": "D:\\Models\\Qwen2.5-VL-4B-Instruct-Q4_K_M.gguf",
+      "mmproj": "D:\\Models\\Qwen2.5-VL-4B-Instruct-mmproj.gguf"
+    }
+  ],
+  "contexts": [8192, 16384, 32768],
+  "gpu_layers": [99, 80, 60],
+  "flash_attention": [true, false],
+  "kv_cache": [["q8_0", "q8_0"], ["q4_0", "q4_0"]],
+  "warmups": 1,
+  "measured_runs": 10,
+  "min_free_vram_mb": 512
+}

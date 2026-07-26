@@ -110,6 +110,7 @@ class ResourceGovernorService:
         self._last_decision: Optional[ResourceDecision] = None
         self._deferred_count = 0
         self._residency_status_provider: Optional[Callable[[], dict[str, Any]]] = None
+        self._rocm_profile_provider: Optional[Callable[[str], dict[str, Any] | None]] = None
         self._last_deferral_log_at = 0.0
         self._last_deferral_reason = ""
 
@@ -128,6 +129,9 @@ class ResourceGovernorService:
 
     def set_residency_status_provider(self, provider: Callable[[], dict[str, Any]]) -> None:
         self._residency_status_provider = provider
+
+    def set_rocm_profile_provider(self, provider: Callable[[str], dict[str, Any] | None]) -> None:
+        self._rocm_profile_provider = provider
 
     def _host_ram_reserve(self, preset_reserve_mb: int) -> int:
         """Apply the configured RAM threshold as an upper bound on a preset."""
@@ -181,6 +185,18 @@ class ResourceGovernorService:
                 if snapshot.free_vram_mb is None or snapshot.free_vram_mb < int(vram_reserve):
                     allowed = False
                     reason = f"only {snapshot.free_vram_mb or 0} MB VRAM is free; {vram_reserve} MB is reserved"
+                elif (
+                    not use_post_load_floor
+                    and snapshot.gpu_backend == "amd_rocm"
+                    and self._measured_rocm_vram_requirement_mb(request.model_name, int(vram_reserve)) is not None
+                    and snapshot.free_vram_mb < self._measured_rocm_vram_requirement_mb(request.model_name, int(vram_reserve))
+                ):
+                    required_vram = self._measured_rocm_vram_requirement_mb(request.model_name, int(vram_reserve)) or vram_reserve
+                    allowed = False
+                    reason = (
+                        f"only {snapshot.free_vram_mb} MB VRAM is free; tuned ROCm profile for "
+                        f"{request.model_name} needs {required_vram} MB including reserve"
+                    )
                 elif snapshot.available_ram_mb < int(gpu_ram_reserve):
                     allowed = False
                     reason = (
@@ -307,10 +323,34 @@ class ResourceGovernorService:
         }
         if self._residency_status_provider is not None:
             payload["residency"] = self._residency_status_provider()
+        if self._rocm_profile_provider is not None and snapshot.gpu_backend == "amd_rocm":
+            loaded_model = None
+            if isinstance(payload.get("residency"), dict):
+                loaded_model = payload["residency"].get("loaded_model")
+            payload["rocm_tuned_profile"] = self._rocm_profile_provider(str(loaded_model or ""))
         return payload
 
     def _decision_details(self, request: InferenceRequest, decision: ResourceDecision) -> dict[str, Any]:
-        return {"request": asdict(request), "decision": asdict(decision)}
+        details = {"request": asdict(request), "decision": asdict(decision)}
+        if self._rocm_profile_provider is not None:
+            details["rocm_tuned_profile"] = self._rocm_profile_provider(request.model_name)
+        return details
+
+    def _measured_rocm_vram_requirement_mb(self, model_name: str, reserve_mb: int) -> Optional[int]:
+        if self._rocm_profile_provider is None:
+            return None
+        try:
+            profile = self._rocm_profile_provider(model_name)
+        except Exception:
+            self.logger.exception("Unable to read ROCm tuned profile for %s.", model_name)
+            return None
+        if not profile:
+            return None
+        summary = profile.get("summary") or {}
+        delta = summary.get("vram_delta_mb_max")
+        if delta is None:
+            return None
+        return max(reserve_mb, int(float(delta)) + reserve_mb)
 
     def _log_deferral(self, request: InferenceRequest, decision: ResourceDecision) -> None:
         now = time.monotonic()

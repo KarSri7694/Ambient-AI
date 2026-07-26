@@ -30,6 +30,7 @@ export function RealWorldTestsPage() {
   const suites = useQuery({ queryKey: ["rw-suites"], queryFn: () => getJson<any>("/api/real-world/suites") });
   const models = useQuery({ queryKey: ["rw-models"], queryFn: () => getJson<any>("/api/real-world/models"), retry: false });
   const runs = useQuery({ queryKey: ["rw-runs"], queryFn: () => getJson<any>("/api/real-world/runs"), refetchInterval: 1500 });
+  const rocm = useQuery({ queryKey: ["rocm-tuning-status"], queryFn: () => getJson<any>("/api/rocm-tuning/status"), refetchInterval: 5000 });
   const [sourceMode, setSourceMode] = useState<SourceMode>("suite");
   const [suiteId, setSuiteId] = useState("");
   const [scenarioIds, setScenarioIds] = useState<string[]>([]);
@@ -108,6 +109,7 @@ export function RealWorldTestsPage() {
   const runItems = runs.data?.runs || [];
   const completedCount = runItems.filter((item: any) => item.status === "completed").length;
   const hardware = run?.config?.accelerator || events.find((event: any) => event.event_type === "accelerator_detected")?.payload;
+  const tunedProfile = rocm.data?.latest_profile;
   const modelEvents = events.filter((event: any) => event.stage === "model");
   const toolEvents = events.filter((event: any) => event.event_type.includes("tool"));
   const failedEvents = events.filter((event: any) => event.status === "failed");
@@ -126,7 +128,7 @@ export function RealWorldTestsPage() {
       eyebrow="Evaluation studio"
       title="Real-world tests"
       description="Replay authentic media through the complete ambient pipeline, then inspect every perception, model, and tool decision in one trace."
-      actions={<><Badge tone={active ? "warn" : "good"}>{active ? "Run in progress" : "Lab ready"}</Badge><Badge>Local only</Badge></>}
+      actions={<><Badge tone={active ? "warn" : "good"}>{active ? "Run in progress" : "Lab ready"}</Badge><Badge>{tunedProfile ? "ROCm tuned" : "ROCm untuned"}</Badge><Button variant="secondary" onClick={() => downloadRocm("json")}><Download size={14} />Tuning JSON</Button><Button variant="secondary" onClick={() => downloadRocm("csv")}><Download size={14} />CSV</Button></>}
     />
 
     <section className="rw-hero">
@@ -213,6 +215,12 @@ export function RealWorldTestsPage() {
             <Metric icon={<AlertTriangle size={17} />} value={failedEvents.length} label="Failures" />
             <div className="rw-stat"><span><Clock3 size={17} /></span><strong>{avgModelMs ?? "n/a"}</strong><small>Avg model ms</small></div>
           </div>
+          {tunedProfile && <div className="rw-tuning-strip">
+            <div><strong>{tunedProfile.model_name}</strong><span>{tunedFlags(tunedProfile.candidate)}</span></div>
+            <div><strong>{formatMetric(tunedProfile.summary?.ttft_seconds_median, "s")}</strong><span>Median TTFT</span></div>
+            <div><strong>{formatMetric(tunedProfile.summary?.chars_per_second_median, " cps")}</strong><span>Generation</span></div>
+            <div><strong>{formatMetric(tunedProfile.summary?.vram_delta_mb_max, " MB")}</strong><span>VRAM delta</span></div>
+          </div>}
           {run.error_text && <div className="rw-inline-error">{run.error_text}</div>}
           <div className="space-y-4">{run.results?.map((result: any) => <ResultReview key={result.result_id} result={result} runId={run.run_id} onSaved={() => client.invalidateQueries({ queryKey: ["rw-run", selectedRun] })} />)}</div>
         </>}
@@ -234,6 +242,20 @@ function Metric({ icon, value, label }: { icon: React.ReactNode; value: number; 
 
 function downloadRun(runId: string, format: "json" | "csv") {
   window.location.href = `/api/real-world/runs/${runId}/export.${format}`;
+}
+
+function downloadRocm(format: "json" | "csv") {
+  window.location.href = `/api/rocm-tuning/export.${format}`;
+}
+
+function formatMetric(value: any, suffix: string) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return "n/a";
+  return `${Number(value).toFixed(suffix === "s" ? 2 : 0)}${suffix}`;
+}
+
+function tunedFlags(candidate: any) {
+  if (!candidate) return "No candidate details";
+  return `ctx ${candidate.context_size} | ngl ${candidate.gpu_layers} | fa ${candidate.flash_attention ? "on" : "off"} | ${candidate.cache_type_k}/${candidate.cache_type_v}`;
 }
 
 function TraceEventCard({ event }: { event: any }) {

@@ -277,6 +277,7 @@ def create_runtime_log_app(
     capture_control: Any = None,
     resource_governor: Any = None,
     real_world_lab: Any = None,
+    rocm_tuning_service: Any = None,
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -316,6 +317,58 @@ def create_runtime_log_app(
             return {"suites": [], "available": False}
         suites = real_world_lab.suites()
         return {"suites": suites, "available": True}
+
+    @app.get("/api/rocm-tuning/status")
+    def get_rocm_tuning_status() -> dict[str, Any]:
+        if rocm_tuning_service is None:
+            return {"available": False, "accelerator": None, "latest_profile": None, "recent_runs": []}
+        return rocm_tuning_service.status()
+
+    @app.get("/api/rocm-tuning/runs")
+    def get_rocm_tuning_runs(limit: int = Query(default=20, ge=1, le=200)) -> dict[str, Any]:
+        if rocm_tuning_service is None:
+            return {"available": False, "runs": []}
+        return {"available": True, "runs": rocm_tuning_service.store.list_runs(limit=limit)}
+
+    @app.get("/api/rocm-tuning/runs/{run_id}")
+    def get_rocm_tuning_run(run_id: str) -> dict[str, Any]:
+        if rocm_tuning_service is None:
+            raise HTTPException(status_code=503, detail="rocm_tuning_unavailable")
+        run = rocm_tuning_service.store.get_run(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="rocm_tuning_run_not_found")
+        return {"run": run}
+
+    @app.post("/api/rocm-tuning/runs")
+    def start_rocm_tuning_run() -> dict[str, Any]:
+        if rocm_tuning_service is None:
+            raise HTTPException(status_code=503, detail="rocm_tuning_unavailable")
+        try:
+            return {"run": rocm_tuning_service.run()}
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @app.get("/api/rocm-tuning/latest")
+    def get_rocm_tuning_latest() -> dict[str, Any]:
+        if rocm_tuning_service is None:
+            return {"profile": None}
+        return {"profile": rocm_tuning_service.store.latest_profile()}
+
+    @app.get("/api/rocm-tuning/export.json")
+    def export_rocm_tuning_json() -> dict[str, Any]:
+        if rocm_tuning_service is None:
+            raise HTTPException(status_code=503, detail="rocm_tuning_unavailable")
+        return rocm_tuning_service.store.export_json()
+
+    @app.get("/api/rocm-tuning/export.csv")
+    def export_rocm_tuning_csv() -> Response:
+        if rocm_tuning_service is None:
+            raise HTTPException(status_code=503, detail="rocm_tuning_unavailable")
+        return Response(
+            content=rocm_tuning_service.store.export_csv(),
+            media_type="text/csv",
+            headers={"Content-Disposition": 'attachment; filename="rocm-tuning.csv"'},
+        )
 
     @app.get("/api/real-world/models")
     def get_real_world_models() -> dict[str, Any]:
@@ -1176,6 +1229,7 @@ def start_runtime_log_server(
     capture_control: Any = None,
     resource_governor: Any = None,
     real_world_lab: Any = None,
+    rocm_tuning_service: Any = None,
 ) -> RuntimeLogBuffer:
     global _SERVER_THREAD, _SERVER
     log_buffer = configure_runtime_log_streaming(max_entries=max_entries)
@@ -1201,6 +1255,7 @@ def start_runtime_log_server(
             capture_control=capture_control,
             resource_governor=resource_governor,
             real_world_lab=real_world_lab,
+            rocm_tuning_service=rocm_tuning_service,
         )
 
         def _serve() -> None:

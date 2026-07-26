@@ -1633,6 +1633,7 @@ class AmbientRuntime:
 if __name__ == "__main__":
     import atexit
     from real_world_testing.runtime_lock import RuntimeOwnershipLock
+    from rocm_tuning.service import RocmTuningService, config_from_ini
 
     _runtime_ownership_lock = RuntimeOwnershipLock(PROJECT_ROOT / ".ambient_data" / "runtime.lock", "ambient-runtime")
     _runtime_ownership_lock.acquire()
@@ -1660,6 +1661,8 @@ if __name__ == "__main__":
         critical_vram_mb=RESOURCE_CRITICAL_VRAM_MB,
         audit=autonomy_api_store.audit,
     )
+    rocm_tuning_service = RocmTuningService(config=config_from_ini(CONFIG.path, project_root=PROJECT_ROOT))
+    resource_governor.set_rocm_profile_provider(lambda model_name: rocm_tuning_service.store.latest_profile(model_name=model_name or None))
     chat_store = SQLiteChatAdapter(db_path=str(CHAT_DB_PATH))
     recovered_chat_messages = chat_store.recover_interrupted()
     if recovered_chat_messages:
@@ -1697,6 +1700,7 @@ if __name__ == "__main__":
             capture_store=capture_store,
             capture_control=capture_control,
             resource_governor=resource_governor,
+            rocm_tuning_service=rocm_tuning_service,
         )
         logger.info(
             "Runtime log server started at %s://%s:%s/logs",

@@ -286,6 +286,10 @@ button:disabled { cursor: not-allowed; opacity: .55; }
   .rw-amd-chip > svg { @apply shrink-0 text-accent; }
   .rw-amd-chip strong { @apply block truncate text-sm; }
   .rw-amd-chip span { @apply mt-0.5 block truncate text-xs text-muted; }
+  .rw-tuning-strip { @apply mb-5 grid gap-2 rounded-2xl border border-accent/20 bg-accent-soft p-3 sm:grid-cols-2 xl:grid-cols-4; }
+  .rw-tuning-strip > div { @apply min-w-0 rounded-xl bg-surface p-3; }
+  .rw-tuning-strip strong { @apply block truncate text-sm; }
+  .rw-tuning-strip span { @apply mt-1 block truncate text-xs text-muted; }
   .rw-inline-error { @apply mb-4 rounded-xl border border-danger/20 bg-danger/10 p-3 text-sm text-danger; }
   .rw-result-card { @apply overflow-hidden rounded-2xl border border-line bg-raised; }
   .rw-result-card > header { @apply flex items-center gap-3 border-b border-line bg-surface px-4 py-3.5; }
