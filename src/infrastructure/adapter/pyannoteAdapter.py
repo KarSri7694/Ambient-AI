@@ -16,9 +16,10 @@ project_root = current_dir.parent.parent.parent  # Go up to ambient_ai root
 DIARIZATION_MODEL = "pyannote/speaker-diarization-3.1"
 
 class PyannoteAdapter(DiarizationPort):
-    def __init__(self, hf_token: str):
+    def __init__(self, hf_token: str, device: str = "auto"):
         self.diarization_model = Pipeline.from_pretrained(DIARIZATION_MODEL, token=hf_token)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        selected_device = device if device in {"cpu", "cuda"} else ("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device(selected_device)
         try:
             self.diarization_model.to(self.device)
         except RuntimeError as exc:

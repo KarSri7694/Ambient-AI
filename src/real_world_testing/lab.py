@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import configparser
+import csv
 import hashlib
+import io
 import json
 import logging
 import re
@@ -20,6 +22,11 @@ from real_world_testing.case_loader import (
     ScheduledMediaInput, load_suites, suite_to_dict,
 )
 from real_world_testing.store import SQLiteRealWorldTestStore, TERMINAL_STATUSES
+
+try:
+    from infrastructure.accelerator import detect_accelerator
+except Exception:
+    detect_accelerator = None
 
 
 LOGGER = logging.getLogger(__name__)
@@ -110,13 +117,14 @@ class RealWorldLab:
         parser = self._config()
         if parser.get("autonomy", "mode", fallback="shadow").strip() != "active":
             raise ValueError("Real live-tool runs require [autonomy] mode = active")
+        accelerator = self.accelerator_summary(parser)
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 raise RuntimeError(f"Run {self._active_run_id} is already active")
             run_id = self.store.create_run(
                 suite_id=suite.suite_id, scenario_ids=[item.scenario_id for item in scenarios],
                 playback_speed=speed, model_roles=roles,
-                config={"config_path": str(self.config_path), "live_tools": True},
+                config={"config_path": str(self.config_path), "live_tools": True, "accelerator": accelerator},
             )
             self._active_run_id = run_id
             self._thread = threading.Thread(
@@ -125,6 +133,45 @@ class RealWorldLab:
             )
             self._thread.start()
         return self.store.get_run(run_id) or {"run_id": run_id}
+
+    def accelerator_summary(self, parser: configparser.ConfigParser | None = None) -> dict[str, Any]:
+        parser = parser or self._config()
+        backend = parser.get("accelerator", "backend", fallback="auto")
+        require_supported = parser.getboolean("accelerator", "require_supported_gpu", fallback=False)
+        if detect_accelerator is None:
+            return {"available": False, "backend": backend, "reason": "accelerator module unavailable"}
+        return detect_accelerator(backend, require_supported_gpu=require_supported).to_dict()
+
+    def export_run(self, run_id: str) -> dict[str, Any]:
+        run = self.store.get_run(run_id)
+        if run is None:
+            raise KeyError(run_id)
+        return {"run": run, "events": self.store.list_events(run_id, limit=5000)}
+
+    def export_run_csv(self, run_id: str) -> str:
+        payload = self.export_run(run_id)
+        output = io.StringIO()
+        writer = csv.DictWriter(
+            output,
+            fieldnames=[
+                "sequence", "created_at", "stage", "event_type", "status", "model",
+                "duration_ms", "result_id", "payload_json",
+            ],
+        )
+        writer.writeheader()
+        for event in payload["events"]:
+            writer.writerow({
+                "sequence": event.get("sequence"),
+                "created_at": event.get("created_at"),
+                "stage": event.get("stage"),
+                "event_type": event.get("event_type"),
+                "status": event.get("status"),
+                "model": event.get("model"),
+                "duration_ms": event.get("duration_ms"),
+                "result_id": event.get("result_id"),
+                "payload_json": json.dumps(event.get("payload") or {}, ensure_ascii=False),
+            })
+        return output.getvalue()
 
     def cancel_run(self, run_id: str) -> bool:
         return self.store.request_cancel(run_id)
@@ -164,6 +211,15 @@ class RealWorldLab:
     def _run_thread(self, run_id: str, scenarios: list[RealWorldScenario], speed: float,
                     roles: dict[str, str]) -> None:
         self.store.update_run(run_id, "running")
+        accelerator = self.accelerator_summary()
+        self.store.append_event(
+            run_id=run_id,
+            result_id=None,
+            stage="hardware",
+            event_type="accelerator_detected",
+            payload=accelerator,
+            status="completed" if accelerator.get("available") else "failed",
+        )
         errors = 0
         try:
             for scenario in scenarios:

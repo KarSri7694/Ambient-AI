@@ -349,6 +349,29 @@ def create_runtime_log_app(
         events = real_world_lab.store.list_events(run_id, after_sequence=after_sequence, limit=limit)
         return {"events": events, "count": len(events)}
 
+    @app.get("/api/real-world/runs/{run_id}/export.json")
+    def export_real_world_run_json(run_id: str) -> dict[str, Any]:
+        if real_world_lab is None:
+            raise HTTPException(status_code=503, detail="real_world_lab_unavailable")
+        try:
+            return real_world_lab.export_run(run_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="real_world_run_not_found") from exc
+
+    @app.get("/api/real-world/runs/{run_id}/export.csv")
+    def export_real_world_run_csv(run_id: str) -> Response:
+        if real_world_lab is None:
+            raise HTTPException(status_code=503, detail="real_world_lab_unavailable")
+        try:
+            csv_text = real_world_lab.export_run_csv(run_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="real_world_run_not_found") from exc
+        return Response(
+            content=csv_text,
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="real-world-{run_id}.csv"'},
+        )
+
     @app.get("/api/real-world/runs/{run_id}/events")
     async def stream_real_world_events(run_id: str, request: Request):
         if real_world_lab is None or real_world_lab.store.get_run(run_id) is None:

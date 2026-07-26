@@ -692,6 +692,10 @@ class ResourceSnapshot:
     free_vram_mb: Optional[int] = None
     gpu_telemetry_available: bool = False
     user_idle: bool = False
+    gpu_backend: Optional[str] = None
+    gpu_name: Optional[str] = None
+    gpu_runtime_version: Optional[str] = None
+    gpu_architecture: Optional[str] = None
 
 
 @dataclass(frozen=True)

@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  Activity, AlertTriangle, AudioLines, Check, ChevronRight, Clock3, FileAudio,
-  FileImage, Gauge, ImageIcon, Layers3, Play, Save, Settings2, ShieldAlert,
+  Activity, AlertTriangle, AudioLines, Check, ChevronRight, Clock3, Cpu, Download,
+  FileAudio, FileImage, Gauge, ImageIcon, Layers3, Play, Save, Settings2, ShieldAlert,
   Sparkles, Square, UploadCloud, Wrench, X,
 } from "lucide-react";
 import { getJson, sendJson, uploadBinary } from "../api";
@@ -107,6 +107,11 @@ export function RealWorldTestsPage() {
   const active = run && ["queued", "running"].includes(run.status);
   const runItems = runs.data?.runs || [];
   const completedCount = runItems.filter((item: any) => item.status === "completed").length;
+  const hardware = run?.config?.accelerator || events.find((event: any) => event.event_type === "accelerator_detected")?.payload;
+  const modelEvents = events.filter((event: any) => event.stage === "model");
+  const toolEvents = events.filter((event: any) => event.event_type.includes("tool"));
+  const failedEvents = events.filter((event: any) => event.status === "failed");
+  const avgModelMs = modelEvents.length ? Math.round(modelEvents.reduce((total: number, event: any) => total + (Number(event.duration_ms) || 0), 0) / modelEvents.length) : null;
   const filteredEvents = events.filter((event: any) => {
     if (traceFilter === "model") return event.stage === "model";
     if (traceFilter === "tools") return event.event_type.includes("tool");
@@ -200,7 +205,14 @@ export function RealWorldTestsPage() {
 
       <div className="rw-result-panel">
         {!run ? <EmptyState title="Select a run" description="Choose an evaluation to inspect its media, outputs, and manual review rubric." /> : <>
-          <div className="rw-selected-head"><div><p className="rw-step">Selected evaluation</p><h2>{run.suite_id}</h2><p>{run.scenario_ids?.join(", ") || "Uploaded media scenario"}</p></div><div className="flex items-center gap-2"><Badge tone={statusTone(run.status)}>{humanStatus(run.status)}</Badge>{active && <Button variant="danger" onClick={() => cancel.mutate(run.run_id)}><Square size={14} />Cancel</Button>}</div></div>
+          <div className="rw-selected-head"><div><p className="rw-step">Selected evaluation</p><h2>{run.suite_id}</h2><p>{run.scenario_ids?.join(", ") || "Uploaded media scenario"}</p></div><div className="flex items-center gap-2"><Badge tone={statusTone(run.status)}>{humanStatus(run.status)}</Badge><Button variant="secondary" onClick={() => downloadRun(run.run_id, "json")}><Download size={14} />JSON</Button><Button variant="secondary" onClick={() => downloadRun(run.run_id, "csv")}><Download size={14} />CSV</Button>{active && <Button variant="danger" onClick={() => cancel.mutate(run.run_id)}><Square size={14} />Cancel</Button>}</div></div>
+          <div className="rw-amd-summary">
+            <div className="rw-amd-chip"><Cpu size={18} /><div><strong>{hardware?.gpu_name || "GPU not reported"}</strong><span>{hardware?.backend || "unknown"}{hardware?.runtime_version ? ` · ${hardware.runtime_version}` : ""}</span></div></div>
+            <Metric icon={<Sparkles size={17} />} value={modelEvents.length} label="Model events" />
+            <Metric icon={<Wrench size={17} />} value={toolEvents.length} label="Tool events" />
+            <Metric icon={<AlertTriangle size={17} />} value={failedEvents.length} label="Failures" />
+            <div className="rw-stat"><span><Clock3 size={17} /></span><strong>{avgModelMs ?? "n/a"}</strong><small>Avg model ms</small></div>
+          </div>
           {run.error_text && <div className="rw-inline-error">{run.error_text}</div>}
           <div className="space-y-4">{run.results?.map((result: any) => <ResultReview key={result.result_id} result={result} runId={run.run_id} onSaved={() => client.invalidateQueries({ queryKey: ["rw-run", selectedRun] })} />)}</div>
         </>}
@@ -218,6 +230,10 @@ export function RealWorldTestsPage() {
 
 function Metric({ icon, value, label }: { icon: React.ReactNode; value: number; label: string }) {
   return <div className="rw-stat"><span>{icon}</span><strong>{value}</strong><small>{label}</small></div>;
+}
+
+function downloadRun(runId: string, format: "json" | "csv") {
+  window.location.href = `/api/real-world/runs/${runId}/export.${format}`;
 }
 
 function TraceEventCard({ event }: { event: any }) {

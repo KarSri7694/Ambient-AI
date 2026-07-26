@@ -6,8 +6,6 @@ import threading
 import queue
 from pathlib import Path
 import os
-import torch
-import gc
 import torchaudio
 import logging
 import hashlib
@@ -23,10 +21,9 @@ from infrastructure.adapter.SQLiteVoiceAdapter import SQLiteVoiceAdapter
 from application.services.system_idle_service import SystemIdleService
 from core.models import AmbientEvent, DiarizationResult, InferenceRequest, TranscriptionResult
 from config import CONFIG
+from infrastructure.accelerator import empty_accelerator_cache, enable_fast_cuda_math, resolve_torch_device
 
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-torch.backends.cudnn.benchmark = True  # helps cuDNN find kernels
+enable_fast_cuda_math()
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -46,6 +43,12 @@ ALWAYS_ON_MODE = CONFIG.get_bool("runtime", "always_on", False)
 
 HF_TOKEN = CONFIG.get_str("audio", "hf_token", "").strip() or None
 MIN_TIME_THRESHOLD = CONFIG.get_float("audio", "min_time_threshold", 0.2)
+ASR_BACKEND = CONFIG.get_str("audio", "asr_backend", "faster_whisper")
+ASR_DEVICE = CONFIG.get_str("audio", "asr_device", "auto")
+FORCED_ALIGNER_DEVICE = CONFIG.get_str("audio", "forced_aligner_device", "auto")
+PREPROCESSOR_DEVICE = CONFIG.get_str("audio", "preprocessor_device", "auto")
+DIARIZATION_DEVICE = CONFIG.get_str("audio", "diarization_device", "auto")
+SPEAKER_DEVICE = CONFIG.get_str("audio", "speaker_device", "auto")
 
 if not UPLOAD_DIR.exists():
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -91,11 +94,22 @@ class AudioAgent:
             self.stage_callback(stage, payload or {})
 
     def preprocess_audio(self, audio_file_path):
-        self.preprocessor = AudioPreprocessor(temp_audio_dir=str(self.temp_audio_dir), cleaned_audio_dir=str(self.cleaned_audio_dir))
+        self.preprocessor = AudioPreprocessor(
+            temp_audio_dir=str(self.temp_audio_dir),
+            cleaned_audio_dir=str(self.cleaned_audio_dir),
+            device=resolve_torch_device(PREPROCESSOR_DEVICE),
+        )
         return self.preprocessor.run(audio_file_path)
     
     def transcribe_audio(self, audio_file_path: str, vad_filter: bool, word_timestamps: bool, batch_size: int = 8)-> list[TranscriptionResult]:
-        self.asr = asr_adapter(model_size=self.asr_model, device="cuda")
+        from infrastructure.adapter.ASR_Adapter import QwenASRAdapter
+
+        adapter_cls = QwenASRAdapter if ASR_BACKEND.lower() in {"llamacpp_qwen", "qwen", "qwen_asr"} else asr_adapter
+        self.asr = adapter_cls(
+            model_size=self.asr_model,
+            device=resolve_torch_device(ASR_DEVICE),
+            forced_aligner_device=resolve_torch_device(FORCED_ALIGNER_DEVICE),
+        )
         try:
             return self.asr.transcribe_audio(audio_file_path, vad_filter, word_timestamps, batch_size)
         finally:
@@ -103,7 +117,7 @@ class AudioAgent:
     
 
     def diarize_audio(self,audio_file_path: str) -> list[DiarizationResult]:
-        self.diarization = PyannoteAdapter(HF_TOKEN)
+        self.diarization = PyannoteAdapter(HF_TOKEN, device=resolve_torch_device(DIARIZATION_DEVICE))
         try:
             return self.diarization.diarize_audio(audio_file_path)
         finally:
@@ -114,7 +128,7 @@ class AudioAgent:
         return db
     
     def compare_embeddings(self, db, diarization_result: list[DiarizationResult]):
-        self.encoder = EcapaVoxcelebAdapter(db)
+        self.encoder = EcapaVoxcelebAdapter(db, device=resolve_torch_device(SPEAKER_DEVICE))
         try:
             waveform, samplerate= torchaudio.load(diarization_result[0].audio_file)
             speaker_audio_tensor = defaultdict(list)
@@ -150,9 +164,7 @@ class AudioAgent:
         self.asr = None
         self.diarization = None
         self.encoder = None
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        gc.collect()
+        empty_accelerator_cache()
         
     def merge_transciptions_and_diarizations(self, transcription: list[TranscriptionResult], diarization_result: list[DiarizationResult]):
         if transcription is None:
@@ -208,9 +220,7 @@ class AudioAgent:
             model_object: Model to be unloaded
         '''
         setattr(self, attr_name, None)
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        gc.collect()
+        empty_accelerator_cache()
         
         
     def run(self, audio_file: str):

@@ -17,7 +17,7 @@ class AudioPreprocessor:
     """
     A class to preprocess audio files by converting them to WAV, reducing noise, and normalizing loudness.
     """
-    def __init__(self, temp_audio_dir="temp_audio",isSample=False, cleaned_audio_dir="cleaned_audio"):
+    def __init__(self, temp_audio_dir="temp_audio",isSample=False, cleaned_audio_dir="cleaned_audio", device="auto"):
         """
         Initializes the AudioPreprocessor with specified directories and model.
 
@@ -28,6 +28,7 @@ class AudioPreprocessor:
         self.extension=".wav"
         self.device_cpu = 'cpu'
         self.device_gpu = 'cuda'
+        self.device = device if device in {"cpu", "cuda"} else (self.device_gpu if torch.cuda.is_available() else self.device_cpu)
         self.TEMP_AUDIO_DIR = temp_audio_dir
         self.isSample = isSample
         self.VOICE_SAMPLES_DIR = "voice_samples"
@@ -108,15 +109,15 @@ class AudioPreprocessor:
         '''
         if self.model is None:
             self.model = get_model('htdemucs_ft')
-            self.model.to(self.device_gpu if torch.cuda.is_available() else self.device_cpu)
+            self.model.to(self.device)
 
         try:
             # Load audio file
             wav, sr = sf.read(input_file)
             wav_tensor = torch.from_numpy(wav.T).float()
             wav_tensor = wav_tensor.unsqueeze(0) # add batch dimension
-            wav_tensor = wav_tensor.to(self.device_gpu if torch.cuda.is_available() else self.device_cpu)
-            separated_sources= apply_model(self.model, wav_tensor, device=self.device_gpu, shifts=5, progress=True)[0] # assuming single channel input
+            wav_tensor = wav_tensor.to(self.device)
+            separated_sources= apply_model(self.model, wav_tensor, device=self.device, shifts=5, progress=True)[0] # assuming single channel input
             cleaned_audio = separated_sources[3]
             
             cleaned_audio_mono = torch.mean(cleaned_audio, dim=0) # convert to mono by averaging channels

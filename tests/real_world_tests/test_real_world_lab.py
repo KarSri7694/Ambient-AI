@@ -149,7 +149,13 @@ mode = active
             self.assertEqual(run["results"][0]["final_response"], "done")
             events = client.get(f"/api/real-world/runs/{run_id}/trace").json()["events"]
             self.assertEqual([event["event_type"] for event in events],
-                             ["fixture_released", "model_request", "tool_finished"])
+                             ["accelerator_detected", "fixture_released", "model_request", "tool_finished"])
+            exported = client.get(f"/api/real-world/runs/{run_id}/export.json")
+            self.assertEqual(exported.status_code, 200)
+            self.assertEqual(exported.json()["run"]["run_id"], run_id)
+            exported_csv = client.get(f"/api/real-world/runs/{run_id}/export.csv")
+            self.assertEqual(exported_csv.status_code, 200)
+            self.assertIn("accelerator_detected", exported_csv.text)
             self.assertTrue(FakeExecutor.workspaces[-1].is_dir())
 
     def test_raw_upload_is_scoped_and_can_form_inline_run(self):

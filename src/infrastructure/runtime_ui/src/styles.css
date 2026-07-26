@@ -281,6 +281,11 @@ button:disabled { cursor: not-allowed; opacity: .55; }
   .rw-selected-head { @apply mb-5 flex flex-col gap-3 border-b border-line pb-5 sm:flex-row sm:items-start sm:justify-between; }
   .rw-selected-head h2 { @apply text-xl font-bold; }
   .rw-selected-head p:not(.rw-step) { @apply mt-1 text-xs text-muted; }
+  .rw-amd-summary { @apply mb-5 grid gap-2 rounded-2xl border border-line bg-soft/65 p-3 sm:grid-cols-2 xl:grid-cols-5; }
+  .rw-amd-chip { @apply flex min-w-0 items-center gap-3 rounded-xl bg-surface p-3 xl:col-span-1; }
+  .rw-amd-chip > svg { @apply shrink-0 text-accent; }
+  .rw-amd-chip strong { @apply block truncate text-sm; }
+  .rw-amd-chip span { @apply mt-0.5 block truncate text-xs text-muted; }
   .rw-inline-error { @apply mb-4 rounded-xl border border-danger/20 bg-danger/10 p-3 text-sm text-danger; }
   .rw-result-card { @apply overflow-hidden rounded-2xl border border-line bg-raised; }
   .rw-result-card > header { @apply flex items-center gap-3 border-b border-line bg-surface px-4 py-3.5; }

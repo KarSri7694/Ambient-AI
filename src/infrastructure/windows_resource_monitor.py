@@ -1,4 +1,3 @@
-import csv
 import ctypes
 import logging
 import subprocess
@@ -43,7 +42,7 @@ class WindowsResourceMonitor(ResourceMonitorPort):
                     **{**self._cached.__dict__, "user_idle": bool(user_idle)}
                 )
             total_ram, available_ram = self._ram_mb()
-            total_vram, free_vram = self._vram_mb()
+            total_vram, free_vram, gpu_info = self._vram_mb()
             available_percent = (available_ram / total_ram * 100.0) if total_ram else 0.0
             current = ResourceSnapshot(
                 captured_at=datetime.now(timezone.utc).isoformat(),
@@ -54,6 +53,10 @@ class WindowsResourceMonitor(ResourceMonitorPort):
                 free_vram_mb=free_vram,
                 gpu_telemetry_available=total_vram is not None and free_vram is not None,
                 user_idle=bool(user_idle),
+                gpu_backend=gpu_info.get("backend"),
+                gpu_name=gpu_info.get("gpu_name"),
+                gpu_runtime_version=gpu_info.get("runtime_version"),
+                gpu_architecture=gpu_info.get("gcn_architecture"),
             )
             self._cached = current
             self._cached_at = now
@@ -68,7 +71,25 @@ class WindowsResourceMonitor(ResourceMonitorPort):
         divisor = 1024 * 1024
         return int(status.ullTotalPhys / divisor), int(status.ullAvailPhys / divisor)
 
-    def _vram_mb(self) -> tuple[Optional[int], Optional[int]]:
+    def _vram_mb(self) -> tuple[Optional[int], Optional[int], dict[str, Optional[str]]]:
+        gpu_info: dict[str, Optional[str]] = {}
+        try:
+            import torch
+            from infrastructure.accelerator import detect_accelerator
+
+            info = detect_accelerator()
+            gpu_info = {
+                "backend": info.backend,
+                "gpu_name": info.gpu_name,
+                "runtime_version": info.runtime_version,
+                "gcn_architecture": info.gcn_architecture,
+            }
+            if torch.cuda.is_available():
+                free_bytes, total_bytes = torch.cuda.mem_get_info(0)
+                divisor = 1024 * 1024
+                return int(total_bytes / divisor), int(free_bytes / divisor), gpu_info
+        except Exception as exc:
+            self.logger.debug("PyTorch GPU telemetry unavailable: %s", exc)
         try:
             completed = subprocess.run(
                 [
@@ -83,9 +104,11 @@ class WindowsResourceMonitor(ResourceMonitorPort):
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             if completed.returncode != 0 or not completed.stdout.strip():
-                return None, None
-            row = next(csv.reader([completed.stdout.splitlines()[0]]))
-            return int(float(row[0].strip())), int(float(row[1].strip()))
+                return None, None, gpu_info
+            row = completed.stdout.splitlines()[0].split(",", 1)
+            if not gpu_info.get("backend") or gpu_info.get("backend") == "cpu":
+                gpu_info["backend"] = "nvidia_cuda"
+            return int(float(row[0].strip())), int(float(row[1].strip())), gpu_info
         except (OSError, ValueError, StopIteration, subprocess.TimeoutExpired) as exc:
             self.logger.debug("NVIDIA VRAM telemetry unavailable: %s", exc)
-            return None, None
+            return None, None, gpu_info

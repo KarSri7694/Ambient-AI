@@ -9,9 +9,10 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class EcapaVoxcelebAdapter(SpeakerIdentityPort):
-    def __init__(self,voice_repo = VoiceRepository, model_name_or_path: str = "spkrec-ecapa-voxceleb/"):
+    def __init__(self,voice_repo = VoiceRepository, model_name_or_path: str = "spkrec-ecapa-voxceleb/", device: str = "auto"):
         self.voice_repo = voice_repo
-        self.classifier = EncoderClassifier.from_hparams(source=model_name_or_path, savedir="pretrained_models/spkrec-ecapa-voxceleb", run_opts={"device": "cuda" if torch.cuda.is_available() else "cpu"})
+        self.device = device if device in {"cpu", "cuda"} else ("cuda" if torch.cuda.is_available() else "cpu")
+        self.classifier = EncoderClassifier.from_hparams(source=model_name_or_path, savedir="pretrained_models/spkrec-ecapa-voxceleb", run_opts={"device": self.device})
 
     def identify_speaker(self, audio_tensor: torch.Tensor, original_label: str, threshold: float = 0.7) -> SpeakerMapping:
         """
@@ -23,7 +24,7 @@ class EcapaVoxcelebAdapter(SpeakerIdentityPort):
         """
         # Perform speaker identification
         embedding = self.classifier.encode_batch(audio_tensor)
-        embedding = embedding.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        embedding = embedding.to(torch.device(self.device))
         known_embeddings = self.voice_repo.get_all_embeddings()
         
         best_match = "UNKNOWN"

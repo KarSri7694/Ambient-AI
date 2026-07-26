@@ -16,7 +16,7 @@ API_BASE_URL = CONFIG.get_str("runtime", "api_base_url", "http://localhost:8080"
 API_KEY = CONFIG.get_str("runtime", "api_key", "testkey")
 
 class WhisperAdapter(TranscriptionPort):
-    def __init__(self, model_size: str = "HIN2HINGLISH", device: str = "cpu"):
+    def __init__(self, model_size: str = "HIN2HINGLISH", device: str = "cpu", forced_aligner_device: str | None = None):
         self.model = WhisperModel(model_size, device=device)
         self.batched_model = BatchedInferencePipeline(self.model)
 
@@ -47,8 +47,10 @@ class WhisperAdapter(TranscriptionPort):
 
  
 class QwenASRAdapter(TranscriptionPort):
-    def __init__(self, model_size: str = "QWEN_ASR", device: str = "cpu"):
+    def __init__(self, model_size: str = "QWEN_ASR", device: str = "cpu", forced_aligner_device: str = "auto"):
         self.model_size = model_size
+        self.device = device
+        self.forced_aligner_device = forced_aligner_device if forced_aligner_device in {"cpu", "cuda"} else device
         self.model = self.load_model()
         self.client = OpenAI(base_url=f"{API_BASE_URL}/v1", api_key=API_KEY) 
     
@@ -126,7 +128,7 @@ class QwenASRAdapter(TranscriptionPort):
             aligner = Qwen3ForcedAligner.from_pretrained(
                 "Qwen/Qwen3-ForcedAligner-0.6B",
                 dtype=torch.bfloat16,
-                device_map="cuda:0",
+                device_map="cuda:0" if self.forced_aligner_device == "cuda" else "cpu",
             )
 
             results = aligner.align(
@@ -152,7 +154,7 @@ class QwenASRAdapter(TranscriptionPort):
         Unloads the Qwen-ASR model from memory.
         """
         requests.post(
-            f"http://localhost:8080/models/unload",
+            f"{API_BASE_URL}/models/unload",
             json={"model": self.model_size},
             timeout=30,
         )
