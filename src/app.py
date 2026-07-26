@@ -1631,6 +1631,12 @@ class AmbientRuntime:
 
 
 if __name__ == "__main__":
+    import atexit
+    from real_world_testing.runtime_lock import RuntimeOwnershipLock
+
+    _runtime_ownership_lock = RuntimeOwnershipLock(PROJECT_ROOT / ".ambient_data" / "runtime.lock", "ambient-runtime")
+    _runtime_ownership_lock.acquire()
+    atexit.register(_runtime_ownership_lock.release)
     model_server_ready, model_server_status = check_model_server()
     if model_server_ready:
         logger.info("Manual llama.cpp router is reachable at %s (%s).", API_BASE_URL, model_server_status)

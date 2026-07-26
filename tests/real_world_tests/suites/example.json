@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "suite_id": "example_real_world",
+  "title": "Example real-world evaluation",
+  "description": "Replace the placeholder media paths or upload an ad-hoc sequence in the UI.",
+  "scenarios": [
+    {
+      "scenario_id": "timed_desktop_sequence",
+      "title": "Timed desktop activity",
+      "modality": "image_sequence",
+      "rubric_notes": "Check continuity, visible-fact extraction, judgment, tool choice, and final response.",
+      "events": [
+        {
+          "offset_seconds": 0,
+          "media_path": "../media/desktop_01.png",
+          "screen_context": {"app_name": "Recorded desktop", "window_title": "First state"}
+        },
+        {
+          "offset_seconds": 10,
+          "media_path": "../media/desktop_02.png",
+          "screen_context": {"app_name": "Recorded desktop", "window_title": "Second state"}
+        }
+      ]
+    },
+    {
+      "scenario_id": "recorded_conversation",
+      "title": "Recorded multi-speaker conversation",
+      "modality": "audio_sequence",
+      "rubric_notes": "Check preprocessing, diarization, speaker identity, transcript accuracy, judgment, and downstream action.",
+      "events": [
+        {"offset_seconds": 0, "media_path": "../media/conversation.wav"}
+      ]
+    }
+  ]
+}

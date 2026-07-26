@@ -3,6 +3,7 @@
 .pytest_cache
 /uploads
 /transcriptions
+/.ambient_data
 *.wav
 *.opus
 *.m4a
@@ -34,6 +35,22 @@ config.ini
 audio_models_preset.ini
 model_details.csv
 Skills/powershell_skill.md
-src/infrastructure/runtime_ui/node_modules/
-src/infrastructure/runtime_ui/.vite/
-src/infrastructure/runtime_ui/*.tsbuildinfo
+
+# Runtime web UI: dependencies, caches, local settings, and generated diagnostics.
+/src/infrastructure/runtime_ui/node_modules/
+/src/infrastructure/runtime_ui/.vite/
+/src/infrastructure/runtime_ui/.vite-temp/
+/src/infrastructure/runtime_ui/.cache/
+/src/infrastructure/runtime_ui/coverage/
+/src/infrastructure/runtime_ui/.nyc_output/
+/src/infrastructure/runtime_ui/*.tsbuildinfo
+/src/infrastructure/runtime_ui/.env
+/src/infrastructure/runtime_ui/.env.*
+!/src/infrastructure/runtime_ui/.env.example
+/src/infrastructure/runtime_ui/npm-debug.log*
+/src/infrastructure/runtime_ui/yarn-debug.log*
+/src/infrastructure/runtime_ui/yarn-error.log*
+/src/infrastructure/runtime_ui/pnpm-debug.log*
+
+# Keep deployable dist assets, but omit large source maps from version control.
+/src/infrastructure/runtime_ui/dist/**/*.map

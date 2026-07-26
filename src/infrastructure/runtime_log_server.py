@@ -7,6 +7,7 @@ import queue
 import threading
 import uuid
 from collections import deque
+from contextlib import asynccontextmanager
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Literal, Optional
@@ -275,8 +276,17 @@ def create_runtime_log_app(
     capture_store: Any = None,
     capture_control: Any = None,
     resource_governor: Any = None,
+    real_world_lab: Any = None,
 ) -> FastAPI:
-    app = FastAPI(title="Ambient Runtime Logs")
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        try:
+            yield
+        finally:
+            if real_world_lab is not None:
+                real_world_lab.shutdown()
+
+    app = FastAPI(title="Ambient Runtime Logs", lifespan=lifespan)
     normalized_media_roots = [Path(root) for root in (media_roots or [])]
     if UI_ROOT.exists():
         app.mount("/runtime-ui", StaticFiles(directory=str(UI_ROOT)), name="runtime_ui")
@@ -298,7 +308,131 @@ def create_runtime_log_app(
 
     @app.get("/healthz")
     def healthz() -> dict[str, Any]:
-        return {"status": "ok", "latest_id": log_buffer.latest_id()}
+        return {"status": "ok", "latest_id": log_buffer.latest_id(), "real_world_lab": real_world_lab is not None}
+
+    @app.get("/api/real-world/suites")
+    def get_real_world_suites() -> dict[str, Any]:
+        if real_world_lab is None:
+            return {"suites": [], "available": False}
+        suites = real_world_lab.suites()
+        return {"suites": suites, "available": True}
+
+    @app.get("/api/real-world/models")
+    def get_real_world_models() -> dict[str, Any]:
+        if real_world_lab is None:
+            raise HTTPException(status_code=503, detail="real_world_lab_unavailable")
+        return real_world_lab.models()
+
+    @app.get("/api/real-world/runs")
+    def get_real_world_runs(limit: int = Query(default=50, ge=1, le=200)) -> dict[str, Any]:
+        if real_world_lab is None:
+            return {"runs": [], "available": False}
+        rows = real_world_lab.store.list_runs(limit=limit)
+        return {"runs": rows, "available": True, "count": len(rows)}
+
+    @app.get("/api/real-world/runs/{run_id}")
+    def get_real_world_run(run_id: str) -> dict[str, Any]:
+        if real_world_lab is None:
+            raise HTTPException(status_code=503, detail="real_world_lab_unavailable")
+        row = real_world_lab.store.get_run(run_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="real_world_run_not_found")
+        return {"run": row}
+
+    @app.get("/api/real-world/runs/{run_id}/trace")
+    def get_real_world_trace(run_id: str, after_sequence: int = Query(default=0, ge=0),
+                             limit: int = Query(default=1000, ge=1, le=5000)) -> dict[str, Any]:
+        if real_world_lab is None:
+            raise HTTPException(status_code=503, detail="real_world_lab_unavailable")
+        if real_world_lab.store.get_run(run_id) is None:
+            raise HTTPException(status_code=404, detail="real_world_run_not_found")
+        events = real_world_lab.store.list_events(run_id, after_sequence=after_sequence, limit=limit)
+        return {"events": events, "count": len(events)}
+
+    @app.get("/api/real-world/runs/{run_id}/events")
+    async def stream_real_world_events(run_id: str, request: Request):
+        if real_world_lab is None or real_world_lab.store.get_run(run_id) is None:
+            raise HTTPException(status_code=404, detail="real_world_run_not_found")
+
+        async def event_stream():
+            sequence = 0
+            while not await request.is_disconnected():
+                events = real_world_lab.store.list_events(run_id, after_sequence=sequence, limit=500)
+                for event in events:
+                    sequence = max(sequence, int(event["sequence"]))
+                    yield f"event: trace\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+                run = real_world_lab.store.get_run(run_id)
+                if run and run["status"] in {"completed", "completed_with_errors", "failed", "cancelled", "interrupted"}:
+                    yield f"event: done\ndata: {json.dumps({'status': run['status']})}\n\n"
+                    return
+                if not events:
+                    yield ": heartbeat\n\n"
+                await asyncio.sleep(0.5)
+        return StreamingResponse(event_stream(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    @app.post("/api/real-world/runs")
+    async def start_real_world_run(request: Request) -> dict[str, Any]:
+        if real_world_lab is None:
+            raise HTTPException(status_code=503, detail="real_world_lab_unavailable")
+        try:
+            run = real_world_lab.start_run(await request.json())
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"run": run}
+
+    @app.post("/api/real-world/runs/{run_id}/cancel")
+    def cancel_real_world_run(run_id: str) -> dict[str, Any]:
+        if real_world_lab is None:
+            raise HTTPException(status_code=503, detail="real_world_lab_unavailable")
+        if not real_world_lab.cancel_run(run_id):
+            raise HTTPException(status_code=409, detail="run_is_not_active")
+        return {"ok": True, "run_id": run_id}
+
+    @app.post("/api/real-world/uploads")
+    async def upload_real_world_media(request: Request, filename: str = Query(...),
+                                      kind: Literal["image", "audio"] = Query(...)) -> dict[str, Any]:
+        if real_world_lab is None:
+            raise HTTPException(status_code=503, detail="real_world_lab_unavailable")
+        try:
+            media = real_world_lab.upload_media(filename=filename, kind=kind, data=await request.body())
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"media": media}
+
+    @app.get("/api/real-world/media/{media_id}")
+    def get_real_world_media(media_id: str):
+        if real_world_lab is None:
+            raise HTTPException(status_code=503, detail="real_world_lab_unavailable")
+        path = real_world_lab.media_path(media_id)
+        if path is None:
+            raise HTTPException(status_code=404, detail="media_not_found")
+        mime_type, _ = mimetypes.guess_type(str(path))
+        return FileResponse(str(path), media_type=mime_type or "application/octet-stream")
+
+    @app.get("/api/real-world/runs/{run_id}/results/{result_id}/media/{index}")
+    def get_real_world_result_media(run_id: str, result_id: str, index: int):
+        if real_world_lab is None:
+            raise HTTPException(status_code=503, detail="real_world_lab_unavailable")
+        path = real_world_lab.scenario_media_path(run_id, result_id, index)
+        if path is None:
+            raise HTTPException(status_code=404, detail="media_not_found")
+        mime_type, _ = mimetypes.guess_type(str(path))
+        return FileResponse(str(path), media_type=mime_type or "application/octet-stream")
+
+    @app.post("/api/real-world/results/{result_id}/review")
+    async def review_real_world_result(result_id: str, request: Request) -> dict[str, Any]:
+        if real_world_lab is None:
+            raise HTTPException(status_code=503, detail="real_world_lab_unavailable")
+        try:
+            review = real_world_lab.store.upsert_review(result_id, await request.json())
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="real_world_result_not_found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"review": review}
 
     @app.get("/api/logs")
     def get_logs(
@@ -993,6 +1127,7 @@ def create_runtime_log_app(
     @app.get("/", response_class=HTMLResponse)
     @app.get("/logs", response_class=HTMLResponse)
     @app.get("/benchmarks", response_class=HTMLResponse)
+    @app.get("/real-world-tests", response_class=HTMLResponse)
     @app.get("/training", response_class=HTMLResponse)
     def view_logs() -> str:
         return _load_dashboard_html()
@@ -1017,6 +1152,7 @@ def start_runtime_log_server(
     capture_store: Any = None,
     capture_control: Any = None,
     resource_governor: Any = None,
+    real_world_lab: Any = None,
 ) -> RuntimeLogBuffer:
     global _SERVER_THREAD, _SERVER
     log_buffer = configure_runtime_log_streaming(max_entries=max_entries)
@@ -1041,6 +1177,7 @@ def start_runtime_log_server(
             capture_store=capture_store,
             capture_control=capture_control,
             resource_governor=resource_governor,
+            real_world_lab=real_world_lab,
         )
 
         def _serve() -> None:

@@ -43,3 +43,7 @@ export function queryString(values: Record<string, string | number | null | unde
   });
   return params.toString();
 }
+
+export async function uploadBinary<T>(path: string, data: Blob): Promise<T> {
+  return (await apiFetch(path, { method: "POST", body: data })).json() as Promise<T>;
+}
