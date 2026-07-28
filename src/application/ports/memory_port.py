@@ -302,6 +302,7 @@ class MemoryPort(ABC):
         *,
         limit: int = 30,
         speaker_ids: Optional[List[str]] = None,
+        source_types: Optional[List[str]] = None,
     ) -> List[SemanticMemoryResult]:
         pass
 

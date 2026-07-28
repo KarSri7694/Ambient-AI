@@ -1,0 +1,6 @@
+# Windows-only live desktop and microphone integration.
+appopener==1.7; platform_system == "Windows"
+PyAudio==0.2.14; platform_system == "Windows"
+PyAutoGUI==0.9.54; platform_system == "Windows"
+pywin32==312; platform_system == "Windows"
+uiautomation==2.0.29; platform_system == "Windows"

@@ -31,14 +31,18 @@ class SemanticMemoryService:
     def is_enabled(self) -> bool:
         return self.semantic_adapter is not None and self.semantic_adapter.is_enabled()
 
-    def ensure_embeddings_synced(self) -> int:
+    def ensure_embeddings_synced(self, *, max_batches: Optional[int] = None) -> int:
         if not self.is_enabled():
             return 0
         synced = 0
+        batches = 0
         while True:
+            if max_batches is not None and batches >= max(0, int(max_batches)):
+                break
             chunks = self.memory.get_chunks_missing_embeddings(limit=self.sync_batch_size)
             if not chunks:
                 break
+            batches += 1
             texts = [chunk.content for chunk in chunks]
             try:
                 embeddings = self.semantic_adapter.embed_texts(texts)
@@ -80,13 +84,14 @@ class SemanticMemoryService:
         limit: Optional[int] = None,
         rerank_limit: Optional[int] = None,
         source_types: Optional[List[str]] = None,
+        sync_max_batches: Optional[int] = 1,
     ) -> List[SemanticMemoryResult]:
         if not self.is_enabled():
             return []
         normalized_query = str(query).strip()
         if not normalized_query:
             return []
-        self.ensure_embeddings_synced()
+        self.ensure_embeddings_synced(max_batches=sync_max_batches)
         try:
             query_embedding = self.semantic_adapter.embed_texts([normalized_query])
         except Exception as exc:
@@ -97,12 +102,14 @@ class SemanticMemoryService:
         if not self._is_valid_embedding(query_embedding[0]):
             self.logger.warning("Semantic query embedding was invalid; skipping retrieval.")
             return []
+        allowed_source_types = [str(item).strip() for item in (source_types or []) if str(item).strip()]
         results = self.memory.vector_search(
             query_embedding[0],
             limit=limit or self.vector_limit,
+            source_types=allowed_source_types or None,
         )
-        if source_types:
-            allowed = {str(item).strip() for item in source_types if str(item).strip()}
+        if allowed_source_types:
+            allowed = set(allowed_source_types)
             results = [result for result in results if result.chunk.source_type in allowed]
         if not results:
             return []

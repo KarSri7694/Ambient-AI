@@ -354,6 +354,7 @@ class ProductionScenarioExecutor:
         from application.services.llm_interaction_service import LLMInteractionService
         from application.services.opportunity_judgment_service import OpportunityJudgmentService
         from application.services.autonomy_coordinator_service import AutonomyCoordinatorService
+        from application.services.semantic_memory_service import SemanticMemoryService
         from infrastructure.adapter.LlamaCppSemanticAdapter import LlamaCppSemanticAdapter
         from infrastructure.adapter.MCPToolAdapter import MCPToolAdapter
         from infrastructure.adapter.SQLiteAutonomyAdapter import SQLiteAutonomyAdapter
@@ -370,6 +371,36 @@ class ProductionScenarioExecutor:
         llm = RealWorldTracingLLMProvider(raw, self.emit)
         autonomy_store = SQLiteAutonomyAdapter(str(self.workspace / "autonomy.db"))
         memory = SQLiteMemoryAdapter(str(self.workspace / "memory.db"), str(self.workspace / "memory"))
+        semantic_memory = None
+        semantic_enabled = parser.getboolean("semantic_memory", "enabled", fallback=False)
+        embedding_model = parser.get("semantic_memory", "embedding_model", fallback="").strip()
+        if semantic_enabled and embedding_model:
+            semantic_adapter = LlamaCppSemanticAdapter(
+                embedding_base_url=parser.get(
+                    "semantic_memory",
+                    "embedding_api_base_url",
+                    fallback="http://127.0.0.1:8081",
+                ),
+                embedding_model=embedding_model,
+                reranker_base_url=parser.get(
+                    "semantic_memory",
+                    "reranker_api_base_url",
+                    fallback=parser.get(
+                        "semantic_memory",
+                        "embedding_api_base_url",
+                        fallback="http://127.0.0.1:8081",
+                    ),
+                ),
+                reranker_model=parser.get("semantic_memory", "reranker_model", fallback="").strip(),
+                timeout_seconds=parser.getfloat("semantic_memory", "timeout_seconds", fallback=5.0),
+            )
+            semantic_memory = SemanticMemoryService(
+                memory=memory,
+                semantic_adapter=semantic_adapter,
+                sync_batch_size=parser.getint("semantic_memory", "sync_batch_size", fallback=32),
+                vector_limit=parser.getint("semantic_memory", "vector_limit", fallback=12),
+                rerank_limit=parser.getint("semantic_memory", "rerank_limit", fallback=6),
+            )
         capture_store = PlainCaptureStore(str(self.workspace / "captures"))
         policy = CapabilityPolicyService(
             store=autonomy_store,
@@ -388,6 +419,12 @@ class ProductionScenarioExecutor:
             browser_agent_model=self.model_roles.get("browser_agent_model"),
             reporter_model=self.model_roles.get("reporter_model"),
             artifact_root=str(self.workspace / "artifacts"), capability_policy=policy,
+            artifact_organizer_enabled=parser.getboolean("artifacts", "organizer_enabled", fallback=True),
+            artifact_candidate_summary_words=parser.getint("artifacts", "candidate_summary_words", fallback=50),
+            artifact_candidate_limit=parser.getint("artifacts", "candidate_limit", fallback=8),
+            artifact_full_candidate_limit=parser.getint("artifacts", "full_candidate_limit", fallback=3),
+            artifact_max_existing_chars=parser.getint("artifacts", "max_existing_artifact_chars", fallback=50000),
+            semantic_memory=semantic_memory,
         )
         await service.initialize_tools()
         coordinator = AutonomyCoordinatorService(

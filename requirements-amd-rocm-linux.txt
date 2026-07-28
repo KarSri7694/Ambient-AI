@@ -1,0 +1,14 @@
+# AMD Radeon Cloud / Linux ROCm profile.
+# This file intentionally avoids NVIDIA CUDA wheels and Windows-only packages.
+-r requirements-common.txt
+-r requirements-audio-common.txt
+-r requirements-faster-whisper-common.txt
+
+--index-url https://download.pytorch.org/whl/rocm6.4
+torch==2.8.0+rocm6.4
+torchaudio==2.8.0+rocm6.4
+torchvision==0.23.0+rocm6.4
+
+# CTranslate2 ROCm and faster-whisper are installed by scripts/install_requirements.py:
+# 1. official rocm-python-wheels-Linux.zip CTranslate2 wheel for this Python
+# 2. faster-whisper with --no-deps so generic PyPI ctranslate2 does not replace it

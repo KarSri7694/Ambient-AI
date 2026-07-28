@@ -1,0 +1,3 @@
+# Backward-compatible alias. ROCm CTranslate2 is installed by
+# scripts/install_requirements.py from the official OpenNMT release wheel archive.
+-r requirements-amd-rocm-linux.txt

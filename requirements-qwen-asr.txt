@@ -1,0 +1,2 @@
+# Optional explicit Qwen ASR backend. Whisper remains the default ASR family.
+qwen-asr==0.0.6

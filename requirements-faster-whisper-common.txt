@@ -1,0 +1,7 @@
+# faster-whisper runtime dependencies except ctranslate2.
+# ROCm installs must install the official CTranslate2 ROCm wheel first, then
+# install faster-whisper with --no-deps so pip does not replace it.
+av==16.0.1
+onnxruntime==1.24.0
+tokenizers==0.22.1
+tqdm==4.67.1

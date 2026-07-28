@@ -1,0 +1,12 @@
+# NVIDIA/CUDA profile for Windows or Linux machines with CUDA.
+-r requirements-common.txt
+-r requirements-audio-common.txt
+-r requirements-faster-whisper-common.txt
+
+--extra-index-url https://download.pytorch.org/whl/cu129
+torch==2.8.0+cu129
+torchaudio==2.8.0+cu129
+
+# faster-whisper uses CTranslate2 and is the preferred Whisper backend on CUDA.
+ctranslate2==4.6.0
+faster-whisper==1.2.1

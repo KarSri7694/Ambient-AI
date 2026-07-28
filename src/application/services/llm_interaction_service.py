@@ -26,6 +26,7 @@ from application.services.capability_policy_service import (
     CapabilityPolicyService,
     PolicyDeniedError,
 )
+from application.services.artifact_organizer_service import ArtifactOrganizer
 from utils.kv_state_handling import KVStateControl
 
 
@@ -131,6 +132,28 @@ class LLMInteractionService:
         "- detailed_report must be highly detailed and miss nothing important from the task outcome.\n"
         "- Do not add any keys other than title, summary, and detailed_report.\n"
     )
+    ARTIFACT_ORGANIZER_PROMPT = (
+        "You organize Ambient AI artifacts for the user.\n\n"
+        "Given one new report and candidate existing artifacts, decide whether to merge into an existing artifact "
+        "or create a new artifact.\n\n"
+        "Return JSON only with exactly these keys:\n"
+        "{\n"
+        '  "action": "merge_existing or create_new",\n'
+        '  "target_artifact_id": "existing artifact id, or empty string for create_new",\n'
+        '  "final_title": "best artifact title",\n'
+        '  "updated_short_summary": "short summary of the full artifact",\n'
+        '  "updated_detailed_summary": "detailed summary of the full artifact",\n'
+        '  "merged_content": "complete markdown body for the artifact content section",\n'
+        '  "dedupe_notes": ["specific duplicated facts skipped"],\n'
+        '  "reason": "brief reason for the selected artifact or new artifact"\n'
+        "}\n\n"
+        "Rules:\n"
+        "- Merge only when the existing artifact is clearly about the same topic, lecture, project, person, or workflow.\n"
+        "- Remove duplicate information; preserve prior useful details.\n"
+        "- If merging, merged_content must contain the full updated artifact body, not just the new addition.\n"
+        "- If no candidate is a good match, use action=create_new and leave target_artifact_id empty.\n"
+        "- Do not invent facts not present in the new report or existing artifact content.\n"
+    )
 
     def __init__(
         self,
@@ -144,6 +167,12 @@ class LLMInteractionService:
         reporter_model: Optional[str] = None,
         artifact_root: Optional[str] = None,
         capability_policy: Optional[CapabilityPolicyService] = None,
+        artifact_organizer_enabled: bool = False,
+        artifact_candidate_summary_words: int = 50,
+        artifact_candidate_limit: int = 8,
+        artifact_full_candidate_limit: int = 3,
+        artifact_max_existing_chars: int = 50_000,
+        semantic_memory: Optional[Any] = None,
     ):
         self.llm = llm_provider
         self.tool_bridge = tool_bridge
@@ -161,6 +190,18 @@ class LLMInteractionService:
         self.capability_policy = capability_policy
         self.artifact_root = Path(artifact_root) if artifact_root else (self.PARENT_DIR / "artifacts")
         self.artifact_root.mkdir(parents=True, exist_ok=True)
+        self.artifact_organizer = (
+            ArtifactOrganizer(
+                self.artifact_root,
+                candidate_summary_words=artifact_candidate_summary_words,
+                candidate_limit=artifact_candidate_limit,
+                full_candidate_limit=artifact_full_candidate_limit,
+                max_existing_artifact_chars=artifact_max_existing_chars,
+                semantic_memory=semantic_memory,
+            )
+            if artifact_organizer_enabled
+            else None
+        )
 
     @property
     def _frame(self) -> AgentFrame:
@@ -991,16 +1032,22 @@ class LLMInteractionService:
         detailed_report = str(parsed.get("detailed_report") or "").strip()
         if not title or not summary or not detailed_report:
             return None
-        artifact_path = self._save_report_artifact(
+        artifact = await self._save_or_merge_report_artifact(
+            model=report_model,
             title=title,
             summary=summary,
             detailed_report=detailed_report,
+            source_name=source_name,
         )
         report = {
             "title": title,
             "summary": summary,
-            "artifact_path": str(artifact_path),
-            "artifact_filename": artifact_path.name,
+            "artifact_path": str(artifact["artifact_path"]),
+            "artifact_filename": Path(str(artifact["artifact_path"])).name,
+            "artifact_id": artifact.get("artifact_id"),
+            "artifact_action": artifact.get("artifact_action"),
+            "artifact_reason": artifact.get("artifact_reason"),
+            "dedupe_notes": artifact.get("dedupe_notes", []),
             "source": source_name,
             "tools_used": deduped_tools,
             "created_at": datetime.now().isoformat(),
@@ -1078,6 +1125,81 @@ class LLMInteractionService:
             if getattr(delta, "content", None):
                 text_parts.append(delta.content)
         return "".join(text_parts).strip()
+
+    async def _save_or_merge_report_artifact(
+        self,
+        *,
+        model: str,
+        title: str,
+        summary: str,
+        detailed_report: str,
+        source_name: str,
+    ) -> Dict[str, Any]:
+        source_ref = f"{source_name}/{datetime.now().isoformat(timespec='seconds')}"
+        if self.artifact_organizer is None:
+            path = self._save_report_artifact(
+                title=title,
+                summary=summary,
+                detailed_report=detailed_report,
+            )
+            return {
+                "artifact_id": None,
+                "artifact_path": str(path),
+                "artifact_action": "created",
+                "artifact_reason": "Artifact organizer disabled.",
+                "dedupe_notes": [],
+            }
+
+        candidates = self.artifact_organizer.candidates_for(
+            title=title,
+            summary=summary,
+            detailed_report=detailed_report,
+        )
+        if not candidates:
+            return self.artifact_organizer.save_new(
+                title=title,
+                summary=summary,
+                detailed_report=detailed_report,
+                source_ref=source_ref,
+            )
+
+        payload = {
+            "new_report": {
+                "title": title,
+                "summary": summary,
+                "detailed_report": detailed_report,
+                "source": source_name,
+            },
+            "candidate_artifacts": [
+                candidate.prompt_summary(
+                    summary_words=self.artifact_organizer.candidate_summary_words,
+                )
+                for candidate in candidates
+            ],
+            "existing_artifact_contents": self.artifact_organizer.build_existing_payload(candidates),
+        }
+        decision_text = await self._run_json_prompt(
+            model=model,
+            system_prompt=self.ARTIFACT_ORGANIZER_PROMPT,
+            user_payload=payload,
+        )
+        decision = self._safe_parse_json(decision_text)
+        if not isinstance(decision, dict):
+            fallback = self.artifact_organizer.save_new(
+                title=title,
+                summary=summary,
+                detailed_report=detailed_report,
+                source_ref=source_ref,
+            )
+            fallback["artifact_reason"] = "Organizer model returned malformed JSON; created a new artifact safely."
+            return fallback
+        return self.artifact_organizer.apply_decision(
+            decision=decision,
+            fallback_title=title,
+            fallback_summary=summary,
+            fallback_detailed_report=detailed_report,
+            source_ref=source_ref,
+        )
 
     def _save_report_artifact(self, *, title: str, summary: str, detailed_report: str) -> Path:
         safe_title = self._sanitize_artifact_name(title)

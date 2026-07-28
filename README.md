@@ -104,6 +104,28 @@ python -m venv venv
 pip install -r requirements.txt
 ```
 
+`requirements.txt` is intentionally a safe default and does not install CUDA,
+ROCm, or Windows desktop automation packages. For hardware-specific installs use:
+
+```powershell
+python scripts\install_requirements.py --target windows-cpu
+python scripts\install_requirements.py --target nvidia-cuda
+python scripts\install_requirements.py --target rocm-windows
+```
+
+On Radeon Cloud Linux:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python scripts/install_requirements.py --target rocm-linux
+```
+
+Whisper is the default ASR family. NVIDIA installs use `faster-whisper` with
+CUDA CTranslate2. ROCm installs use the official OpenNMT CTranslate2 ROCm wheel
+and then install `faster-whisper` without dependencies so pip does not replace
+the ROCm wheel. Qwen ASR is optional and only used when explicitly selected.
+
 ## Configuration
 Important environment variables:
 
@@ -153,6 +175,14 @@ originating conversation and Reports.
 
 The dashboard has no login or security database and is deliberately restricted to
 loopback (`127.0.0.1`, `localhost`, or `::1`). Non-loopback binding is refused.
+
+### Organized Artifacts
+
+When Ambient AI surfaces a user-facing report, the artifact organizer checks
+existing Markdown artifacts under `USER_DATA_DIR/artifacts` before saving. Related
+reports are merged into the existing artifact, summaries are refreshed, duplicate
+facts are skipped, and each artifact records its last AI edit time. Configure this
+in the `[artifacts]` section of `config.ini`.
 
 The React dashboard also includes an Interaction Logs tab backed by
 `interaction_logs.db`. Each model request is paired with its response, can be sorted

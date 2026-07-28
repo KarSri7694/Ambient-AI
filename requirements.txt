@@ -1,5 +1,4 @@
--r requirements-base.txt
-
---extra-index-url https://download.pytorch.org/whl/cu129
-torch==2.8.0+cu129
-torchaudio==2.8.0+cu129
+# Safe default install: no CUDA wheels and no Windows-only desktop automation.
+-r requirements-common.txt
+-r requirements-audio-common.txt
+-r requirements-dev.txt

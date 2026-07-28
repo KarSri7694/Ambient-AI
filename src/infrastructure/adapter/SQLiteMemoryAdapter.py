@@ -754,7 +754,10 @@ class SQLiteMemoryAdapter(MemoryPort):
         *,
         limit: int = 30,
         speaker_ids: Optional[List[str]] = None,
+        source_types: Optional[List[str]] = None,
     ) -> List[SemanticMemoryResult]:
+        safe_limit = max(1, int(limit))
+        allowed_source_types = [str(item).strip() for item in (source_types or []) if str(item).strip()]
         with self._managed_connection() as conn:
             if not self._vector_table_exists(conn):
                 return []
@@ -763,23 +766,44 @@ class SQLiteMemoryAdapter(MemoryPort):
                 return []
             serialized_query = self._serialize_embedding(query_embedding)
 
-            base_query = """
-                SELECT
-                    semantic_memory_chunks.*,
-                    semantic_memory_embeddings.distance AS distance
-                FROM semantic_memory_embeddings
-                JOIN semantic_memory_chunks
-                    ON semantic_memory_chunks.rowid = semantic_memory_embeddings.rowid
-                WHERE semantic_memory_embeddings.embedding MATCH ?
-                  AND k = ?
-            """
-            params: List[object] = [serialized_query, limit]
-            if speaker_ids:
-                placeholders = ", ".join("?" for _ in speaker_ids)
-                base_query += f" AND (semantic_memory_chunks.speaker_id IS NULL OR semantic_memory_chunks.speaker_id IN ({placeholders}))"
-                params.extend(speaker_ids)
-            base_query += " ORDER BY semantic_memory_embeddings.distance ASC"
-            rows = conn.execute(base_query, params).fetchall()
+            def _run_search(k_value: int) -> list[sqlite3.Row]:
+                base_query = """
+                    SELECT
+                        semantic_memory_chunks.*,
+                        semantic_memory_embeddings.distance AS distance
+                    FROM semantic_memory_embeddings
+                    JOIN semantic_memory_chunks
+                        ON semantic_memory_chunks.rowid = semantic_memory_embeddings.rowid
+                    WHERE semantic_memory_embeddings.embedding MATCH ?
+                      AND k = ?
+                """
+                params: List[object] = [serialized_query, max(1, int(k_value))]
+                if speaker_ids:
+                    placeholders = ", ".join("?" for _ in speaker_ids)
+                    base_query += f" AND (semantic_memory_chunks.speaker_id IS NULL OR semantic_memory_chunks.speaker_id IN ({placeholders}))"
+                    params.extend(speaker_ids)
+                if allowed_source_types:
+                    placeholders = ", ".join("?" for _ in allowed_source_types)
+                    base_query += f" AND semantic_memory_chunks.source_type IN ({placeholders})"
+                    params.extend(allowed_source_types)
+                base_query += " ORDER BY semantic_memory_embeddings.distance ASC"
+                return conn.execute(base_query, params).fetchall()
+
+            search_limits = [safe_limit]
+            if allowed_source_types:
+                search_limits.extend(
+                    [
+                        max(safe_limit * 5, 50),
+                        max(safe_limit * 25, 250),
+                        max(safe_limit * 100, 1000),
+                    ]
+                )
+            rows: list[sqlite3.Row] = []
+            for search_limit in dict.fromkeys(search_limits):
+                rows = _run_search(search_limit)
+                if len(rows) >= safe_limit or not allowed_source_types:
+                    break
+            rows = rows[:safe_limit]
 
         return [
             SemanticMemoryResult(

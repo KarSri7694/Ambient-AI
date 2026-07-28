@@ -100,6 +100,11 @@ TRAINING_DATA_DB_PATH = Path(
 )
 CURRENT_RESPONSE_PATH = PROJECT_ROOT / "database" / "current_llm_response.md"
 ARTIFACTS_ROOT = USER_DATA_DIR / "artifacts"
+ARTIFACT_ORGANIZER_ENABLED = CONFIG.get_bool("artifacts", "organizer_enabled", True)
+ARTIFACT_CANDIDATE_SUMMARY_WORDS = CONFIG.get_int("artifacts", "candidate_summary_words", 50)
+ARTIFACT_CANDIDATE_LIMIT = CONFIG.get_int("artifacts", "candidate_limit", 8)
+ARTIFACT_FULL_CANDIDATE_LIMIT = CONFIG.get_int("artifacts", "full_candidate_limit", 3)
+ARTIFACT_MAX_EXISTING_CHARS = CONFIG.get_int("artifacts", "max_existing_artifact_chars", 50000)
 VOICE_DB_PATH = USER_DATA_DIR / "database" / "voice_database.db"
 PASSIVE_OBSERVER_ROOT = USER_DATA_DIR / "passive_observer"
 PASSIVE_OBSERVER_ENABLED = CONFIG.get_bool("passive_observer", "enabled", False)
@@ -153,6 +158,7 @@ RERANKER_MODEL = CONFIG.get_model("reranker_model", "", section="semantic_memory
 SEMANTIC_VECTOR_LIMIT = CONFIG.get_int("semantic_memory", "vector_limit", 12)
 SEMANTIC_RERANK_LIMIT = CONFIG.get_int("semantic_memory", "rerank_limit", 6)
 SEMANTIC_SYNC_BATCH_SIZE = CONFIG.get_int("semantic_memory", "sync_batch_size", 32)
+SEMANTIC_TIMEOUT_SECONDS = CONFIG.get_float("semantic_memory", "timeout_seconds", 5.0)
 SEMANTIC_DEDUPE_ENABLED = CONFIG.get_bool("semantic_dedupe", "enabled", True)
 SEMANTIC_DEDUPE_MODEL = CONFIG.get_model("model", DEFAULT_MODEL, section="semantic_dedupe")
 SEMANTIC_DEDUPE_CANDIDATE_LIMIT = CONFIG.get_int("semantic_dedupe", "candidate_limit", 8)
@@ -557,18 +563,6 @@ class AmbientRuntime:
             profile_dir=BROWSER_PROFILE_DIR,
             denied_tool_names=BROWSER_DENIED_TOOL_NAMES,
         )
-        llm_service = LLMInteractionService(
-            llm_provider=logged_llm,
-            tool_bridge=tool_bridge,
-            browser_tool_bridge=browser_tool_bridge,
-            browser_agent_model=BROWSER_AGENT_MODEL,
-            browser_task_timeout_seconds=BROWSER_TASK_TIMEOUT_SECONDS,
-            browser_headless=BROWSER_HEADLESS,
-            scheduled_task_service=scheduled_task_service,
-            reporter_model=REPORTER_MODEL,
-            artifact_root=str(ARTIFACTS_ROOT),
-            capability_policy=capability_policy,
-        )
         memory_store = SQLiteMemoryAdapter(
             db_path=str(MEMORY_DB_PATH),
             memory_root=str(MEMORY_ROOT),
@@ -581,6 +575,7 @@ class AmbientRuntime:
                 embedding_model=EMBEDDING_MODEL,
                 reranker_base_url=RERANKER_API_BASE_URL,
                 reranker_model=RERANKER_MODEL,
+                timeout_seconds=SEMANTIC_TIMEOUT_SECONDS,
             )
             semantic_memory = SemanticMemoryService(
                 memory=memory_store,
@@ -589,6 +584,24 @@ class AmbientRuntime:
                 vector_limit=SEMANTIC_VECTOR_LIMIT,
                 rerank_limit=SEMANTIC_RERANK_LIMIT,
             )
+        llm_service = LLMInteractionService(
+            llm_provider=logged_llm,
+            tool_bridge=tool_bridge,
+            browser_tool_bridge=browser_tool_bridge,
+            browser_agent_model=BROWSER_AGENT_MODEL,
+            browser_task_timeout_seconds=BROWSER_TASK_TIMEOUT_SECONDS,
+            browser_headless=BROWSER_HEADLESS,
+            scheduled_task_service=scheduled_task_service,
+            reporter_model=REPORTER_MODEL,
+            artifact_root=str(ARTIFACTS_ROOT),
+            capability_policy=capability_policy,
+            artifact_organizer_enabled=ARTIFACT_ORGANIZER_ENABLED,
+            artifact_candidate_summary_words=ARTIFACT_CANDIDATE_SUMMARY_WORDS,
+            artifact_candidate_limit=ARTIFACT_CANDIDATE_LIMIT,
+            artifact_full_candidate_limit=ARTIFACT_FULL_CANDIDATE_LIMIT,
+            artifact_max_existing_chars=ARTIFACT_MAX_EXISTING_CHARS,
+            semantic_memory=semantic_memory,
+        )
         semantic_dedupe = SemanticDeduplicationService(
             memory=memory_store,
             llm_provider=logged_llm,

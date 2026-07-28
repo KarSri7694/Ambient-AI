@@ -43,7 +43,7 @@ ALWAYS_ON_MODE = CONFIG.get_bool("runtime", "always_on", False)
 
 HF_TOKEN = CONFIG.get_str("audio", "hf_token", "").strip() or None
 MIN_TIME_THRESHOLD = CONFIG.get_float("audio", "min_time_threshold", 0.2)
-ASR_BACKEND = CONFIG.get_str("audio", "asr_backend", "faster_whisper")
+ASR_BACKEND = CONFIG.get_str("audio", "asr_backend", "whisper_auto")
 ASR_DEVICE = CONFIG.get_str("audio", "asr_device", "auto")
 FORCED_ALIGNER_DEVICE = CONFIG.get_str("audio", "forced_aligner_device", "auto")
 PREPROCESSOR_DEVICE = CONFIG.get_str("audio", "preprocessor_device", "auto")
