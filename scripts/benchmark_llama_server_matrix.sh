@@ -126,15 +126,25 @@ CSV
 
 wait_for_server() {
   local deadline=$((SECONDS + STARTUP_TIMEOUT))
-  until curl -fsS "http://$HOST:$PORT/v1/models" >/dev/null 2>&1; do
-    if [[ $SECONDS -ge $deadline ]]; then
-      return 1
-    fi
+  while [[ $SECONDS -lt $deadline ]]; do
     if [[ -n "${SERVER_PID:-}" ]] && ! kill -0 "$SERVER_PID" 2>/dev/null; then
       return 1
     fi
+    if curl -fsS "http://$HOST:$PORT/v1/models" >/dev/null 2>&1; then
+      return 0
+    fi
     sleep 1
   done
+  return 1
+}
+
+assert_port_free() {
+  if curl -fsS "http://$HOST:$PORT/v1/models" >/dev/null 2>&1 || curl -fsS "http://$HOST:$PORT/health" >/dev/null 2>&1; then
+    echo "Port $HOST:$PORT already has a responding llama-server/API process." >&2
+    echo "Stop it first, or run this benchmark with a different PORT." >&2
+    echo "Example: pkill -f llama-server" >&2
+    exit 2
+  fi
 }
 
 wait_for_idle() {
@@ -297,6 +307,8 @@ print(buf.getvalue().strip())
 PY
 }
 
+assert_port_free
+
 for entry in "${CONFIGS[@]}"; do
   name="${entry%%::*}"
   cfg_args="${entry#*::}"
@@ -317,7 +329,13 @@ for entry in "${CONFIGS[@]}"; do
   # shellcheck disable=SC2206
   cfg_array=($cfg_args)
   server_command+=("${cfg_array[@]}")
-  "${server_command[@]}" > "$log_file" 2>&1 &
+  {
+    printf 'benchmark config: %s\n' "$name"
+    printf 'server command:'
+    printf ' %q' "${server_command[@]}"
+    printf '\n'
+  } > "$log_file"
+  "${server_command[@]}" >> "$log_file" 2>&1 &
   SERVER_PID="$!"
 
   if ! wait_for_server; then
