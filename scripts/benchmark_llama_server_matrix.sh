@@ -16,6 +16,7 @@ set -euo pipefail
 #   OUT_DIR=.ambient_data/benchmarks
 #   RUNS=3
 #   WARMUPS=1
+#   MAX_TOKENS=1024
 #
 # Custom configs:
 #   CONFIGS=("name::llama-server args" "other::llama-server args")
@@ -33,6 +34,7 @@ WARMUPS="${WARMUPS:-1}"
 STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-120}"
 REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-900}"
 LOG_SETTLE_SECONDS="${LOG_SETTLE_SECONDS:-0.25}"
+MAX_TOKENS="${MAX_TOKENS:-1024}"
 
 if [[ -z "$LLAMA_SERVER" || ! -x "$LLAMA_SERVER" ]]; then
   echo "Set LLAMA_SERVER to an executable llama-server path." >&2
@@ -140,10 +142,11 @@ run_turn() {
   local messages_file="$1"
   local prompt="$2"
   local response_file="$3"
-  python3 - "$HOST" "$PORT" "$API_KEY" "$REQUEST_TIMEOUT" "$messages_file" "$prompt" "$response_file" <<'PY'
+  local max_tokens="$4"
+  python3 - "$HOST" "$PORT" "$API_KEY" "$REQUEST_TIMEOUT" "$messages_file" "$prompt" "$response_file" "$max_tokens" <<'PY'
 import json, sys, time, urllib.request
 
-host, port, api_key, timeout, messages_path, prompt, response_path = sys.argv[1:8]
+host, port, api_key, timeout, messages_path, prompt, response_path, max_tokens = sys.argv[1:9]
 timeout = float(timeout)
 with open(messages_path, "r", encoding="utf-8") as handle:
     messages = json.load(handle)
@@ -151,6 +154,7 @@ messages.append({"role": "user", "content": prompt})
 body = json.dumps({
     "model": "local-model",
     "messages": messages,
+    "max_tokens": int(max_tokens),
     "stream": True,
     "stream_options": {"include_usage": True},
 }).encode("utf-8")
@@ -177,7 +181,10 @@ with urllib.request.urlopen(request, timeout=timeout) as response:
         for key in ("prompt_ms", "prompt_n", "prompt_per_second", "predicted_ms", "predicted_n", "predicted_per_second", "timings"):
             if key in chunk:
                 server_timings[key] = chunk[key]
-        delta = chunk.get("choices", [{}])[0].get("delta", {}).get("content")
+        choices = chunk.get("choices") or []
+        delta = None
+        if choices:
+            delta = choices[0].get("delta", {}).get("content")
         if delta:
             if first is None:
                 first = time.perf_counter()
@@ -272,7 +279,7 @@ for entry in "${CONFIGS[@]}"; do
       response_file="$TMP_ROOT/response-$name-$run_index-$turn_index.json"
       status="completed"
       error=""
-      if ! run_turn "$messages_file" "$prompt" "$response_file"; then
+      if ! run_turn "$messages_file" "$prompt" "$response_file" "$MAX_TOKENS"; then
         status="failed"
         error="request failed"
         echo "{}" > "$response_file"
