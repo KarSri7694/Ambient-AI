@@ -162,6 +162,15 @@ the configured `browser_agent_model` and must end with
 returns control to the main model while retaining the browser session; retained
 sessions close during application shutdown.
 
+Local file-system and computer-control tools follow the same delegated-agent
+pattern but live under `src/local_control/` for maintenance. The main model sees
+`use_filesystem(task, granted_paths)` for read-only access inside explicit user
+path grants. It sees `request_computer_use(task, reason)` for desktop control,
+but that tool only creates a pending `computer.use` approval. The computer-use
+agent is deployed only after the local user clicks Allow computer use in the web
+UI. `Shift+Esc` terminates the active computer-use session only; it does not stop
+the Ambient AI runtime.
+
 Do not commit real secrets in `mcp.json` or related config.
 
 ### Direct Chat

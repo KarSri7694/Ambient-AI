@@ -224,6 +224,40 @@ Requirements:
                     event.event_id,
                     self._safe_json(event.payload_json).get("capture_mode", "lightweight"),
                 )
+            if event.event_type == "approval_granted" and self._is_computer_use_approval(event):
+                payload = self._safe_json(event.payload_json)
+                arguments = payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {}
+                task = str(arguments.get("task") or "").strip()
+                if not task:
+                    self.store.complete_event(
+                        event.event_id,
+                        status="dead_letter",
+                        error_text="approved computer-use request had no task",
+                    )
+                    return {
+                        "processed": True,
+                        "event_id": event.event_id,
+                        "outcome": "invalid_computer_use_approval",
+                    }
+                result = await llm_service.deploy_computer_agent(
+                    task=task,
+                    approval_id=event.source_ref,
+                    event_callback=event_callback,
+                )
+                if hasattr(self.store, "audit"):
+                    self.store.audit(
+                        "ambient_agent",
+                        "computer_use.deployed",
+                        event.source_ref,
+                        {"event_id": event.event_id, "result": result[:2000]},
+                    )
+                self.store.complete_event(event.event_id)
+                return {
+                    "processed": True,
+                    "event_id": event.event_id,
+                    "outcome": "computer_use_completed",
+                    "result": result,
+                }
             with interaction_trace(
                 "autonomy_judgment",
                 {"event_id": event.event_id, "privacy_label": event.privacy_label},
@@ -536,6 +570,13 @@ Requirements:
             created_at=now,
             updated_at=now,
             metadata_json=json.dumps(payload, ensure_ascii=False),
+        )
+
+    def _is_computer_use_approval(self, event: AmbientEvent) -> bool:
+        payload = self._safe_json(event.payload_json)
+        return (
+            str(payload.get("approval_kind") or "") == "computer_use_deployment"
+            and str(payload.get("tool_name") or "") == "request_computer_use"
         )
 
     @staticmethod

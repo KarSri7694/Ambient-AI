@@ -554,6 +554,48 @@ async def schedule_task_at(
     """Schedule a task for an exact future date and time."""
     # Implemented in LLMInteractionService so interaction/chat metadata is retained.
     pass
+
+
+@mcp.tool
+async def use_filesystem(
+    task: Annotated[
+        str,
+        "Detailed filesystem task to perform only inside the user-granted paths",
+    ],
+    granted_paths: Annotated[
+        list[str],
+        "Absolute file or folder paths explicitly granted by the user for this task",
+    ],
+) -> str:
+    """
+    Delegate one read-only local filesystem task to the dedicated filesystem agent.
+
+    The delegated agent can only list, stat, read, and search inside the granted
+    paths. It cannot delete, overwrite, move, rename, run shell commands, or
+    access ungranted paths. Implemented by LLMInteractionService.
+    """
+    pass
+
+
+@mcp.tool
+async def request_computer_use(
+    task: Annotated[
+        str,
+        "Detailed desktop-control task, stopping conditions, and expected result",
+    ],
+    reason: Annotated[
+        str,
+        "Short explanation shown to the user before they allow computer use",
+    ],
+) -> str:
+    """
+    Request permission to deploy the dedicated computer-use agent.
+
+    This never starts desktop control by itself. The task is recorded as a
+    pending approval and runs only after the local user allows it in the Ambient
+    AI web UI. Implemented by LLMInteractionService.
+    """
+    pass
     
 @mcp.tool
 def load_agent(model_name: Annotated[str, "The name of the model to load"], message: Annotated[str, "Task to be performed by the model"]) -> str:

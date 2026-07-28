@@ -60,6 +60,14 @@ class CapabilityRegistry:
 
         if lowered == "capture_screen" or lowered.startswith(("memory_", "context_")):
             return self._d(name, "context.observe", "context", "read", False, True, "low", ("screen",), "result")
+        if lowered == "use_filesystem" or lowered.startswith("fs_"):
+            return self._d(name, "filesystem.read", "local_control", "read", False, True, "medium", ("filesystem",), "result", 2)
+        if lowered == "request_computer_use":
+            return self._d(name, "computer.use", "local_control", "write", True, False, "critical", ("screen", "keyboard", "mouse"), "explicit", 4)
+        if lowered.startswith("computer_"):
+            if lowered == "computer_inspect":
+                return self._d(name, "computer.observe", "local_control", "read", False, True, "high", ("screen",), "screen_state", 2)
+            return self._d(name, "computer.mutate", "local_control", "write", True, False, "critical", ("screen", "keyboard", "mouse"), "screen_state", 4)
         if lowered.startswith("browser_"):
             read_only_browser = any(
                 token in lowered
@@ -165,6 +173,12 @@ class CapabilityPolicyService:
         "system.model": "deny",
         "finance.read": "ask",
         "finance.mutate": "deny",
+        "filesystem.read": "ask",
+        "filesystem.write": "deny",
+        "computer.observe": "ask",
+        "computer.use": "ask",
+        "computer.mutate": "deny",
+        "computer.critical": "deny",
         "unclassified": "deny",
     }
     DEFAULT_CONSTRAINTS = {

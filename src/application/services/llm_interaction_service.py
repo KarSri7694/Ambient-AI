@@ -5,7 +5,7 @@ import logging
 import re
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -27,6 +27,10 @@ from application.services.capability_policy_service import (
     PolicyDeniedError,
 )
 from application.services.artifact_organizer_service import ArtifactOrganizer
+from core.models import ApprovalGrant
+from local_control.computer import ComputerControlSession
+from local_control.filesystem import FilesystemControlSession
+from local_control.safety import ComputerControlTerminated
 from utils.kv_state_handling import KVStateControl
 
 
@@ -38,6 +42,7 @@ class AgentFrame:
     tools: Optional[List[Dict[str, Any]]] = None
     tool_bridge: Optional[Any] = None
     browser_exit_requested: Optional[bool] = None
+    computer_exit_requested: Optional[bool] = None
 
 
 class LLMInteractionService:
@@ -51,7 +56,18 @@ class LLMInteractionService:
     AGENT_DEPTH = 0
     MAX_AGENT_DEPTH = 3
     MAX_ITERATIONS = 25
-    TERMINAL_TOOL_NAMES = {"restore_previous_agent", "finish_browser_task"}
+    BLOCKED_COMPUTER_TASK_RE = re.compile(
+        r"\b(delete|erase|format|wipe|shutdown|restart|log\s*out|lock\s+screen|"
+        r"change\s+password|credential|payment|checkout|purchase|transfer\s+money)\b",
+        re.IGNORECASE,
+    )
+    TERMINAL_TOOL_NAMES = {
+        "restore_previous_agent",
+        "finish_browser_task",
+        "finish_filesystem_task",
+        "finish_computer_task",
+    }
+    LOCAL_CONTROL_REQUEST_TOOLS = {"request_computer_use"}
     FINISH_BROWSER_TASK_TOOL = {
         "type": "function",
         "function": {
@@ -78,6 +94,38 @@ class LLMInteractionService:
                     },
                 },
                 "required": ["exit_browser", "status", "summary"],
+                "additionalProperties": False,
+            },
+        },
+    }
+    FINISH_FILESYSTEM_TASK_TOOL = {
+        "type": "function",
+        "function": {
+            "name": "finish_filesystem_task",
+            "description": "Finish the delegated filesystem task and return control to the main model.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string"},
+                    "summary": {"type": "string"},
+                },
+                "required": ["status", "summary"],
+                "additionalProperties": False,
+            },
+        },
+    }
+    FINISH_COMPUTER_TASK_TOOL = {
+        "type": "function",
+        "function": {
+            "name": "finish_computer_task",
+            "description": "Finish the delegated computer-use task and return control to Ambient AI.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string"},
+                    "summary": {"type": "string"},
+                },
+                "required": ["status", "summary"],
                 "additionalProperties": False,
             },
         },
@@ -132,6 +180,30 @@ class LLMInteractionService:
         "- detailed_report must be highly detailed and miss nothing important from the task outcome.\n"
         "- Do not add any keys other than title, summary, and detailed_report.\n"
     )
+    FILESYSTEM_AGENT_PROMPT = (
+        "You are a dedicated read-only filesystem sub-agent working on one delegated task.\n"
+        "\n"
+        "Rules:\n"
+        "- Operate only inside the user-granted paths available to your tools.\n"
+        "- Do not request shell commands, deletion, overwrites, moves, renames, chmod, or hidden path expansion.\n"
+        "- Prefer listing and stat before reading unfamiliar files.\n"
+        "- Stop when the requested information has been found or the grant is insufficient.\n"
+        "- When the task reaches a terminal state, call finish_filesystem_task exactly once.\n"
+        "- In status and summary, report concrete files inspected and any blocker.\n"
+    )
+    COMPUTER_AGENT_PROMPT = (
+        "You are a dedicated computer-use sub-agent working on one user-approved desktop-control task.\n"
+        "\n"
+        "Rules:\n"
+        "- Perform only the approved task supplied by Ambient AI.\n"
+        "- Inspect the foreground window before interacting and after meaningful actions.\n"
+        "- Do not use shell commands, system shutdown/logout/lock, credential entry, payment, checkout, "
+        "or destructive file-manager actions.\n"
+        "- Do not bypass authentication, CAPTCHA, two-factor authentication, security warnings, or confirmation screens.\n"
+        "- If Shift+Esc terminates your session, stop immediately.\n"
+        "- When the task reaches a terminal state, call finish_computer_task exactly once.\n"
+        "- In status and summary, provide the completion state, material actions performed, and any blocker.\n"
+    )
     ARTIFACT_ORGANIZER_PROMPT = (
         "You organize Ambient AI artifacts for the user.\n\n"
         "Given one new report and candidate existing artifacts, decide whether to merge into an existing artifact "
@@ -163,6 +235,14 @@ class LLMInteractionService:
         browser_agent_model: Optional[str] = None,
         browser_task_timeout_seconds: float = 180.0,
         browser_headless: bool = False,
+        filesystem_agent_model: Optional[str] = None,
+        filesystem_task_timeout_seconds: float = 120.0,
+        filesystem_max_read_bytes: int = 256_000,
+        filesystem_max_list_entries: int = 200,
+        computer_agent_model: Optional[str] = None,
+        computer_task_timeout_seconds: float = 180.0,
+        computer_max_actions_per_task: int = 40,
+        computer_enabled: bool = False,
         scheduled_task_service: Optional[ScheduledTaskService] = None,
         reporter_model: Optional[str] = None,
         artifact_root: Optional[str] = None,
@@ -180,11 +260,21 @@ class LLMInteractionService:
         self.browser_agent_model = browser_agent_model
         self.browser_task_timeout_seconds = browser_task_timeout_seconds
         self.browser_headless = browser_headless
+        self.filesystem_agent_model = filesystem_agent_model
+        self.filesystem_task_timeout_seconds = filesystem_task_timeout_seconds
+        self.filesystem_max_read_bytes = filesystem_max_read_bytes
+        self.filesystem_max_list_entries = filesystem_max_list_entries
+        self.computer_agent_model = computer_agent_model
+        self.computer_task_timeout_seconds = computer_task_timeout_seconds
+        self.computer_max_actions_per_task = computer_max_actions_per_task
+        self.computer_enabled = computer_enabled
         self.scheduled_task_service = scheduled_task_service
         self.logger = logging.getLogger(self.__class__.__name__)
         self._tools: Optional[List[Dict[str, Any]]] = None
         self._frame_stack: List[AgentFrame] = [AgentFrame(tool_bridge=tool_bridge)]
         self._browser_lock = asyncio.Lock()
+        self._filesystem_lock = asyncio.Lock()
+        self._computer_lock = asyncio.Lock()
         self._retained_browser_sessions: List[BrowserToolSessionPort] = []
         self.reporter_model = reporter_model
         self.capability_policy = capability_policy
@@ -355,7 +445,8 @@ class LLMInteractionService:
             tools = [
                 tool
                 for tool in tools
-                if tool.get("function", {}).get("name") != "use_browser"
+                if tool.get("function", {}).get("name")
+                not in {"use_browser", "use_filesystem", "request_computer_use"}
             ]
 
         if allowed_tool_names is None:
@@ -490,6 +581,247 @@ class LLMInteractionService:
                     ) from cleanup_error
 
             return browser_result
+
+    async def _run_filesystem_agent(
+        self,
+        *,
+        task: str,
+        granted_paths: list[str],
+        agent_depth: int,
+    ) -> str:
+        if agent_depth != 0:
+            raise RuntimeError("use_filesystem can only be called by the root agent.")
+        if not task.strip():
+            raise ValueError("use_filesystem requires a non-empty task.")
+        if not self.filesystem_agent_model:
+            raise RuntimeError("No filesystem model is configured.")
+
+        async with self._filesystem_lock:
+            parent_model_name = self.llm.get_current_model() or self._frame.model
+            if not parent_model_name:
+                raise RuntimeError("Cannot determine the parent model before filesystem delegation.")
+
+            saved_parent_state = await self.llm.save_and_unload(self._frame.messages)
+            if saved_parent_state is None:
+                raise RuntimeError("Could not save the parent model state; filesystem task was not started.")
+
+            session = FilesystemControlSession(
+                granted_paths=granted_paths,
+                max_read_bytes=self.filesystem_max_read_bytes,
+                max_list_entries=self.filesystem_max_list_entries,
+            )
+            child_frame_pushed = False
+            fs_result = ""
+            primary_error: Optional[BaseException] = None
+            try:
+                fs_tools = [
+                    *await session.get_all_tools(),
+                    copy.deepcopy(self.FINISH_FILESYSTEM_TASK_TOOL),
+                ]
+                await self.llm.load_model(self.filesystem_agent_model)
+                self._push_frame(
+                    model=self.filesystem_agent_model,
+                    depth=agent_depth + 1,
+                    tools=fs_tools,
+                    tool_bridge=session,
+                )
+                child_frame_pushed = True
+                allowed_tool_names = {
+                    tool.get("function", {}).get("name")
+                    for tool in fs_tools
+                    if tool.get("function", {}).get("name")
+                }
+                fs_result = await asyncio.wait_for(
+                    self.run_interaction(
+                        user_input="You have been given this read-only filesystem task:\n" + task.strip(),
+                        system_prompt=self.FILESYSTEM_AGENT_PROMPT,
+                        model=self.filesystem_agent_model,
+                        agent_depth=agent_depth + 1,
+                        allowed_tool_names=allowed_tool_names,
+                        report_policy="silent",
+                    ),
+                    timeout=self.filesystem_task_timeout_seconds,
+                )
+            except BaseException as exc:
+                primary_error = exc
+            finally:
+                if child_frame_pushed:
+                    self._pop_frame()
+                await session.cleanup()
+                restore_error: Optional[BaseException] = None
+                try:
+                    current_model_name = self.llm.get_current_model()
+                    if current_model_name and current_model_name != parent_model_name:
+                        await self.llm.unload_model()
+                    await self.llm.load_and_restore()
+                except BaseException as exc:
+                    restore_error = exc
+                    self.logger.exception("Failed to restore parent model after filesystem delegation.")
+                if restore_error is not None:
+                    if primary_error is not None:
+                        raise RuntimeError(
+                            f"Filesystem task failed ({primary_error}) and parent restoration also failed ({restore_error})."
+                        ) from restore_error
+                    raise RuntimeError(
+                        f"Filesystem task completed but parent restoration failed: {restore_error}"
+                    ) from restore_error
+                if primary_error is not None:
+                    raise primary_error
+            return fs_result
+
+    def _request_computer_use(self, *, task: str, reason: str, agent_depth: int) -> str:
+        if agent_depth != 0:
+            raise RuntimeError("request_computer_use can only be called by the root agent.")
+        if not self.computer_enabled:
+            raise RuntimeError("Computer use is disabled in configuration.")
+        if not self.computer_agent_model:
+            raise RuntimeError("No computer-use model is configured.")
+        if not task.strip():
+            raise ValueError("request_computer_use requires a non-empty task.")
+        if self.BLOCKED_COMPUTER_TASK_RE.search(task):
+            raise RuntimeError("Computer-use request was denied because the task appears destructive or high-risk.")
+        if self.capability_policy is None or not hasattr(self.capability_policy.store, "create_approval"):
+            raise RuntimeError("Computer-use approvals require the autonomy approval store.")
+
+        arguments = {"task": task.strip(), "reason": reason.strip()}
+        fingerprint = self.capability_policy.action_fingerprint("request_computer_use", arguments)
+        now = datetime.now(timezone.utc)
+        approval = ApprovalGrant(
+            approval_id=uuid.uuid4().hex,
+            capability="computer.use",
+            action_fingerprint=fingerprint,
+            constraints_json=json.dumps(
+                {
+                    "tool_name": "request_computer_use",
+                    "arguments": arguments,
+                    "approval_kind": "computer_use_deployment",
+                },
+                ensure_ascii=False,
+            ),
+            status="pending",
+            created_at=now.isoformat(),
+            expires_at=(now + timedelta(minutes=10)).isoformat(),
+            approver="pending",
+        )
+        self.capability_policy.store.create_approval(approval)
+        if hasattr(self.capability_policy.store, "audit"):
+            self.capability_policy.store.audit(
+                "ambient_agent",
+                "computer_use.requested",
+                approval.approval_id,
+                arguments,
+            )
+        return json.dumps(
+            {
+                "status": "awaiting_user_approval",
+                "approval_id": approval.approval_id,
+                "message": "Computer-use agent will deploy only after the local user allows it in the Ambient AI web UI.",
+            },
+            ensure_ascii=False,
+        )
+
+    async def deploy_computer_agent(
+        self,
+        *,
+        task: str,
+        approval_id: str = "",
+        event_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> str:
+        if not self.computer_enabled:
+            raise RuntimeError("Computer use is disabled in configuration.")
+        if not self.computer_agent_model:
+            raise RuntimeError("No computer-use model is configured.")
+        if not task.strip():
+            raise ValueError("Computer-use deployment requires a non-empty task.")
+        if self.BLOCKED_COMPUTER_TASK_RE.search(task):
+            raise RuntimeError("Computer-use deployment was denied because the task appears destructive or high-risk.")
+
+        async with self._computer_lock:
+            parent_model_name = self.llm.get_current_model() or self._frame.model
+            if not parent_model_name:
+                raise RuntimeError("Cannot determine the parent model before computer-use deployment.")
+
+            saved_parent_state = await self.llm.save_and_unload(self._frame.messages)
+            if saved_parent_state is None:
+                raise RuntimeError("Could not save the parent model state; computer-use task was not started.")
+
+            session = ComputerControlSession(max_actions=self.computer_max_actions_per_task)
+            child_frame_pushed = False
+            computer_result = ""
+            primary_error: Optional[BaseException] = None
+            try:
+                computer_tools = [
+                    *await session.get_all_tools(),
+                    copy.deepcopy(self.FINISH_COMPUTER_TASK_TOOL),
+                ]
+                await self.llm.load_model(self.computer_agent_model)
+                self._push_frame(
+                    model=self.computer_agent_model,
+                    depth=1,
+                    tools=computer_tools,
+                    tool_bridge=session,
+                )
+                child_frame_pushed = True
+                allowed_tool_names = {
+                    tool.get("function", {}).get("name")
+                    for tool in computer_tools
+                    if tool.get("function", {}).get("name")
+                }
+                computer_result = await asyncio.wait_for(
+                    self.run_interaction(
+                        user_input="You have been approved for this computer-use task:\n" + task.strip(),
+                        system_prompt=self.COMPUTER_AGENT_PROMPT,
+                        model=self.computer_agent_model,
+                        agent_depth=1,
+                        allowed_tool_names=allowed_tool_names,
+                        report_policy="silent",
+                        event_callback=event_callback,
+                    ),
+                    timeout=self.computer_task_timeout_seconds,
+                )
+            except BaseException as exc:
+                primary_error = exc
+            finally:
+                if child_frame_pushed:
+                    self._pop_frame()
+                await session.cleanup()
+                restore_error: Optional[BaseException] = None
+                try:
+                    current_model_name = self.llm.get_current_model()
+                    if current_model_name and current_model_name != parent_model_name:
+                        await self.llm.unload_model()
+                    await self.llm.load_and_restore()
+                except BaseException as exc:
+                    restore_error = exc
+                    self.logger.exception("Failed to restore parent model after computer-use deployment.")
+                if restore_error is not None:
+                    if primary_error is not None:
+                        raise RuntimeError(
+                            f"Computer-use task failed ({primary_error}) and parent restoration also failed ({restore_error})."
+                        ) from restore_error
+                    raise RuntimeError(
+                        f"Computer-use task completed but parent restoration failed: {restore_error}"
+                    ) from restore_error
+
+            if isinstance(primary_error, ComputerControlTerminated):
+                computer_result = json.dumps(
+                    {
+                        "status": "terminated",
+                        "summary": "Computer-use agent was terminated by Shift+Esc.",
+                        "approval_id": approval_id,
+                    },
+                    ensure_ascii=False,
+                )
+            elif primary_error is not None:
+                raise primary_error
+            if self.capability_policy is not None and hasattr(self.capability_policy.store, "audit"):
+                self.capability_policy.store.audit(
+                    "ambient_agent",
+                    "computer_use.completed",
+                    approval_id or "unknown",
+                    {"result": computer_result[:2000]},
+                )
+            return computer_result
 
     def _build_system_prompt(self, system_prompt: str) -> str:
         now = datetime.now()
@@ -746,7 +1078,11 @@ class LLMInteractionService:
                         }
                     )
                     continue
-                if self.capability_policy is not None and tool_name not in self.TERMINAL_TOOL_NAMES:
+                if (
+                    self.capability_policy is not None
+                    and tool_name not in self.TERMINAL_TOOL_NAMES
+                    and tool_name not in self.LOCAL_CONTROL_REQUEST_TOOLS
+                ):
                     metadata = current_interaction_metadata()
                     source = current_interaction_source()
                     observed_evidence = "\n".join(
@@ -788,6 +1124,21 @@ class LLMInteractionService:
                         task=str(task),
                         agent_depth=agent_depth,
                     )
+                elif tool_name == "use_filesystem":
+                    granted_paths = tool_args.get("granted_paths")
+                    if not isinstance(granted_paths, list):
+                        raise ValueError("use_filesystem granted_paths must be a list of absolute paths.")
+                    response_content = await self._run_filesystem_agent(
+                        task=str(tool_args.get("task", "")),
+                        granted_paths=[str(path) for path in granted_paths],
+                        agent_depth=agent_depth,
+                    )
+                elif tool_name == "request_computer_use":
+                    response_content = self._request_computer_use(
+                        task=str(tool_args.get("task", "")),
+                        reason=str(tool_args.get("reason", "")),
+                        agent_depth=agent_depth,
+                    )
                 elif tool_name == "finish_browser_task":
                     if agent_depth == 0:
                         raise RuntimeError(
@@ -809,6 +1160,36 @@ class LLMInteractionService:
                             "summary": summary.strip(),
                             "browser_exited": exit_browser,
                         },
+                        ensure_ascii=False,
+                    )
+                elif tool_name == "finish_filesystem_task":
+                    if agent_depth == 0:
+                        raise RuntimeError(
+                            "finish_filesystem_task can only be called by the delegated filesystem agent."
+                        )
+                    status = tool_args.get("status")
+                    summary = tool_args.get("summary")
+                    if not isinstance(status, str) or not status.strip():
+                        raise ValueError("finish_filesystem_task status must be a non-empty string.")
+                    if not isinstance(summary, str) or not summary.strip():
+                        raise ValueError("finish_filesystem_task summary must be a non-empty string.")
+                    response_content = json.dumps(
+                        {"status": status.strip(), "summary": summary.strip()},
+                        ensure_ascii=False,
+                    )
+                elif tool_name == "finish_computer_task":
+                    if agent_depth == 0:
+                        raise RuntimeError(
+                            "finish_computer_task can only be called by the delegated computer-use agent."
+                        )
+                    status = tool_args.get("status")
+                    summary = tool_args.get("summary")
+                    if not isinstance(status, str) or not status.strip():
+                        raise ValueError("finish_computer_task status must be a non-empty string.")
+                    if not isinstance(summary, str) or not summary.strip():
+                        raise ValueError("finish_computer_task summary must be a non-empty string.")
+                    response_content = json.dumps(
+                        {"status": status.strip(), "summary": summary.strip()},
                         ensure_ascii=False,
                     )
                 elif tool_name == "schedule_task_at":

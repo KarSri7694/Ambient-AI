@@ -84,6 +84,8 @@ TODOIST_EXECUTION_MODEL = CONFIG.get_model("todoist_execution_model", DEFAULT_MO
 REFLECTION_MODEL = CONFIG.get_model("reflection_model", DEFAULT_MODEL)
 TRANSCRIPT_PROCESSING_MODEL = CONFIG.get_model("transcript_processing_model", FOLLOWUP_EXECUTION_MODEL)
 BROWSER_AGENT_MODEL = CONFIG.get_model("browser_agent_model", FOLLOWUP_EXECUTION_MODEL)
+FILESYSTEM_AGENT_MODEL = CONFIG.get_model("filesystem_agent_model", FOLLOWUP_EXECUTION_MODEL)
+COMPUTER_AGENT_MODEL = CONFIG.get_model("computer_agent_model", FOLLOWUP_EXECUTION_MODEL)
 CHAT_MODEL = CONFIG.get_model("chat_model", FOLLOWUP_EXECUTION_MODEL)
 LIGHTWEIGHT_CHAT_MODEL = CONFIG.get_model("lightweight_chat_model", "")
 USER_DATA_DIR = Path(CONFIG.get_str("runtime", "user_data_dir", "D:\\USER_DATA"))
@@ -134,6 +136,12 @@ BROWSER_PROFILE_DIR = CONFIG.get_str(
     "persistent_profile_dir",
     str(USER_DATA_DIR / "browser" / "profile"),
 )
+FILESYSTEM_TASK_TIMEOUT_SECONDS = CONFIG.get_float("filesystem", "task_timeout_seconds", 120.0)
+FILESYSTEM_MAX_READ_BYTES = CONFIG.get_int("filesystem", "max_read_bytes", 256000)
+FILESYSTEM_MAX_LIST_ENTRIES = CONFIG.get_int("filesystem", "max_list_entries", 200)
+COMPUTER_ENABLED = CONFIG.get_bool("computer", "enabled", False)
+COMPUTER_TASK_TIMEOUT_SECONDS = CONFIG.get_float("computer", "task_timeout_seconds", 180.0)
+COMPUTER_MAX_ACTIONS_PER_TASK = CONFIG.get_int("computer", "max_actions_per_task", 40)
 from infrastructure.plain_capture_store import PlainCaptureStore
 CHAT_HISTORY_MESSAGE_LIMIT = CONFIG.get_int("chat", "history_message_limit", 40)
 CHAT_STREAM_CHECKPOINT_SECONDS = CONFIG.get_float("chat", "stream_checkpoint_seconds", 0.25)
@@ -591,6 +599,14 @@ class AmbientRuntime:
             browser_agent_model=BROWSER_AGENT_MODEL,
             browser_task_timeout_seconds=BROWSER_TASK_TIMEOUT_SECONDS,
             browser_headless=BROWSER_HEADLESS,
+            filesystem_agent_model=FILESYSTEM_AGENT_MODEL,
+            filesystem_task_timeout_seconds=FILESYSTEM_TASK_TIMEOUT_SECONDS,
+            filesystem_max_read_bytes=FILESYSTEM_MAX_READ_BYTES,
+            filesystem_max_list_entries=FILESYSTEM_MAX_LIST_ENTRIES,
+            computer_agent_model=COMPUTER_AGENT_MODEL,
+            computer_task_timeout_seconds=COMPUTER_TASK_TIMEOUT_SECONDS,
+            computer_max_actions_per_task=COMPUTER_MAX_ACTIONS_PER_TASK,
+            computer_enabled=COMPUTER_ENABLED,
             scheduled_task_service=scheduled_task_service,
             reporter_model=REPORTER_MODEL,
             artifact_root=str(ARTIFACTS_ROOT),
