@@ -21,9 +21,10 @@ set -euo pipefail
 #   BATCH_MAX=4096
 #   UBATCH_START=512
 #   UBATCH_MAX=2048
-#   BATCH_STEP=512
+#   BATCH_STEP=1024
 #   MTP_DRAFT_MIN=1
 #   MTP_DRAFT_MAX=4
+#   MD_SUMMARY_FILE=/path/to/already-loaded.md
 #
 # Custom configs:
 #   CONFIGS=("name::llama-server args" "other::llama-server args")
@@ -47,9 +48,10 @@ BATCH_START="${BATCH_START:-2048}"
 BATCH_MAX="${BATCH_MAX:-4096}"
 UBATCH_START="${UBATCH_START:-512}"
 UBATCH_MAX="${UBATCH_MAX:-2048}"
-BATCH_STEP="${BATCH_STEP:-512}"
+BATCH_STEP="${BATCH_STEP:-1024}"
 MTP_DRAFT_MIN="${MTP_DRAFT_MIN:-1}"
 MTP_DRAFT_MAX="${MTP_DRAFT_MAX:-4}"
+MD_SUMMARY_FILE="${MD_SUMMARY_FILE:-}"
 
 if [[ -z "$LLAMA_SERVER" || ! -x "$LLAMA_SERVER" ]]; then
   echo "Set LLAMA_SERVER to an executable llama-server path." >&2
@@ -110,15 +112,157 @@ if ! declare -p CONFIGS >/dev/null 2>&1 || [[ ${#CONFIGS[@]} -eq 0 ]]; then
   fi
 fi
 
-cat > "$TMP_ROOT/prompts.json" <<'JSON'
-[
-  "Explain the history, engineering tradeoffs, and practical applications of suspension bridges. Include load paths, materials, failure modes, and how modern monitoring systems improve safety.",
-  "Now design a fictional suspension bridge for a windy coastal city. Give constraints, dimensions, materials, inspection routines, and the reasoning behind each decision.",
-  "A city council says the bridge must also support emergency evacuation, cycling lanes, maintenance robots, and severe corrosion risk. Revise the design while preserving earlier assumptions where possible.",
-  "Create a risk register for the revised bridge. Include likelihood, impact, detection strategy, mitigation, and the owner responsible for each risk.",
-  "Summarize the entire bridge proposal as an executive briefing, explicitly referencing earlier design decisions and explaining what changed across the conversation."
+MD_SUMMARY_FILE="$MD_SUMMARY_FILE" python3 - "$TMP_ROOT/prompts.json" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+md_path = os.environ.get("MD_SUMMARY_FILE", "").strip()
+if md_path:
+    markdown_text = Path(md_path).read_text(encoding="utf-8", errors="replace")
+else:
+    markdown_text = """# Radeon ROCm Benchmark Notes
+
+This fallback Markdown document is used when MD_SUMMARY_FILE is not set. It describes an AI agent benchmark plan that compares local inference performance across llama-server batch sizes, micro-batch sizes, and speculative MTP draft token counts. The benchmark records time to first token, prompt preprocessing throughput, generation throughput, server command lines, and per-turn responses. The goal is to identify a stable, high-throughput configuration for AMD Radeon GPU inference while preserving multi-turn context behavior."""
+
+prompts = [
+    """Act as an expert game engineer specializing in retro rogue-like mechanics and 2D graphics math.
+
+Your task is to build a complete, self-contained "Procedural Dungeon Generator with Dynamic Fog of War" inside a single, beautifully styled HTML file. Use vanilla HTML, CSS, and JavaScript with NO external libraries or dependencies.
+
+### Visual & UI Requirements:
+1. UI Layout: A clean, dark cyber-grid theme. Center the canvas. Include a control panel with:
+   - A button to "Regenerate Map"
+   - Text display showing current player coordinates
+   - A button to toggle "God Mode" (revealing the entire map layout completely for debugging/demonstration).
+2. Canvas Dimensions: Fixed at 600x600 pixels. Use `image-rendering: pixelated;` in CSS. The internal simulation grid should map to exactly 60x60 cells (meaning each map tile is a 10x10 pixel square on the canvas).
+3. Theme Colors:
+   - Unexplored/Hidden (Fog of War): Absolute pitch black (#000000)
+   - Visible Walls: Deep stone gray (#4a4e69)
+   - Visible Floor: Soft slate gray (#9a8c98)
+   - Player Character: A bright, distinct green square or sprite (#55ff33)
+
+### Core Mechanics & Algorithmic Rules:
+You must implement a 2D grid array representing the map states (0 = Floor, 1 = Wall) and a secondary 2D array tracking visibility (0 = Hidden, 1 = Revealed/Visible).
+
+1. Map Generation (Choose One Engine):
+   - Option A: Binary Space Partitioning (BSP) to split the grid recursively into rectangular rooms, then carving straight hallway connections between them.
+   - Option B: Cellular Automata (Fill grid randomly with ~45% walls, then run 4-5 simulation steps of Conway's-like rules to create organic cave layouts). Ensure there is an algorithm to connect isolated cavern pockets.
+2. Player Movement: Spawn the player on a valid Floor tile. Implement standard keyboard controls (Arrow keys or WASD) to move the player exactly 1 grid tile per keypress. Prevent walking through Wall tiles.
+3. Raycasting Line of Sight (The Core Math Challenge):
+   - You must calculate the player's real-time visibility radius (limited to 8-10 tiles away).
+   - To do this, cast virtual rays from the player's tile out to every single grid tile along the perimeter of their visibility radius.
+   - For EACH ray, you MUST implement a generalized Bresenham's Line Algorithm to trace the line of grid cells step-by-step from the player to the destination tile.
+   - Trace rules: Mark cells along the line as "Revealed". If the line hits a cell marked as a Wall, immediately stop tracing that ray further (blocking vision behind the wall).
+
+### Deliverable:
+Provide the complete, working code inside a single code block containing the HTML, CSS, and JavaScript. Do not leave any functions empty, do not use comments like "// implement logic here", and do not omit edge cases. It must run immediately when opened in a web browser.
+
+Note: You may not have access to a browser, dev server, or vision tools — do not rely on running or visually inspecting the game for verification. Validate by reading and reasoning about the code instead.
+
+Before finishing, review the code to confirm:
+- Map generation (BSP or cellular automata) produces valid floor tiles with connectivity between areas
+- Player moves one tile per keypress and cannot walk through walls
+- Bresenham raycasting marks revealed cells along each ray and stops at walls
+- God mode toggle reveals the full map; regenerate resets the map
+- Complete single HTML file with no empty functions or placeholder logic""",
+    f"""Read the following Markdown document and write a detailed, structured summary of it. Preserve important headings, decisions, technical constraints, commands, results, open questions, and action items. If the document contains implementation details, explain what was implemented and what remains unresolved.
+
+--- MARKDOWN DOCUMENT START ---
+{markdown_text}
+--- MARKDOWN DOCUMENT END ---""",
+    """Build a toy desktop environment as a single-page web app using vanilla HTML, CSS, and JavaScript only (no React, Vue, Svelte, etc.).
+
+Do not reuse a tutorial layout or repo you already know. Implement from the rules below.
+
+Goal:
+A playful fake OS desktop in the browser — draggable windows, a taskbar, and two working applets. Prioritize correct window stacking, focus, and interaction first — that is what this test measures. Also give it a cohesive, presentable look using CSS only (dark theme, gradient wallpaper, styled title bars/taskbar, subtle borders or shadows on windows). Do not add extra features or assets just for visuals. It should feel interactive and good on screen, not a wireframe or a feature-heavy OS clone.
+
+Technical requirements:
+- Vanilla HTML, CSS, and JavaScript only.
+- Runs locally without a backend: open index.html directly or use a minimal dev server (e.g. npx serve . or Vite).
+- No external UI frameworks or window-manager libraries.
+- Persist Notepad document text and desktop icon positions in localStorage so refresh does not lose them.
+- Include a README with: how to run, feature list, brief file/structure notes.
+
+Desktop shell:
+
+1. Wallpaper & icons
+   - Full-viewport desktop area with an attractive gradient wallpaper (CSS only — no image files required).
+   - Two desktop icons: "Notepad" and "Calculator" (labels + clickable icons — emoji or simple SVG/CSS shapes are fine).
+   - Double-click an icon to open its window (single-click may select/highlight if you want; opening must work reliably).
+   - Icons are draggable on the desktop; positions persist after reload.
+
+2. Windows (shared behavior)
+   - Each app opens in its own window with: title bar, minimize button, close button.
+   - Windows are draggable by the title bar only (not by clicking content inside).
+   - Clicking a window brings it to the front (highest z-index). The focused window has a visibly distinct title bar style.
+   - Only the focused window receives keyboard input for its app.
+   - Minimize hides the window but keeps it in the taskbar; clicking the taskbar button restores it.
+   - Close removes the window; reopening from the desktop icon creates a fresh instance (Notepad restores saved text from localStorage; Calculator starts cleared).
+   - New windows open slightly offset so they do not perfectly stack on first launch.
+   - Title text longer than 18 characters must ellipsize in the title bar (e.g. "Untitled — Notep…").
+
+3. Taskbar
+   - Fixed bar at the bottom of the screen.
+   - Shows a button for each open (including minimized) window; label matches the window title (ellipsized if needed).
+   - Clicking a taskbar button: restores if minimized; otherwise brings that window to the front.
+   - Optional clock display is fine; not required.
+
+Notepad app:
+
+1. Multi-line text area filling the client area below the title bar.
+2. Auto-save content to localStorage on input (debounced up to 500 ms is fine).
+3. On open, load the last saved document from localStorage.
+4. Window title reflects document state: default "Untitled — Notepad"; append a " •" or "*" when there are unsaved changes since last save, if you track that — otherwise static title is acceptable if auto-save runs on every input.
+
+Calculator app:
+
+1. Basic four-function calculator: +, −, ×, ÷.
+2. Number buttons 0–9, decimal point, equals, and clear (C).
+3. Display shows the current input or result; divide-by-zero shows "Error" and does not crash the app.
+4. Keyboard support when the Calculator window is focused: digits, operators, Enter (=), Escape (clear).
+5. Chain calculations are not required; each equals press evaluates the current expression is enough.
+
+UX expectations:
+- Visual style should be consistent across desktop, windows, taskbar, and apps (readable fonts, clear button states).
+- Cursor changes on draggable regions (title bar, desktop icons).
+- Minimized windows cannot be interacted with until restored.
+- Clicking the desktop (not on a window) does not break window state.
+- Layout works on a desktop browser; mobile-perfect design is not required.
+
+Code quality expectations:
+- Split logic across multiple JS files or clear modules (e.g. window manager, taskbar, notepad, calculator, storage) — not one unmaintainable script.
+- Central window manager owns: open windows list, z-index, focus, minimize/restore/close.
+- No dead UI: every button and icon must do something.
+
+Scope guidance:
+- Do NOT build: file system, multiple desktops, networking, themes, or more than the two apps above.
+- Do NOT add npm runtime dependencies.
+- Do NOT use iframes for app windows.
+
+Deliverables:
+- All source files to run the app
+- README with run instructions
+- App should be complete without manual code edits
+
+Note: You may not have access to a browser, dev server, or vision tools — do not rely on running or visually inspecting the app for verification. Validate by reading and reasoning about the code instead.
+
+Before finishing, review the code to confirm:
+- Window manager assigns incrementing z-index on focus; focused window style is applied
+- Dragging uses title-bar hit target only; content area drag does not move the window
+- Minimize hides window and taskbar restore works; minimized windows are not focusable
+- Close removes window and taskbar entry; reopen from icon works
+- Only the focused window's app handles keyboard events
+- Notepad loads/saves via localStorage; Calculator handles divide-by-zero safely
+- Desktop icon positions persist via localStorage
+- Title ellipsizes after 18 characters
+- No empty functions, stubbed handlers, or placeholder "// TODO" logic remain""",
 ]
-JSON
+
+Path(sys.argv[1]).write_text(json.dumps(prompts, ensure_ascii=False, indent=2), encoding="utf-8")
+PY
 
 cat > "$CSV" <<'CSV'
 config,status,run_index,turn_index,warmup,total_seconds,ttft_seconds,prompt_eval_tokens_per_second,server_eval_tokens_per_second,response_prompt_per_second,response_predicted_per_second,completion_chars,error
