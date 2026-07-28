@@ -276,6 +276,7 @@ def create_runtime_log_app(
     capture_store: Any = None,
     capture_control: Any = None,
     resource_governor: Any = None,
+    runtime_control: Any = None,
     real_world_lab: Any = None,
     rocm_tuning_service: Any = None,
 ) -> FastAPI:
@@ -1119,6 +1120,18 @@ def create_runtime_log_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"ok": True, "preset": preset, **resource_governor.status()}
 
+    @app.get("/api/runtime/reflection/status")
+    def manual_reflection_status() -> dict[str, Any]:
+        if runtime_control is None or not hasattr(runtime_control, "manual_reflection_status"):
+            raise HTTPException(status_code=503, detail="runtime_control_unavailable")
+        return {"ok": True, "status": runtime_control.manual_reflection_status()}
+
+    @app.post("/api/runtime/reflection/run")
+    def manual_reflection_run() -> dict[str, Any]:
+        if runtime_control is None or not hasattr(runtime_control, "request_reflection"):
+            raise HTTPException(status_code=503, detail="runtime_control_unavailable")
+        return runtime_control.request_reflection()
+
     @app.post("/api/privacy/capture/{action}")
     def privacy_capture_action(action: str, request: Request) -> dict[str, Any]:
         if capture_control is None:
@@ -1228,6 +1241,7 @@ def start_runtime_log_server(
     capture_store: Any = None,
     capture_control: Any = None,
     resource_governor: Any = None,
+    runtime_control: Any = None,
     real_world_lab: Any = None,
     rocm_tuning_service: Any = None,
 ) -> RuntimeLogBuffer:
@@ -1254,6 +1268,7 @@ def start_runtime_log_server(
             capture_store=capture_store,
             capture_control=capture_control,
             resource_governor=resource_governor,
+            runtime_control=runtime_control,
             real_world_lab=real_world_lab,
             rocm_tuning_service=rocm_tuning_service,
         )

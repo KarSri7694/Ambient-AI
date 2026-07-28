@@ -25,6 +25,7 @@ from application.services.screenshot_queue_service import ScreenshotQueueService
 from application.services.system_idle_service import SystemIdleService
 from application.services.training_data_service import TrainingDataService
 from application.services.user_bio_data_service import UserBioDataService
+from application.services.user_context_service import UserContextService
 from application.services.autonomy_coordinator_service import AutonomyCoordinatorService
 from application.services.capability_policy_service import AutonomyBudget, CapabilityPolicyService
 from application.services.opportunity_judgment_service import OpportunityJudgmentService
@@ -167,6 +168,20 @@ SEMANTIC_VECTOR_LIMIT = CONFIG.get_int("semantic_memory", "vector_limit", 12)
 SEMANTIC_RERANK_LIMIT = CONFIG.get_int("semantic_memory", "rerank_limit", 6)
 SEMANTIC_SYNC_BATCH_SIZE = CONFIG.get_int("semantic_memory", "sync_batch_size", 32)
 SEMANTIC_TIMEOUT_SECONDS = CONFIG.get_float("semantic_memory", "timeout_seconds", 5.0)
+PERSONALIZATION_ENABLED = CONFIG.get_bool("personalization", "enabled", True)
+PERSONALIZATION_STABLE_PROFILE_CHARS = CONFIG.get_int("personalization", "stable_profile_chars", 3000)
+PERSONALIZATION_WORKING_MEMORY_CHARS = CONFIG.get_int("personalization", "working_memory_chars", 3000)
+PERSONALIZATION_SEMANTIC_LIMIT = CONFIG.get_int("personalization", "semantic_limit", 8)
+PERSONALIZATION_PROMPT_CONTEXT_CHARS = CONFIG.get_int("personalization", "prompt_context_chars", 8000)
+PERSONALIZATION_INCLUDE_RECENT_CONTEXT_LEGACY = CONFIG.get_bool(
+    "personalization",
+    "include_recent_context_legacy",
+    True,
+)
+BIODATA_UPDATE_EVENT_INTERVAL = max(
+    1,
+    CONFIG.get_int("personalization", "biodata_update_event_interval", 3),
+)
 SEMANTIC_DEDUPE_ENABLED = CONFIG.get_bool("semantic_dedupe", "enabled", True)
 SEMANTIC_DEDUPE_MODEL = CONFIG.get_model("model", DEFAULT_MODEL, section="semantic_dedupe")
 SEMANTIC_DEDUPE_CANDIDATE_LIMIT = CONFIG.get_int("semantic_dedupe", "candidate_limit", 8)
@@ -320,6 +335,17 @@ class AmbientRuntime:
         self._chat_resource_backoff_until = 0.0
         self._deferred_followup_observations: deque = deque()
         self._deferred_followup_activities: deque[str] = deque()
+        self._manual_reflection_requested = threading.Event()
+        self._manual_reflection_lock = threading.Lock()
+        self._manual_reflection_status = {
+            "requested": False,
+            "running": False,
+            "last_requested_at": None,
+            "last_started_at": None,
+            "last_finished_at": None,
+            "last_result": None,
+            "last_error": None,
+        }
         if self.chat_event_broker is not None:
             self.chat_event_broker.set_turn_enqueued_callback(self._notify_chat_queued)
 
@@ -336,6 +362,32 @@ class AmbientRuntime:
         self.stop_event.set()
         self._screenshot_capture_stop_event.set()
         self._notify_chat_queued()
+
+    def request_reflection(self) -> dict:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._manual_reflection_lock:
+            already_pending = self._manual_reflection_status["requested"]
+            already_running = self._manual_reflection_status["running"]
+            self._manual_reflection_status.update(
+                {
+                    "requested": True,
+                    "last_requested_at": now,
+                    "last_error": None,
+                }
+            )
+            status = dict(self._manual_reflection_status)
+        self._manual_reflection_requested.set()
+        self._notify_chat_queued()
+        return {
+            "ok": True,
+            "accepted": not already_pending,
+            "already_running": bool(already_running),
+            "status": status,
+        }
+
+    def manual_reflection_status(self) -> dict:
+        with self._manual_reflection_lock:
+            return dict(self._manual_reflection_status)
 
     def _notify_chat_queued(self) -> None:
         """Wake the runtime loop without interrupting an active model request."""
@@ -592,6 +644,16 @@ class AmbientRuntime:
                 vector_limit=SEMANTIC_VECTOR_LIMIT,
                 rerank_limit=SEMANTIC_RERANK_LIMIT,
             )
+        user_context_service = UserContextService(
+            memory=memory_store,
+            semantic_memory=semantic_memory,
+            enabled=PERSONALIZATION_ENABLED,
+            stable_profile_chars=PERSONALIZATION_STABLE_PROFILE_CHARS,
+            working_memory_chars=PERSONALIZATION_WORKING_MEMORY_CHARS,
+            semantic_limit=PERSONALIZATION_SEMANTIC_LIMIT,
+            prompt_context_chars=PERSONALIZATION_PROMPT_CONTEXT_CHARS,
+            include_recent_context_legacy=PERSONALIZATION_INCLUDE_RECENT_CONTEXT_LEGACY,
+        )
         llm_service = LLMInteractionService(
             llm_provider=logged_llm,
             tool_bridge=tool_bridge,
@@ -738,6 +800,7 @@ class AmbientRuntime:
                 # Use one vision-capable model for enrichment, judgment, and research
                 # so an ambient batch never swaps presets between its phases.
                 visual_model=FOLLOWUP_EXECUTION_MODEL,
+                user_context_service=user_context_service,
             )
             if AUTONOMY_COORDINATOR_ENABLED
             else None
@@ -758,6 +821,7 @@ class AmbientRuntime:
             passive_observer,
             autonomy_store,
             autonomy_coordinator,
+            user_context_service,
         )
 
     def _start_screenshot_capture_loop(
@@ -1048,6 +1112,124 @@ class AmbientRuntime:
                 delegated += 1
         return delegated
 
+    async def _run_manual_reflection(
+        self,
+        *,
+        llm_adapter: ModelResidencyManager,
+        reflection_service: ReflectionService | None,
+        services_initialized: bool,
+    ) -> tuple[bool, bool]:
+        if not self._manual_reflection_requested.is_set():
+            return False, services_initialized
+        if reflection_service is None:
+            self._manual_reflection_requested.clear()
+            with self._manual_reflection_lock:
+                self._manual_reflection_status.update(
+                    {
+                        "requested": False,
+                        "running": False,
+                        "last_finished_at": datetime.now(timezone.utc).isoformat(),
+                        "last_error": "reflection_service_unavailable",
+                    }
+                )
+            return True, services_initialized
+
+        self._manual_reflection_requested.clear()
+        started_at = datetime.now(timezone.utc).isoformat()
+        with self._manual_reflection_lock:
+            self._manual_reflection_status.update(
+                {
+                    "requested": False,
+                    "running": True,
+                    "last_started_at": started_at,
+                    "last_error": None,
+                }
+            )
+        logger.info("Manual reflection run requested from runtime UI.")
+        try:
+            services_initialized = await self._ensure_runtime(
+                llm_adapter=llm_adapter,
+                services_initialized=services_initialized,
+                reason="running manually requested reflection service",
+                model_name=REFLECTION_MODEL,
+            )
+            with self.gpu_lock:
+                result = await reflection_service.run(model=REFLECTION_MODEL)
+            logger.info(
+                "Manual reflection completed: generated=%s queued=%s skipped=%s.",
+                len(result.get("generated_tasks", [])),
+                len(result.get("queued_tasks", [])),
+                len(result.get("skipped_tasks", [])),
+            )
+            with self._manual_reflection_lock:
+                self._manual_reflection_status.update(
+                    {
+                        "running": False,
+                        "last_finished_at": datetime.now(timezone.utc).isoformat(),
+                        "last_result": {
+                            "reason": result.get("reason"),
+                            "cleaned_user_info_changed": result.get("cleaned_user_info_changed"),
+                            "cleaned_working_memory_changed": result.get("cleaned_working_memory_changed"),
+                            "generated_count": len(result.get("generated_tasks", [])),
+                            "queued_count": len(result.get("queued_tasks", [])),
+                            "skipped_count": len(result.get("skipped_tasks", [])),
+                        },
+                        "last_error": None,
+                    }
+                )
+        except Exception as exc:
+            logger.exception("Manual reflection run failed.")
+            with self._manual_reflection_lock:
+                self._manual_reflection_status.update(
+                    {
+                        "running": False,
+                        "last_finished_at": datetime.now(timezone.utc).isoformat(),
+                        "last_error": str(exc),
+                    }
+                )
+        return True, services_initialized
+
+    async def _run_biodata_update(
+        self,
+        *,
+        llm_adapter: ModelResidencyManager,
+        user_biodata_service: UserBioDataService | None,
+        services_initialized: bool,
+        user_active: bool,
+    ) -> tuple[bool, bool]:
+        if user_biodata_service is None or ALWAYS_ON_MODE:
+            return False, services_initialized
+        if not user_biodata_service.has_pending_biodata_observations():
+            return False, services_initialized
+
+        services_initialized = await self._ensure_runtime(
+            llm_adapter=llm_adapter,
+            services_initialized=services_initialized,
+            reason="updating user biodata from passive observations",
+            model_name=USER_BIODATA_MODEL,
+            role="ambient_biodata_update",
+            background=True,
+            user_active=user_active,
+        )
+        with self.gpu_lock:
+            biodata_result = await user_biodata_service.update_biodata(
+                model=USER_BIODATA_MODEL
+            )
+        processed_count = len(biodata_result.get("processed_observation_ids", []))
+        entry_count = len(biodata_result.get("entries", []))
+        if processed_count or entry_count:
+            logger.info(
+                "User BioData update processed %s observations and appended %s entries.",
+                processed_count,
+                entry_count,
+            )
+        else:
+            logger.debug(
+                "User BioData update skipped: %s",
+                biodata_result.get("reason", "no usable biodata extracted"),
+            )
+        return bool(processed_count or entry_count), services_initialized
+
     async def run_loop(self):
         (
             llm_adapter,
@@ -1065,10 +1247,13 @@ class AmbientRuntime:
             passive_observer,
             autonomy_store,
             autonomy_coordinator,
+            user_context_service,
         ) = self._build_services()
         idle_cycle_interval = 30
         passive_observer_interval = PASSIVE_OBSERVER_CAPTURE_INTERVAL_SECONDS
         last_idle_cycle_at = 0.0
+        last_biodata_update_at = 0.0
+        biodata_context_events_since_update = 0
         user_idle_now = False
         services_initialized = False
 
@@ -1120,6 +1305,22 @@ class AmbientRuntime:
                         services_initialized=services_initialized,
                         reason="ASR pipeline finished",
                     )
+                    last_biodata_update_at = 0.0
+
+                manual_reflection_handled, services_initialized = await self._run_manual_reflection(
+                    llm_adapter=llm_adapter,
+                    reflection_service=reflection_service,
+                    services_initialized=services_initialized,
+                )
+                if manual_reflection_handled:
+                    services_initialized = await self._restore_chat_residency(
+                        llm_adapter=llm_adapter,
+                        services_initialized=services_initialized,
+                        reason="manual reflection finished",
+                    )
+                    if await self._sleep_or_stop(0.1):
+                        break
+                    continue
 
                 handled_chat, services_initialized = await self._process_pending_chat_turn(
                     llm_adapter=llm_adapter,
@@ -1180,6 +1381,7 @@ class AmbientRuntime:
                 except queue.Empty:
                     transcript_path = None
                 if transcript_path is not None:
+                    transcript_counted_for_biodata = False
                     if autonomy_coordinator is not None:
                         try:
                             transcript_text = Path(transcript_path).read_text(encoding="utf-8").strip()
@@ -1189,6 +1391,7 @@ class AmbientRuntime:
                                     transcript_text=transcript_text,
                                 )
                                 logger.info("Transcript %s added to continuous context evaluation.", transcript_path)
+                                transcript_counted_for_biodata = True
                         except Exception:
                             logger.exception("Failed to enqueue transcript %s for autonomy judgment.", transcript_path)
                     elif ALWAYS_ON_MODE:
@@ -1216,6 +1419,7 @@ class AmbientRuntime:
                                         transcript_path,
                                         result[:500],
                                     )
+                                    transcript_counted_for_biodata = True
                                 finally:
                                     llm_service.reset_context()
                             else:
@@ -1227,7 +1431,10 @@ class AmbientRuntime:
                             "Transcript produced at %s. Downstream transcript reasoning has been removed from the runtime.",
                             transcript_path,
                         )
+                        transcript_counted_for_biodata = True
                     self.queue.task_done()
+                    if transcript_counted_for_biodata:
+                        biodata_context_events_since_update += 1
                     if ALWAYS_ON_MODE:
                         services_initialized = await self._restore_chat_residency(
                             llm_adapter=llm_adapter,
@@ -1309,11 +1516,15 @@ class AmbientRuntime:
                                 observation = await passive_observer.process_screenshot(
                                     screenshot_path=job.screenshot_path,
                                     model=PASSIVE_OBSERVER_MODEL,
-                                    recent_context=memory_store.get_recent_context(),
+                                    recent_context=user_context_service.build_prompt_context(
+                                        include_semantic=False,
+                                        max_chars=PERSONALIZATION_PROMPT_CONTEXT_CHARS,
+                                    ),
                                     captured_at=job.captured_at,
                                     similarity_score=job.similarity_score,
                                 )
                             if observation is not None:
+                                biodata_context_events_since_update += 1
                                 logger.info(
                                     "Processed queued screenshot for %s.",
                                     observation.app_name or observation.page_hint or "screen",
@@ -1390,12 +1601,27 @@ class AmbientRuntime:
                                             autonomy_result = await autonomy_coordinator.process_batch(
                                                 model=FOLLOWUP_EXECUTION_MODEL,
                                                 llm_service=llm_service,
-                                                personalization_context=memory_store.get_recent_context(),
+                                                personalization_context=user_context_service.build_prompt_context(
+                                                    include_semantic=True,
+                                                    max_chars=PERSONALIZATION_PROMPT_CONTEXT_CHARS,
+                                                ),
                                                 max_events=RESOURCE_BATCH_MAX_EVENTS,
                                                 max_seconds=RESOURCE_BATCH_MAX_SECONDS,
                                                 should_preempt=self._chat_turn_ready,
                                             )
                             if autonomy_result.get("processed"):
+                                context_event_count = sum(
+                                    1
+                                    for result in autonomy_result.get("results", [])
+                                    if result.get("event_type")
+                                    in {
+                                        "transcript_available",
+                                        "lightweight_visual_capture",
+                                        "visual_context_changed",
+                                    }
+                                )
+                                if context_event_count:
+                                    biodata_context_events_since_update += context_event_count
                                 logger.info(
                                     "Autonomy coordinator processed %s event(s) in %.2fs.",
                                     autonomy_result.get("count"),
@@ -1428,9 +1654,74 @@ class AmbientRuntime:
                                     reason="ambient backlog drained or chat preempted",
                                 )
                         if autonomy_result.get("processed"):
+                            if (
+                                biodata_context_events_since_update >= BIODATA_UPDATE_EVENT_INTERVAL
+                                and not self._chat_turn_ready()
+                            ):
+                                biodata_unit_attempted = False
+                                now = time.monotonic()
+                                try:
+                                    biodata_unit_attempted, services_initialized = await self._run_biodata_update(
+                                        llm_adapter=llm_adapter,
+                                        user_biodata_service=user_biodata_service,
+                                        services_initialized=services_initialized,
+                                        user_active=not user_idle_now,
+                                    )
+                                except ResourceUnavailableError as exc:
+                                    logger.info(
+                                        "User BioData update deferred by resource governor after context-event trigger: %s",
+                                        exc.decision.reason,
+                                    )
+                                except Exception:
+                                    biodata_unit_attempted = True
+                                    logger.exception("User BioData update failed after context-event trigger.")
+                                last_biodata_update_at = now
+                                biodata_context_events_since_update = 0
+                                if biodata_unit_attempted:
+                                    services_initialized = await self._restore_chat_residency(
+                                        llm_adapter=llm_adapter,
+                                        services_initialized=services_initialized,
+                                        reason="biodata update work unit finished",
+                                    )
                             if await self._sleep_or_stop(0.1):
                                 break
                             continue
+
+                if (
+                    autonomy_coordinator is not None
+                    and (
+                        now - last_biodata_update_at >= idle_cycle_interval
+                        or biodata_context_events_since_update >= BIODATA_UPDATE_EVENT_INTERVAL
+                    )
+                    and not self._chat_turn_ready()
+                ):
+                    biodata_unit_attempted = False
+                    try:
+                        biodata_unit_attempted, services_initialized = await self._run_biodata_update(
+                            llm_adapter=llm_adapter,
+                            user_biodata_service=user_biodata_service,
+                            services_initialized=services_initialized,
+                            user_active=not user_idle_now,
+                        )
+                    except ResourceUnavailableError as exc:
+                        logger.info(
+                            "User BioData update deferred by resource governor: %s",
+                            exc.decision.reason,
+                        )
+                    except Exception:
+                        biodata_unit_attempted = True
+                        logger.exception("User BioData update failed.")
+                    last_biodata_update_at = now
+                    biodata_context_events_since_update = 0
+                    if biodata_unit_attempted:
+                        services_initialized = await self._restore_chat_residency(
+                            llm_adapter=llm_adapter,
+                            services_initialized=services_initialized,
+                            reason="biodata update work unit finished",
+                        )
+                        if await self._sleep_or_stop(0.1):
+                            break
+                        continue
 
                 if autonomy_coordinator is None and runtime_active_now and now - last_idle_cycle_at >= idle_cycle_interval:
                     idle_unit_attempted = False
@@ -1593,26 +1884,13 @@ class AmbientRuntime:
                             and user_biodata_service is not None
                             and not ALWAYS_ON_MODE
                         ):
-                            services_initialized = await self._ensure_runtime(
+                            idle_unit_attempted, services_initialized = await self._run_biodata_update(
                                 llm_adapter=llm_adapter,
+                                user_biodata_service=user_biodata_service,
                                 services_initialized=services_initialized,
-                                reason="updating user biodata from passive observations",
-                                model_name=USER_BIODATA_MODEL,
-                            )
-                            with self.gpu_lock:
-                                biodata_result = await user_biodata_service.update_biodata(
-                                    model=USER_BIODATA_MODEL
-                                )
-                            idle_unit_attempted = bool(
-                                biodata_result.get("processed_observation_ids")
-                                or biodata_result.get("entries")
+                                user_active=not user_idle_now,
                             )
                             idle_unit_completed = idle_unit_attempted
-                            logger.info(
-                                "User BioData update processed %s observations and appended %s entries.",
-                                len(biodata_result.get("processed_observation_ids", [])),
-                                len(biodata_result.get("entries", [])),
-                            )
                     except Exception:
                         idle_unit_attempted = True
                         logger.exception("Idle follow-up work unit failed.")
@@ -1701,43 +1979,6 @@ if __name__ == "__main__":
     if recovered_scheduled_tasks:
         logger.warning("Marked %s interrupted scheduled task(s) as failed.", recovered_scheduled_tasks)
     runtime_log_started = False
-    if LOG_API_ENABLED:
-        interaction_store = SQLiteInteractionLogAdapter(db_path=str(INTERACTION_LOG_DB_PATH))
-        training_store = SQLiteTrainingDataAdapter(db_path=str(TRAINING_DATA_DB_PATH))
-        training_service = TrainingDataService(
-            store=training_store,
-            interaction_store=interaction_store,
-            training_root=str(TRAINING_DATA_ROOT),
-            user_data_dir=str(USER_DATA_DIR),
-            uploads_dir=str(UPLOADS_DIR),
-            transcripts_dir=str(TRANSCRIPTIONS_DIR),
-            cleaned_audio_dir=str(CLEANED_AUDIO_DIR),
-        )
-        start_runtime_log_server(
-            host=LOG_API_HOST,
-            port=LOG_API_PORT,
-            max_entries=LOG_API_BUFFER_SIZE,
-            report_store=interaction_store,
-            task_store=SQLiteTaskQueueAdapter(),
-            benchmark_store=SQLiteBenchmarkAdapter(db_path=str(BENCHMARK_DB_PATH)),
-            training_store=training_store,
-            training_service=training_service,
-            media_roots=[str(USER_DATA_DIR), str(TRAINING_DATA_ROOT)],
-            chat_store=chat_store,
-            chat_event_broker=chat_event_broker,
-            autonomy_store=autonomy_api_store,
-            capture_store=capture_store,
-            capture_control=capture_control,
-            resource_governor=resource_governor,
-            rocm_tuning_service=rocm_tuning_service,
-        )
-        logger.info(
-            "Runtime log server started at %s://%s:%s/logs",
-            "http",
-            LOG_API_HOST,
-            LOG_API_PORT,
-        )
-        runtime_log_started = True
 
     gpu_lock = threading.Lock()
     audio_active_event = threading.Event()
@@ -1766,6 +2007,45 @@ if __name__ == "__main__":
         capture_control=capture_control,
         resource_governor=resource_governor,
     )
+
+    if LOG_API_ENABLED:
+        interaction_store = SQLiteInteractionLogAdapter(db_path=str(INTERACTION_LOG_DB_PATH))
+        training_store = SQLiteTrainingDataAdapter(db_path=str(TRAINING_DATA_DB_PATH))
+        training_service = TrainingDataService(
+            store=training_store,
+            interaction_store=interaction_store,
+            training_root=str(TRAINING_DATA_ROOT),
+            user_data_dir=str(USER_DATA_DIR),
+            uploads_dir=str(UPLOADS_DIR),
+            transcripts_dir=str(TRANSCRIPTIONS_DIR),
+            cleaned_audio_dir=str(CLEANED_AUDIO_DIR),
+        )
+        start_runtime_log_server(
+            host=LOG_API_HOST,
+            port=LOG_API_PORT,
+            max_entries=LOG_API_BUFFER_SIZE,
+            report_store=interaction_store,
+            task_store=SQLiteTaskQueueAdapter(),
+            benchmark_store=SQLiteBenchmarkAdapter(db_path=str(BENCHMARK_DB_PATH)),
+            training_store=training_store,
+            training_service=training_service,
+            media_roots=[str(USER_DATA_DIR), str(TRAINING_DATA_ROOT)],
+            chat_store=chat_store,
+            chat_event_broker=chat_event_broker,
+            autonomy_store=autonomy_api_store,
+            capture_store=capture_store,
+            capture_control=capture_control,
+            resource_governor=resource_governor,
+            runtime_control=ambient_runtime,
+            rocm_tuning_service=rocm_tuning_service,
+        )
+        logger.info(
+            "Runtime log server started at %s://%s:%s/logs",
+            "http",
+            LOG_API_HOST,
+            LOG_API_PORT,
+        )
+        runtime_log_started = True
 
     audio_thread = threading.Thread(
         target=audio_agent.start_service,

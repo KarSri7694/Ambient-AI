@@ -148,6 +148,10 @@ class PassiveObserverTests(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
+    def test_memory_adapter_creates_prompt_memory_files_on_startup(self):
+        self.assertTrue((self.temp_path / "USER_INFO.md").exists())
+        self.assertTrue((self.temp_path / "MEMORY.md").exists())
+
     def test_observer_persists_visual_context(self):
         llm = FakeVisualLLM(
             [

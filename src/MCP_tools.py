@@ -529,15 +529,19 @@ async def use_browser(
         str,
         "Detailed browser task including the goal, relevant URLs, stopping conditions, and expected result",
     ],
+    reason: Annotated[
+        str,
+        "Short explanation shown to the user before they allow browser use",
+    ] = "",
 ) -> str:
     """
-    Delegate one browser task to the dedicated browser-control model.
+    Request permission to deploy the dedicated browser-control model.
 
-    The main model is saved and unloaded while the browser agent works. Browser
-    visibility is selected by the user in application configuration, not by the
-    model. Raw browser tools are available only to that delegated agent. This
-    tool is implemented by LLMInteractionService because it owns model handoff
-    state.
+    This never starts browser control by itself. The task is recorded as a
+    pending approval and runs only after the local user allows it in the Ambient
+    AI web UI. Browser visibility is selected by application configuration, not
+    by the model. Raw browser tools are available only to that approved delegated
+    agent. Implemented by LLMInteractionService.
     """
     pass
 

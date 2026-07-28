@@ -65,6 +65,12 @@ Rules:
         )
         return preamble + prompt
 
+    def has_pending_biodata_observations(self) -> bool:
+        observations = self.memory.get_recent_biodata_pending_visual_observations(
+            limit=self.OBSERVATION_LIMIT
+        )
+        return bool(self._candidate_rows(observations))
+
     async def update_biodata(self, *, model: str) -> dict:
         observations = self.memory.get_recent_biodata_pending_visual_observations(limit=self.OBSERVATION_LIMIT)
         candidates = self._candidate_rows(observations)
@@ -101,6 +107,8 @@ Rules:
         parsed = self._parse_json_object(await self._consume_stream_text(completion))
         entries = self._normalize_entries(parsed.get("entries"))
         appended_entries = self._append_entries(entries)
+        if appended_entries and self.semantic_memory is not None:
+            self.semantic_memory.ensure_embeddings_synced(max_batches=1)
         sent_at = datetime.now().isoformat()
         self.memory.mark_visual_observations_biodata_sent(
             [row["observation_id"] for row in candidates],

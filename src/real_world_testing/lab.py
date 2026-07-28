@@ -355,6 +355,7 @@ class ProductionScenarioExecutor:
         from application.services.opportunity_judgment_service import OpportunityJudgmentService
         from application.services.autonomy_coordinator_service import AutonomyCoordinatorService
         from application.services.semantic_memory_service import SemanticMemoryService
+        from application.services.user_context_service import UserContextService
         from infrastructure.adapter.LlamaCppSemanticAdapter import LlamaCppSemanticAdapter
         from infrastructure.adapter.MCPToolAdapter import MCPToolAdapter
         from infrastructure.adapter.SQLiteAutonomyAdapter import SQLiteAutonomyAdapter
@@ -401,6 +402,20 @@ class ProductionScenarioExecutor:
                 vector_limit=parser.getint("semantic_memory", "vector_limit", fallback=12),
                 rerank_limit=parser.getint("semantic_memory", "rerank_limit", fallback=6),
             )
+        user_context = UserContextService(
+            memory=memory,
+            semantic_memory=semantic_memory,
+            enabled=parser.getboolean("personalization", "enabled", fallback=True),
+            stable_profile_chars=parser.getint("personalization", "stable_profile_chars", fallback=3000),
+            working_memory_chars=parser.getint("personalization", "working_memory_chars", fallback=3000),
+            semantic_limit=parser.getint("personalization", "semantic_limit", fallback=8),
+            prompt_context_chars=parser.getint("personalization", "prompt_context_chars", fallback=8000),
+            include_recent_context_legacy=parser.getboolean(
+                "personalization",
+                "include_recent_context_legacy",
+                fallback=True,
+            ),
+        )
         capture_store = PlainCaptureStore(str(self.workspace / "captures"))
         policy = CapabilityPolicyService(
             store=autonomy_store,
@@ -431,6 +446,7 @@ class ProductionScenarioExecutor:
             store=autonomy_store, judgment=OpportunityJudgmentService(llm_provider=llm),
             policy=policy, mode="active", capture_store=capture_store,
             max_inbox_items_per_day=parser.getint("autonomy", "max_inbox_items_per_day", fallback=30),
+            user_context_service=user_context,
         )
         self._apply_seed(memory, scenario.seed)
         started = time.monotonic()
@@ -469,7 +485,10 @@ class ProductionScenarioExecutor:
                     observation = await observer.process_screenshot(
                         screenshot_path=event.media_path,
                         model=self.model_roles["followup_execution_model"],
-                        recent_context=memory.get_recent_context(), captured_at=event.captured_at,
+                        recent_context=user_context.build_prompt_context(
+                            include_semantic=False,
+                            max_chars=parser.getint("personalization", "prompt_context_chars", fallback=8000),
+                        ), captured_at=event.captured_at,
                         similarity_score=job.similarity_score,
                         uiat_context_override=event.screen_context or None,
                         archive_source=False,
@@ -484,7 +503,7 @@ class ProductionScenarioExecutor:
                     await llm.load_model(self.model_roles["followup_execution_model"])
                     result = await coordinator.process_next(
                         model=self.model_roles["followup_execution_model"], llm_service=service,
-                        personalization_context=memory.get_recent_context(),
+                        personalization_context=user_context.build_prompt_context(include_semantic=True),
                         event_callback=self._interaction_event,
                     )
                     final_response = json.dumps(result, ensure_ascii=False)
@@ -502,7 +521,10 @@ class ProductionScenarioExecutor:
                     await llm.load_model(self.model_roles["transcript_processing_model"])
                     result = await coordinator.process_next(
                         model=self.model_roles["transcript_processing_model"], llm_service=service,
-                        personalization_context=memory.get_recent_context(),
+                        personalization_context=user_context.build_prompt_context(
+                            query_text=transcript,
+                            include_semantic=True,
+                        ),
                         event_callback=self._interaction_event,
                     )
                     final_response = json.dumps(result, ensure_ascii=False)

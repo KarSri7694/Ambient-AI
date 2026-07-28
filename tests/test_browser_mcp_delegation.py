@@ -11,11 +11,15 @@ SRC_ROOT = REPO_ROOT / "src"
 sys.path.insert(0, str(SRC_ROOT))
 
 from application.services.llm_interaction_service import LLMInteractionService
+from application.services.capability_policy_service import CapabilityPolicyService
+from application.services.autonomy_coordinator_service import AutonomyCoordinatorService
 from infrastructure.adapter.BrowserMCPToolAdapter import (
     BrowserMCPToolAdapter,
     BrowserMCPToolSession,
 )
 from infrastructure.adapter.MCPToolAdapter import MCPToolAdapter
+from infrastructure.adapter.SQLiteAutonomyAdapter import SQLiteAutonomyAdapter
+from core.models import AmbientEvent
 
 
 def _tool(name: str, description: str = "") -> dict:
@@ -161,16 +165,23 @@ class _BrowserBridge:
         return session
 
 
-def test_use_browser_isolates_tools_and_restores_parent():
+class _Judgment:
+    def qualifies_for_enrichment(self, candidate):
+        return True
+
+
+def test_use_browser_creates_pending_approval_without_running_agent(tmp_path):
     provider = _BrowserFlowProvider()
     main_bridge = _MainToolBridge()
     browser_bridge = _BrowserBridge()
+    store = SQLiteAutonomyAdapter(str(tmp_path / "autonomy.db"))
     service = LLMInteractionService(
         llm_provider=provider,
         tool_bridge=main_bridge,
         browser_tool_bridge=browser_bridge,
         browser_agent_model="browser-model",
         browser_headless=True,
+        capability_policy=CapabilityPolicyService(store=store),
     )
 
     asyncio.run(service.initialize_tools())
@@ -200,18 +211,41 @@ def test_use_browser_isolates_tools_and_restores_parent():
         )
     )
 
-    assert result == [
-        (
-            "use_browser",
-            json.dumps(
-                {
-                    "status": "completed",
-                    "summary": "Opened example.com.",
-                    "browser_exited": True,
-                }
-            ),
+    payload = json.loads(result[0][1])
+    approvals = store.list_approvals(status="pending")
+    assert payload["status"] == "awaiting_user_approval"
+    assert len(approvals) == 1
+    assert approvals[0].capability == "browser.use"
+    assert json.loads(approvals[0].constraints_json)["approval_kind"] == "browser_use_deployment"
+    assert browser_bridge.headless_calls == []
+    assert browser_bridge.sessions == []
+    assert provider.current_model == "main-model"
+    assert provider.events == []
+
+
+def test_browser_agent_isolates_tools_and_restores_parent_after_approval():
+    provider = _BrowserFlowProvider()
+    browser_bridge = _BrowserBridge()
+    service = LLMInteractionService(
+        llm_provider=provider,
+        tool_bridge=_MainToolBridge(),
+        browser_tool_bridge=browser_bridge,
+        browser_agent_model="browser-model",
+        browser_headless=True,
+    )
+
+    result = asyncio.run(
+        service.deploy_browser_agent(
+            task="Open example.com and report its title",
+            approval_id="approval-1",
         )
-    ]
+    )
+
+    assert json.loads(result) == {
+        "status": "completed",
+        "summary": "Opened example.com.",
+        "browser_exited": True,
+    }
     assert browser_bridge.headless_calls == [True]
     assert browser_bridge.sessions[0].executions == [
         ("browser_navigate", {"url": "https://example.com"})
@@ -232,6 +266,63 @@ def test_use_browser_isolates_tools_and_restores_parent():
     finish_schema = provider.calls[0]["tools"][-1]["function"]["parameters"]
     assert finish_schema["required"] == ["exit_browser", "status", "summary"]
     assert finish_schema["additionalProperties"] is False
+
+
+def test_browser_approval_event_deploys_browser_agent_once(tmp_path):
+    store = SQLiteAutonomyAdapter(str(tmp_path / "autonomy.db"))
+    provider = _BrowserFlowProvider()
+    browser_bridge = _BrowserBridge()
+    service = LLMInteractionService(
+        llm_provider=provider,
+        tool_bridge=_MainToolBridge(),
+        browser_tool_bridge=browser_bridge,
+        browser_agent_model="browser-model",
+        browser_headless=True,
+        capability_policy=CapabilityPolicyService(store=store),
+    )
+    coordinator = AutonomyCoordinatorService(
+        store=store,
+        judgment=_Judgment(),
+        policy=CapabilityPolicyService(store=store),
+        mode="active",
+    )
+    event = AmbientEvent(
+        event_id="approval-event",
+        event_type="approval_granted",
+        source_kind="local_approval",
+        source_ref="approval-1",
+        occurred_at="2026-07-28T12:00:00+00:00",
+        payload_json=json.dumps(
+            {
+                "tool_name": "use_browser",
+                "approval_kind": "browser_use_deployment",
+                "arguments": {"task": "Open example.com", "reason": "User asked"},
+            }
+        ),
+        confidence=1.0,
+        privacy_label="private",
+        fingerprint="approval-fingerprint",
+        priority=1.0,
+        available_at="2026-07-28T12:00:00+00:00",
+    )
+    store.enqueue_event(event)
+
+    result = asyncio.run(
+        coordinator.process_next(
+            model="main-model",
+            llm_service=service,
+            personalization_context="",
+        )
+    )
+
+    assert result["outcome"] == "browser_use_completed"
+    assert browser_bridge.headless_calls == [True]
+    assert provider.events == [
+        "save_and_unload_parent",
+        "load:browser-model",
+        "unload:browser-model",
+        "restore_parent",
+    ]
 
 
 def test_finish_browser_task_can_return_without_closing_browser():

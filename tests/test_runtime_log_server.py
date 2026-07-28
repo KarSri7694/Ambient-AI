@@ -29,6 +29,18 @@ class _AuditStore:
         self.events.append((actor, action, entity_id, metadata))
 
 
+class _RuntimeControl:
+    def __init__(self):
+        self.requested = False
+
+    def manual_reflection_status(self):
+        return {"requested": self.requested, "running": False}
+
+    def request_reflection(self):
+        self.requested = True
+        return {"ok": True, "accepted": True, "status": self.manual_reflection_status()}
+
+
 class RuntimeLogServerTests(unittest.TestCase):
     def test_api_returns_recent_buffered_logs(self):
         buffer = RuntimeLogBuffer(max_entries=10)
@@ -92,6 +104,19 @@ class RuntimeLogServerTests(unittest.TestCase):
         self.assertGreaterEqual(len(asset_paths), 2)
         for asset_path in asset_paths:
             self.assertEqual(client.get(asset_path).status_code, 200)
+
+    def test_manual_reflection_runtime_api_uses_runtime_control(self):
+        runtime = _RuntimeControl()
+        client = TestClient(create_runtime_log_app(RuntimeLogBuffer(), runtime_control=runtime))
+
+        status = client.get("/api/runtime/reflection/status")
+        started = client.post("/api/runtime/reflection/run")
+
+        self.assertEqual(status.status_code, 200)
+        self.assertFalse(status.json()["status"]["requested"])
+        self.assertEqual(started.status_code, 200)
+        self.assertTrue(started.json()["status"]["requested"])
+        self.assertTrue(runtime.requested)
 
     def test_interaction_store_filters_sorts_and_counts_deterministically(self):
         with tempfile.TemporaryDirectory() as tmpdir:

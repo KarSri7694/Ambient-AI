@@ -44,6 +44,30 @@ class _JudgmentProvider:
         return stream()
 
 
+class _CapturingJudgment:
+    def __init__(self):
+        self.personalization_contexts = []
+
+    async def judge(self, *, event, model, personalization_context=""):
+        self.personalization_contexts.append(personalization_context)
+        return None
+
+
+class _UserContext:
+    def __init__(self):
+        self.queries = []
+
+    def build_prompt_context(self, *, query_text="", include_semantic=True, max_chars=None):
+        self.queries.append(
+            {
+                "query_text": query_text,
+                "include_semantic": include_semantic,
+                "max_chars": max_chars,
+            }
+        )
+        return "User profile: user is building Ambient AI for ROCm hackathon."
+
+
 def _event(event_id: str = "event-1", fingerprint: str = "fingerprint-1") -> AmbientEvent:
     now = datetime.now(timezone.utc).isoformat()
     return AmbientEvent(
@@ -113,6 +137,33 @@ def test_shadow_coordinator_judges_active_context_without_idle_trigger(tmp_path)
     assert len(inbox) == 1
     assert "Research tracks" in inbox[0].summary
     assert "No tools or external actions" in inbox[0].detailed_report
+
+
+def test_coordinator_builds_event_specific_personalization_context(tmp_path):
+    store = SQLiteAutonomyAdapter(str(tmp_path / "autonomy.db"))
+    judgment = _CapturingJudgment()
+    user_context = _UserContext()
+    coordinator = AutonomyCoordinatorService(
+        store=store,
+        judgment=judgment,
+        policy=CapabilityPolicyService(store=store),
+        mode="shadow",
+        user_context_service=user_context,
+    )
+    store.enqueue_event(_event())
+
+    result = asyncio.run(
+        coordinator.process_next(
+            model="test-model",
+            llm_service=SimpleNamespace(),
+            personalization_context="stale recent context",
+        )
+    )
+
+    assert result["outcome"] == "ignored"
+    assert "ROCm hackathon" in judgment.personalization_contexts[-1]
+    assert "Applications close Friday" in user_context.queries[-1]["query_text"]
+    assert user_context.queries[-1]["include_semantic"] is True
 
 
 def test_policy_blocks_inferred_shell_and_requires_approval_for_browser_mutation(tmp_path):

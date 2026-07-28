@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Activity, BarChart3, Bot, BrainCircuit, Database, FileText, Inbox,
-  MessageSquare, Moon, Pause, Play, ScrollText, Sun, TestTube2,
+  MessageSquare, Moon, Pause, Play, RotateCcw, ScrollText, Sun, TestTube2,
 } from "lucide-react";
 import { getJson, sendJson } from "./api";
 import { Badge, Button } from "./components/ui";
@@ -75,10 +75,22 @@ export function App() {
     queryFn: () => getJson<any>("/healthz"),
     refetchInterval: 5000,
   });
+  const reflection = useQuery({
+    queryKey: ["manual-reflection-status"],
+    queryFn: () => getJson<any>("/api/runtime/reflection/status"),
+    refetchInterval: 2000,
+    retry: false,
+  });
   const capturePaused = Boolean(privacy.data?.capture?.paused);
+  const reflectionStatus = reflection.data?.status || {};
+  const reflectionBusy = Boolean(reflectionStatus.running || reflectionStatus.requested);
   const captureMutation = useMutation({
     mutationFn: () => sendJson(`/api/privacy/capture/${capturePaused ? "resume" : "pause"}`, "POST"),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["privacy-status"] }),
+  });
+  const reflectionMutation = useMutation({
+    mutationFn: () => sendJson("/api/runtime/reflection/run", "POST"),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["manual-reflection-status"] }),
   });
   const page = useMemo(() => {
     switch (path) {
@@ -133,6 +145,10 @@ export function App() {
           </div>
           <div className="flex items-center gap-2">
             <Badge tone={capturePaused ? "warn" : "good"}>{capturePaused ? "Capture paused" : "Capture active"}</Badge>
+            {reflectionBusy && <Badge tone={reflectionStatus.running ? "warn" : "neutral"}>{reflectionStatus.running ? "Reflection running" : "Reflection queued"}</Badge>}
+            <Button variant="secondary" onClick={() => reflectionMutation.mutate()} disabled={reflectionMutation.isPending || reflectionBusy} title="Run reflection now, bypassing cadence and idle checks">
+              <RotateCcw size={16} />{reflectionBusy ? "Reflection queued" : "Run reflection"}
+            </Button>
             <Button variant="secondary" onClick={() => captureMutation.mutate()} disabled={captureMutation.isPending}>
               {capturePaused ? <Play size={16} /> : <Pause size={16} />}{capturePaused ? "Resume" : "Pause"}
             </Button>

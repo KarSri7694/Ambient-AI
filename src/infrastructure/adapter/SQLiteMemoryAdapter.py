@@ -53,6 +53,7 @@ class SQLiteMemoryAdapter(MemoryPort):
         self.memory_root.mkdir(parents=True, exist_ok=True)
         self._init_db()
         self._ensure_visual_observation_columns()
+        self._ensure_prompt_memory_files()
         self._write_index()
 
     def _connection(self) -> sqlite3.Connection:
@@ -69,6 +70,11 @@ class SQLiteMemoryAdapter(MemoryPort):
             conn.commit()
         finally:
             conn.close()
+
+    def _ensure_prompt_memory_files(self) -> None:
+        self.working_memory_path.parent.mkdir(parents=True, exist_ok=True)
+        self.working_memory_path.touch(exist_ok=True)
+        self.user_info_path.touch(exist_ok=True)
 
     def _init_db(self) -> None:
         with self._managed_connection() as conn:

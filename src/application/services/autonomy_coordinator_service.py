@@ -47,6 +47,7 @@ Requirements:
         capture_store: Optional[Any] = None,
         visual_observer: Optional[Any] = None,
         visual_model: str = "",
+        user_context_service: Optional[Any] = None,
         logger: logging.Logger | None = None,
     ):
         self.store = store
@@ -58,6 +59,7 @@ Requirements:
         self.capture_store = capture_store
         self.visual_observer = visual_observer
         self.visual_model = str(visual_model or "")
+        self.user_context_service = user_context_service
         self.logger = logger or logging.getLogger(self.__class__.__name__)
 
     def enqueue_visual_observation(self, observation: VisualObservation) -> AmbientEvent:
@@ -213,7 +215,17 @@ Requirements:
             event.event_type,
             event.source_kind,
         )
+        def event_result(payload: dict[str, Any]) -> dict[str, Any]:
+            payload.setdefault("event_id", event.event_id)
+            payload.setdefault("event_type", event.event_type)
+            payload.setdefault("source_kind", event.source_kind)
+            return payload
+
         try:
+            personalization_context = self._personalization_for_event(
+                event,
+                fallback=personalization_context,
+            )
             if event.event_type == "lightweight_visual_capture":
                 event = await self._enrich_lightweight_visual(
                     event,
@@ -224,6 +236,42 @@ Requirements:
                     event.event_id,
                     self._safe_json(event.payload_json).get("capture_mode", "lightweight"),
                 )
+                personalization_context = self._personalization_for_event(
+                    event,
+                    fallback=personalization_context,
+                )
+            if event.event_type == "approval_granted" and self._is_browser_use_approval(event):
+                payload = self._safe_json(event.payload_json)
+                arguments = payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {}
+                task = str(arguments.get("task") or "").strip()
+                if not task:
+                    self.store.complete_event(
+                        event.event_id,
+                        status="dead_letter",
+                        error_text="approved browser-use request had no task",
+                    )
+                    return event_result({
+                        "processed": True,
+                        "outcome": "invalid_browser_use_approval",
+                    })
+                result = await llm_service.deploy_browser_agent(
+                    task=task,
+                    approval_id=event.source_ref,
+                    event_callback=event_callback,
+                )
+                if hasattr(self.store, "audit"):
+                    self.store.audit(
+                        "ambient_agent",
+                        "browser_use.deployed",
+                        event.source_ref,
+                        {"event_id": event.event_id, "result": result[:2000]},
+                    )
+                self.store.complete_event(event.event_id)
+                return event_result({
+                    "processed": True,
+                    "outcome": "browser_use_completed",
+                    "result": result,
+                })
             if event.event_type == "approval_granted" and self._is_computer_use_approval(event):
                 payload = self._safe_json(event.payload_json)
                 arguments = payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {}
@@ -234,11 +282,10 @@ Requirements:
                         status="dead_letter",
                         error_text="approved computer-use request had no task",
                     )
-                    return {
+                    return event_result({
                         "processed": True,
-                        "event_id": event.event_id,
                         "outcome": "invalid_computer_use_approval",
-                    }
+                    })
                 result = await llm_service.deploy_computer_agent(
                     task=task,
                     approval_id=event.source_ref,
@@ -252,12 +299,11 @@ Requirements:
                         {"event_id": event.event_id, "result": result[:2000]},
                     )
                 self.store.complete_event(event.event_id)
-                return {
+                return event_result({
                     "processed": True,
-                    "event_id": event.event_id,
                     "outcome": "computer_use_completed",
                     "result": result,
-                }
+                })
             with interaction_trace(
                 "autonomy_judgment",
                 {"event_id": event.event_id, "privacy_label": event.privacy_label},
@@ -272,7 +318,7 @@ Requirements:
             if candidate is None:
                 self.store.complete_event(event.event_id, status="ignored")
                 self.logger.info("Ambient event %s was judged as background/noise.", event.event_id)
-                return {"processed": True, "event_id": event.event_id, "outcome": "ignored"}
+                return event_result({"processed": True, "outcome": "ignored"})
             candidate = self.store.upsert_opportunity(candidate)
             if hasattr(self.store, "get_inbox_for_opportunity"):
                 prior_item = self.store.get_inbox_for_opportunity(candidate.opportunity_id)
@@ -281,11 +327,11 @@ Requirements:
                 }:
                     self.store.update_opportunity_status(candidate.opportunity_id, "suppressed_by_feedback")
                     self.store.complete_event(event.event_id, status="ignored")
-                    return {"processed": True, "event_id": event.event_id, "outcome": "suppressed"}
+                    return event_result({"processed": True, "outcome": "suppressed"})
             if not self.judgment.qualifies_for_enrichment(candidate):
                 self.store.update_opportunity_status(candidate.opportunity_id, "tracking")
                 self.store.complete_event(event.event_id)
-                return {"processed": True, "event_id": event.event_id, "outcome": "tracking"}
+                return event_result({"processed": True, "outcome": "tracking"})
 
             if hasattr(self.store, "count_inbox_since"):
                 since = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
@@ -301,14 +347,14 @@ Requirements:
                         delay_seconds=3600,
                         max_attempts=24,
                     )
-                    return {"processed": True, "event_id": event.event_id, "outcome": "deferred_budget"}
+                    return event_result({"processed": True, "outcome": "deferred_budget"})
 
             if self.mode == "shadow":
                 item = self._shadow_inbox(candidate, event)
                 self.store.add_inbox_item(item)
                 self.store.update_opportunity_status(candidate.opportunity_id, "shadow_proposed")
                 self.store.complete_event(event.event_id)
-                return {"processed": True, "event_id": event.event_id, "outcome": "shadow", "inbox_id": item.inbox_id}
+                return event_result({"processed": True, "outcome": "shadow", "inbox_id": item.inbox_id})
 
             allowed_names = self._allowed_tool_names(llm_service, candidate.confidence)
             if event.event_type == "approval_granted":
@@ -386,7 +432,7 @@ Requirements:
             self.store.complete_run(run.run_id, summary=item.summary, output_text=result)
             self.store.update_opportunity_status(candidate.opportunity_id, inbox_status)
             self.store.complete_event(event.event_id)
-            return {"processed": True, "event_id": event.event_id, "outcome": "completed", "inbox_id": item.inbox_id}
+            return event_result({"processed": True, "outcome": "completed", "inbox_id": item.inbox_id})
         except ResourceUnavailableError as exc:
             self.store.defer_event(event.event_id, reason=exc.decision.reason, delay_seconds=30)
             self.logger.warning(
@@ -394,16 +440,15 @@ Requirements:
                 event.event_id,
                 exc.decision.reason,
             )
-            return {
+            return event_result({
                 "processed": True,
-                "event_id": event.event_id,
                 "outcome": "resource_deferred",
                 "reason": exc.decision.reason,
-            }
+            })
         except Exception as exc:
             self.logger.exception("Autonomy event %s failed.", event.event_id)
             self.store.retry_event(event.event_id, error_text=str(exc))
-            return {"processed": True, "event_id": event.event_id, "outcome": "retry", "error": str(exc)}
+            return event_result({"processed": True, "outcome": "retry", "error": str(exc)})
 
     async def process_batch(
         self,
@@ -452,6 +497,40 @@ Requirements:
 
     def event_counts(self) -> dict[str, int]:
         return dict(getattr(self.store, "event_counts", lambda: {})())
+
+    def _personalization_for_event(self, event: AmbientEvent, *, fallback: str) -> str:
+        if self.user_context_service is None:
+            return fallback
+        query_text = self._event_query_text(event)
+        return self.user_context_service.build_prompt_context(
+            query_text=query_text,
+            include_semantic=bool(query_text),
+        ) or fallback
+
+    def _event_query_text(self, event: AmbientEvent) -> str:
+        payload = self._safe_json(event.payload_json)
+        parts = [
+            event.event_type,
+            event.source_kind,
+            payload.get("title"),
+            payload.get("goal"),
+            payload.get("summary"),
+            payload.get("detailed_description"),
+            payload.get("activity"),
+            payload.get("possible_next_task"),
+            payload.get("text"),
+            payload.get("page_title"),
+            payload.get("window_title"),
+            payload.get("url"),
+            payload.get("domain"),
+        ]
+        topics = payload.get("suggested_research_topics")
+        if isinstance(topics, list):
+            parts.extend(str(item) for item in topics)
+        metadata = payload.get("metadata")
+        if isinstance(metadata, dict):
+            parts.extend(str(value) for value in metadata.values())
+        return " ".join(str(part).strip() for part in parts if str(part or "").strip())[:6000]
 
     async def _enrich_lightweight_visual(
         self,
@@ -577,6 +656,13 @@ Requirements:
         return (
             str(payload.get("approval_kind") or "") == "computer_use_deployment"
             and str(payload.get("tool_name") or "") == "request_computer_use"
+        )
+
+    def _is_browser_use_approval(self, event: AmbientEvent) -> bool:
+        payload = self._safe_json(event.payload_json)
+        return (
+            str(payload.get("approval_kind") or "") == "browser_use_deployment"
+            and str(payload.get("tool_name") or "") == "use_browser"
         )
 
     @staticmethod

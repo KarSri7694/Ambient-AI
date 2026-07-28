@@ -67,7 +67,7 @@ class LLMInteractionService:
         "finish_filesystem_task",
         "finish_computer_task",
     }
-    LOCAL_CONTROL_REQUEST_TOOLS = {"request_computer_use"}
+    LOCAL_CONTROL_REQUEST_TOOLS = {"use_browser", "request_computer_use"}
     FINISH_BROWSER_TASK_TOOL = {
         "type": "function",
         "function": {
@@ -581,6 +581,72 @@ class LLMInteractionService:
                     ) from cleanup_error
 
             return browser_result
+
+    def _request_browser_use(self, *, task: str, reason: str, agent_depth: int) -> str:
+        if agent_depth != 0:
+            raise RuntimeError("use_browser can only be called by the root agent.")
+        if not task.strip():
+            raise ValueError("use_browser requires a non-empty task.")
+        if self.browser_tool_bridge is None:
+            raise RuntimeError("Browser MCP delegation is not configured.")
+        if not self.browser_agent_model:
+            raise RuntimeError("No browser model is configured.")
+        if self.capability_policy is None or not hasattr(self.capability_policy.store, "create_approval"):
+            raise RuntimeError("Browser-use approvals require the autonomy approval store.")
+
+        arguments = {"task": task.strip(), "reason": reason.strip()}
+        fingerprint = self.capability_policy.action_fingerprint("use_browser", arguments)
+        now = datetime.now(timezone.utc)
+        approval = ApprovalGrant(
+            approval_id=uuid.uuid4().hex,
+            capability="browser.use",
+            action_fingerprint=fingerprint,
+            constraints_json=json.dumps(
+                {
+                    "tool_name": "use_browser",
+                    "arguments": arguments,
+                    "approval_kind": "browser_use_deployment",
+                },
+                ensure_ascii=False,
+            ),
+            status="pending",
+            created_at=now.isoformat(),
+            expires_at=(now + timedelta(minutes=10)).isoformat(),
+            approver="pending",
+        )
+        self.capability_policy.store.create_approval(approval)
+        if hasattr(self.capability_policy.store, "audit"):
+            self.capability_policy.store.audit(
+                "ambient_agent",
+                "browser_use.requested",
+                approval.approval_id,
+                arguments,
+            )
+        return json.dumps(
+            {
+                "status": "awaiting_user_approval",
+                "approval_id": approval.approval_id,
+                "message": "Browser-use agent will deploy only after the local user allows it in the Ambient AI web UI.",
+            },
+            ensure_ascii=False,
+        )
+
+    async def deploy_browser_agent(
+        self,
+        *,
+        task: str,
+        approval_id: str = "",
+        event_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> str:
+        result = await self._run_browser_agent(task=task, agent_depth=0)
+        if self.capability_policy is not None and hasattr(self.capability_policy.store, "audit"):
+            self.capability_policy.store.audit(
+                "ambient_agent",
+                "browser_use.completed",
+                approval_id or "unknown",
+                {"result": result[:2000]},
+            )
+        return result
 
     async def _run_filesystem_agent(
         self,
@@ -1120,8 +1186,9 @@ class LLMInteractionService:
                         continue
                 if tool_name == "use_browser":
                     task = tool_args.get("task", "")
-                    response_content = await self._run_browser_agent(
+                    response_content = self._request_browser_use(
                         task=str(task),
+                        reason=str(tool_args.get("reason", "")),
                         agent_depth=agent_depth,
                     )
                 elif tool_name == "use_filesystem":
