@@ -17,6 +17,13 @@ set -euo pipefail
 #   RUNS=3
 #   WARMUPS=1
 #   MAX_TOKENS=1024
+#   BATCH_START=2048
+#   BATCH_MAX=4096
+#   UBATCH_START=512
+#   UBATCH_MAX=2048
+#   BATCH_STEP=512
+#   MTP_DRAFT_MIN=1
+#   MTP_DRAFT_MAX=4
 #
 # Custom configs:
 #   CONFIGS=("name::llama-server args" "other::llama-server args")
@@ -35,6 +42,14 @@ STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-120}"
 REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-900}"
 LOG_SETTLE_SECONDS="${LOG_SETTLE_SECONDS:-0.25}"
 MAX_TOKENS="${MAX_TOKENS:-1024}"
+TURN_IDLE_TIMEOUT="${TURN_IDLE_TIMEOUT:-120}"
+BATCH_START="${BATCH_START:-2048}"
+BATCH_MAX="${BATCH_MAX:-4096}"
+UBATCH_START="${UBATCH_START:-512}"
+UBATCH_MAX="${UBATCH_MAX:-2048}"
+BATCH_STEP="${BATCH_STEP:-512}"
+MTP_DRAFT_MIN="${MTP_DRAFT_MIN:-1}"
+MTP_DRAFT_MAX="${MTP_DRAFT_MAX:-4}"
 
 if [[ -z "$LLAMA_SERVER" || ! -x "$LLAMA_SERVER" ]]; then
   echo "Set LLAMA_SERVER to an executable llama-server path." >&2
@@ -68,16 +83,30 @@ cleanup() {
 trap cleanup EXIT
 
 if ! declare -p CONFIGS >/dev/null 2>&1 || [[ ${#CONFIGS[@]} -eq 0 ]]; then
-  CONFIGS=(
-    "q8-b4096-ub1024::-c 200000 -ngl 999 -fa on -ctk q8_0 -ctv q8_0 -b 4096 -ub 1024"
-    "q4-b4096-ub1024::-c 200000 -ngl 999 -fa on -ctk q4_0 -ctv q4_0 -b 4096 -ub 1024"
-    "q8-b8192-ub2048::-c 200000 -ngl 999 -fa on -ctk q8_0 -ctv q8_0 -b 8192 -ub 2048"
-  )
+  CONFIGS=()
+  for ((batch_size=BATCH_START; batch_size<=BATCH_MAX; batch_size+=BATCH_STEP)); do
+    for ((ubatch_size=UBATCH_START; ubatch_size<=UBATCH_MAX; ubatch_size+=BATCH_STEP)); do
+      if (( ubatch_size > batch_size )); then
+        continue
+      fi
+      CONFIGS+=(
+        "base-b${batch_size}-ub${ubatch_size}::-c 200000 -ngl 999 -fa on -ctk q8_0 -ctv q8_0 -b ${batch_size} -ub ${ubatch_size}"
+      )
+    done
+  done
   if [[ -n "$MTP_MODEL" && -f "$MTP_MODEL" ]]; then
-    CONFIGS+=(
-      "mtp-q8-b4096-ub1024::-c 200000 -ngl 999 -fa on -ctk q8_0 -ctv q8_0 -b 4096 -ub 1024 --model-draft $MTP_MODEL --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-n-min 1"
-      "mtp-q4-b4096-ub1024::-c 200000 -ngl 999 -fa on -ctk q4_0 -ctv q4_0 -b 4096 -ub 1024 --model-draft $MTP_MODEL --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-n-min 1"
-    )
+    for ((batch_size=BATCH_START; batch_size<=BATCH_MAX; batch_size+=BATCH_STEP)); do
+      for ((ubatch_size=UBATCH_START; ubatch_size<=UBATCH_MAX; ubatch_size+=BATCH_STEP)); do
+        if (( ubatch_size > batch_size )); then
+          continue
+        fi
+        for ((draft_tokens=MTP_DRAFT_MIN; draft_tokens<=MTP_DRAFT_MAX; draft_tokens++)); do
+          CONFIGS+=(
+            "mtp-d${draft_tokens}-b${batch_size}-ub${ubatch_size}::-c 200000 -ngl 999 -fa on -ctk q8_0 -ctv q8_0 -b ${batch_size} -ub ${ubatch_size} --model-draft $MTP_MODEL --spec-type draft-mtp --spec-draft-n-max ${draft_tokens} --spec-draft-n-min 1"
+          )
+        done
+      done
+    done
   fi
 fi
 
@@ -106,6 +135,23 @@ wait_for_server() {
     fi
     sleep 1
   done
+}
+
+wait_for_idle() {
+  local deadline=$((SECONDS + TURN_IDLE_TIMEOUT))
+  while [[ $SECONDS -lt $deadline ]]; do
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+      return 1
+    fi
+    if curl -fsS "http://$HOST:$PORT/health" >/dev/null 2>&1; then
+      return 0
+    fi
+    if curl -fsS "http://$HOST:$PORT/v1/models" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
 }
 
 stop_server() {
@@ -155,6 +201,7 @@ body = json.dumps({
     "model": "local-model",
     "messages": messages,
     "max_tokens": int(max_tokens),
+    "n_predict": int(max_tokens),
     "stream": True,
     "stream_options": {"include_usage": True},
 }).encode("utf-8")
@@ -167,30 +214,47 @@ first = None
 chunks = []
 usage = None
 server_timings = {}
-with urllib.request.urlopen(request, timeout=timeout) as response:
-    for raw_line in response:
-        line = raw_line.decode("utf-8", errors="replace").strip()
-        if not line.startswith("data: "):
-            continue
-        data = line[6:]
-        if data == "[DONE]":
-            break
-        chunk = json.loads(data)
-        if chunk.get("usage"):
-            usage = chunk["usage"]
-        for key in ("prompt_ms", "prompt_n", "prompt_per_second", "predicted_ms", "predicted_n", "predicted_per_second", "timings"):
-            if key in chunk:
-                server_timings[key] = chunk[key]
-        choices = chunk.get("choices") or []
-        delta = None
-        if choices:
-            delta = choices[0].get("delta", {}).get("content")
-        if delta:
-            if first is None:
-                first = time.perf_counter()
-            chunks.append(delta)
+try:
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        for raw_line in response:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line.startswith("data: "):
+                continue
+            data = line[6:]
+            if data == "[DONE]":
+                break
+            chunk = json.loads(data)
+            if chunk.get("usage"):
+                usage = chunk["usage"]
+            if chunk.get("error"):
+                raise RuntimeError(json.dumps(chunk["error"], ensure_ascii=False))
+            for key in ("prompt_ms", "prompt_n", "prompt_per_second", "predicted_ms", "predicted_n", "predicted_per_second", "timings"):
+                if key in chunk:
+                    server_timings[key] = chunk[key]
+            choices = chunk.get("choices") or []
+            delta = None
+            if choices:
+                delta = choices[0].get("delta", {}).get("content")
+            if delta:
+                if first is None:
+                    first = time.perf_counter()
+                chunks.append(delta)
+except Exception as exc:
+    error_text = str(exc)
+    if hasattr(exc, "read"):
+        try:
+            error_text = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+    with open(response_path, "w", encoding="utf-8") as handle:
+        json.dump({"error": error_text, "total_seconds": time.perf_counter() - started}, handle, ensure_ascii=False)
+    raise SystemExit(1)
 ended = time.perf_counter()
 answer = "".join(chunks)
+if not answer and usage is None and not server_timings:
+    with open(response_path, "w", encoding="utf-8") as handle:
+        json.dump({"error": "empty streamed response with no usage or timings", "total_seconds": ended - started}, handle, ensure_ascii=False)
+    raise SystemExit(1)
 messages.append({"role": "assistant", "content": answer})
 with open(messages_path, "w", encoding="utf-8") as handle:
     json.dump(messages, handle, ensure_ascii=False)
@@ -266,6 +330,7 @@ for entry in "${CONFIGS[@]}"; do
 
   total_iterations=$((WARMUPS + RUNS))
   for ((run_index=0; run_index<total_iterations; run_index++)); do
+    config_failed=false
     messages_file="$TMP_ROOT/messages-$name-$run_index.json"
     echo "[]" > "$messages_file"
     warmup=false
@@ -275,14 +340,26 @@ for entry in "${CONFIGS[@]}"; do
     prompt_count="$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))))' "$TMP_ROOT/prompts.json")"
     for ((turn_index=0; turn_index<prompt_count; turn_index++)); do
       prompt="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[int(sys.argv[2])])' "$TMP_ROOT/prompts.json" "$turn_index")"
-      before_size="$(wc -c < "$log_file" | tr -d ' ')"
-      response_file="$TMP_ROOT/response-$name-$run_index-$turn_index.json"
-      status="completed"
-      error=""
-      if ! run_turn "$messages_file" "$prompt" "$response_file" "$MAX_TOKENS"; then
+      if ! wait_for_idle; then
         status="failed"
-        error="request failed"
-        echo "{}" > "$response_file"
+        error="server not reachable before turn"
+        response_file="$TMP_ROOT/response-$name-$run_index-$turn_index.json"
+        echo "{\"error\":\"$error\",\"total_seconds\":0}" > "$response_file"
+        config_failed=true
+      fi
+      before_size="$(wc -c < "$log_file" | tr -d ' ')"
+      if [[ "$config_failed" != "true" ]]; then
+        response_file="$TMP_ROOT/response-$name-$run_index-$turn_index.json"
+        status="completed"
+        error=""
+        if ! run_turn "$messages_file" "$prompt" "$response_file" "$MAX_TOKENS"; then
+          status="failed"
+          error="$(json_get "$response_file" error)"
+          if [[ -z "$error" ]]; then
+            error="request failed"
+          fi
+          config_failed=true
+        fi
       fi
       sleep "$LOG_SETTLE_SECONDS"
       perf_file="$TMP_ROOT/perf-$name-$run_index-$turn_index.json"
@@ -314,7 +391,14 @@ PY
       cat "$merged_file" >> "$JSONL"
       echo >> "$JSONL"
       echo "$(csv_escape "$name"),$status,$run_index,$turn_index,$warmup,$(json_get "$merged_file" total_seconds),$(json_get "$merged_file" ttft_seconds),$(json_get "$merged_file" prompt_eval_tokens_per_second),$(json_get "$merged_file" server_eval_tokens_per_second),$(json_get "$merged_file" response_prompt_per_second),$(json_get "$merged_file" response_predicted_per_second),$(json_get "$merged_file" completion_chars),$(csv_escape "$error")" >> "$CSV"
+      if [[ "$config_failed" == "true" ]]; then
+        echo "Stopping config $name after failed turn $turn_index: $error"
+        break
+      fi
     done
+    if [[ "$config_failed" == "true" ]]; then
+      break
+    fi
   done
   stop_server
 done
