@@ -18,25 +18,29 @@ from typing import Any
 import requests
 
 
-DEFAULT_PROMPT = """
-You are Ambient AI running a long real-world reasoning test.
-
-Analyze the following scenario in depth: a user has a busy workday with overlapping
-meetings, a pending document review, an urgent email thread, a calendar conflict,
-and several privacy-sensitive browser tabs open. Produce a detailed operational
-plan for how a local ambient agent should observe context, decide whether to act,
-request permission, call tools, summarize outcomes, and avoid unsafe behavior.
-
-Include:
-1. a detailed timeline of decisions,
-2. the exact tool calls the agent should consider,
-3. what information should remain private,
-4. how memory should be updated,
-5. how the agent should recover from failed tools,
-6. how to explain the final result to the user.
-
-Write a long, structured answer with concrete examples and no filler.
-""".strip()
+DEFAULT_PROMPTS = [
+    """
+    Explain the history, engineering tradeoffs, and practical applications of suspension bridges.
+    Include load paths, materials, failure modes, and how modern monitoring systems improve safety.
+    """,
+    """
+    Now design a fictional suspension bridge for a windy coastal city. Give constraints,
+    dimensions, materials, inspection routines, and the reasoning behind each decision.
+    """,
+    """
+    A city council says the bridge must also support emergency evacuation, cycling lanes,
+    maintenance robots, and severe corrosion risk. Revise the design while preserving
+    the earlier assumptions where possible.
+    """,
+    """
+    Create a risk register for the revised bridge. Include likelihood, impact, detection
+    strategy, mitigation, and the owner responsible for each risk.
+    """,
+    """
+    Summarize the entire bridge proposal as an executive briefing, explicitly referencing
+    earlier design decisions and explaining what changed across the conversation.
+    """,
+]
 
 
 TIMING_PATTERNS = {
@@ -56,6 +60,10 @@ TIMING_PATTERNS = {
 class Variant:
     name: str
     args: list[str]
+
+    @property
+    def uses_mtp(self) -> bool:
+        return "--spec-type" in self.args and "draft-mtp" in self.args
 
 
 def default_variants() -> list[Variant]:
@@ -112,51 +120,58 @@ def stop_process(process: subprocess.Popen) -> None:
         process.wait(timeout=10)
 
 
-def run_chat(base_url: str, api_key: str, model: str, prompt: str, max_tokens: int, timeout: float) -> dict[str, Any]:
+def run_chat_turn(base_url: str, api_key: str, model: str, messages: list[dict[str, str]], max_tokens: int | None, timeout: float) -> dict[str, Any]:
     started = time.perf_counter()
-    first_token_at = None
-    completion = []
+    body: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+    }
+    if max_tokens is not None:
+        body["max_tokens"] = max_tokens
     response = requests.post(
         f"{base_url}/v1/chat/completions",
         headers={"Authorization": f"Bearer {api_key}"},
-        json={
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": max_tokens,
-            "stream": True,
-            "stream_options": {"include_usage": True},
-        },
-        stream=True,
+        json=body,
         timeout=timeout,
     )
     response.raise_for_status()
-    usage = None
-    for line in response.iter_lines(decode_unicode=True):
-        if not line or not line.startswith("data: "):
-            continue
-        data = line[6:]
-        if data == "[DONE]":
-            break
-        chunk = json.loads(data)
-        if chunk.get("usage"):
-            usage = chunk["usage"]
-        delta = chunk.get("choices", [{}])[0].get("delta", {}).get("content")
-        if delta:
-            if first_token_at is None:
-                first_token_at = time.perf_counter()
-            completion.append(delta)
     ended = time.perf_counter()
-    output = "".join(completion)
-    generation_seconds = max(0.0, ended - (first_token_at or ended))
+    payload = response.json()
+    output = payload.get("choices", [{}])[0].get("message", {}).get("content") or ""
+    timings = {
+        key: payload.get(key)
+        for key in (
+            "tokens_predicted",
+            "tokens_evaluated",
+            "generation_settings",
+            "prompt_ms",
+            "prompt_n",
+            "prompt_per_second",
+            "predicted_ms",
+            "predicted_n",
+            "predicted_per_second",
+            "timings",
+        )
+        if key in payload
+    }
     return {
-        "ttft_seconds": (first_token_at - started) if first_token_at else None,
         "total_seconds": ended - started,
-        "generation_seconds": generation_seconds,
+        "completion_seconds": ended - started,
         "completion_chars": len(output),
         "completion_estimated_tokens": max(1, len(output) // 4) if output else 0,
-        "client_chars_per_second": len(output) / generation_seconds if generation_seconds > 0 else None,
-        "usage": usage,
+        "client_chars_per_second": len(output) / (ended - started) if ended > started else None,
+        "usage": payload.get("usage"),
+        "server_timings": timings,
+        "response_preview": output[:500],
+        "response_text": output,
     }
+
+
+def model_for_variant(args: argparse.Namespace, variant: Variant) -> str:
+    if variant.uses_mtp and args.mtp_model:
+        return args.mtp_model
+    return args.model
 
 
 def parse_server_timings(log_text: str) -> dict[str, Any]:
@@ -186,11 +201,12 @@ def parse_server_timings(log_text: str) -> dict[str, Any]:
 def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     summary: dict[str, Any] = {"runs": len(rows)}
     fields = [
-        "ttft_seconds",
         "total_seconds",
         "client_chars_per_second",
         "prompt_eval_tokens_per_second",
         "server_eval_tokens_per_second",
+        "response_prompt_per_second",
+        "response_predicted_per_second",
     ]
     for field in fields:
         values = [float(row[field]) for row in rows if row.get(field) is not None]
@@ -199,8 +215,24 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return summary
 
 
-def benchmark_variant(args: argparse.Namespace, variant: Variant, prompt: str) -> dict[str, Any]:
+def _response_speed_fields(row: dict[str, Any]) -> dict[str, Any]:
+    timings = row.get("server_timings") or {}
+    nested = timings.get("timings") if isinstance(timings.get("timings"), dict) else {}
+    prompt_speed = timings.get("prompt_per_second") or nested.get("prompt_per_second")
+    predicted_speed = timings.get("predicted_per_second") or nested.get("predicted_per_second")
+    prompt_ms = timings.get("prompt_ms") or nested.get("prompt_ms")
+    predicted_ms = timings.get("predicted_ms") or nested.get("predicted_ms")
+    return {
+        "response_prompt_per_second": prompt_speed,
+        "response_predicted_per_second": predicted_speed,
+        "response_prompt_ms": prompt_ms,
+        "response_predicted_ms": predicted_ms,
+    }
+
+
+def benchmark_variant(args: argparse.Namespace, variant: Variant, prompts: list[str]) -> dict[str, Any]:
     base_url = f"http://{args.host}:{args.port}"
+    selected_model = model_for_variant(args, variant)
     with tempfile.TemporaryDirectory(prefix=f"llama-bench-{variant.name}-") as tmp:
         log_path = Path(tmp) / "llama-server.log"
         with log_path.open("w", encoding="utf-8") as log:
@@ -210,8 +242,7 @@ def benchmark_variant(args: argparse.Namespace, variant: Variant, prompt: str) -
                 "--port", str(args.port),
                 "--api-key", args.api_key,
                 "--models-preset", args.models_preset,
-                "--model", args.model,
-                "-c", str(args.context),
+                "--model", selected_model,
                 "--perf",
                 *variant.args,
             ]
@@ -226,25 +257,44 @@ def benchmark_variant(args: argparse.Namespace, variant: Variant, prompt: str) -
                 wait_for_server(base_url, process, args.startup_timeout)
                 all_rows: list[dict[str, Any]] = []
                 for index in range(args.warmups + args.runs):
-                    before_size = log_path.stat().st_size
-                    row = run_chat(base_url, args.api_key, args.model, prompt, args.max_tokens, args.request_timeout)
-                    time.sleep(args.log_settle_seconds)
-                    with log_path.open("r", encoding="utf-8", errors="replace") as reader:
-                        reader.seek(before_size)
-                        timings = parse_server_timings(reader.read())
-                    row.update(timings)
-                    row.update({"index": index, "warmup": index < args.warmups})
-                    all_rows.append(row)
+                    messages: list[dict[str, str]] = []
+                    conversation_rows: list[dict[str, Any]] = []
+                    for turn_index, prompt in enumerate(prompts):
+                        messages.append({"role": "user", "content": prompt})
+                        before_size = log_path.stat().st_size
+                        row = run_chat_turn(base_url, args.api_key, selected_model, messages, args.max_tokens, args.request_timeout)
+                        messages.append({"role": "assistant", "content": row["response_text"]})
+                        time.sleep(args.log_settle_seconds)
+                        with log_path.open("r", encoding="utf-8", errors="replace") as reader:
+                            reader.seek(before_size)
+                            timings = parse_server_timings(reader.read())
+                        row.update(timings)
+                        row.update(_response_speed_fields(row))
+                        row.update({
+                            "index": index,
+                            "turn_index": turn_index,
+                            "warmup": index < args.warmups,
+                            "prompt_chars": len(prompt),
+                            "context_messages_after_turn": len(messages),
+                        })
+                        if not args.keep_full_responses:
+                            row.pop("response_text", None)
+                        conversation_rows.append(row)
+                    all_rows.extend(conversation_rows)
                 measured = [row for row in all_rows if not row["warmup"]]
                 return {
                     "variant": variant.name,
                     "status": "completed",
                     "server_command": command,
                     "server_args": variant.args,
-                    "model": args.model,
+                    "model": selected_model,
+                    "base_model": args.model,
+                    "mtp_model": args.mtp_model,
+                    "uses_mtp": variant.uses_mtp,
                     "models_preset": args.models_preset,
-                    "context": args.context,
-                    "prompt_chars": len(prompt),
+                    "context": "from-preset",
+                    "prompt_count": len(prompts),
+                    "prompt_chars": sum(len(item) for item in prompts),
                     "max_tokens": args.max_tokens,
                     "summary": summarize(measured),
                     "runs": all_rows,
@@ -254,9 +304,12 @@ def benchmark_variant(args: argparse.Namespace, variant: Variant, prompt: str) -
                     "variant": variant.name,
                     "status": "failed",
                     "server_args": variant.args,
-                    "model": args.model,
+                    "model": selected_model,
+                    "base_model": args.model,
+                    "mtp_model": args.mtp_model,
+                    "uses_mtp": variant.uses_mtp,
                     "models_preset": args.models_preset,
-                    "context": args.context,
+                    "context": "from-preset",
                     "error": str(exc),
                     "log_tail": log_path.read_text(encoding="utf-8", errors="replace")[-4000:] if log_path.exists() else "",
                 }
@@ -279,9 +332,10 @@ def write_outputs(output_dir: Path, payload: dict[str, Any]) -> tuple[Path, Path
             "context": result.get("context"),
             "ttft_seconds_median": summary.get("ttft_seconds_median"),
             "total_seconds_median": summary.get("total_seconds_median"),
-            "prompt_eval_tokens_per_second_median": summary.get("prompt_eval_tokens_per_second_median"),
-            "server_eval_tokens_per_second_median": summary.get("server_eval_tokens_per_second_median"),
-            "client_chars_per_second_median": summary.get("client_chars_per_second_median"),
+                    "prompt_eval_tokens_per_second_median": summary.get("prompt_eval_tokens_per_second_median") or summary.get("response_prompt_per_second_median"),
+                    "server_eval_tokens_per_second_median": summary.get("server_eval_tokens_per_second_median"),
+                    "response_predicted_per_second_median": summary.get("response_predicted_per_second_median"),
+                    "client_chars_per_second_median": summary.get("client_chars_per_second_median"),
             "server_args": " ".join(result.get("server_args") or []),
             "error": result.get("error"),
         })
@@ -296,16 +350,17 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Start llama-server with multiple configs and benchmark a long prompt.")
     parser.add_argument("--llama-server", required=True, help="Path to llama-server.")
     parser.add_argument("--models-preset", required=True, help="models_preset.ini containing the model details.")
-    parser.add_argument("--model", required=True, help="Preset/model id to pass to llama-server and chat completions.")
+    parser.add_argument("--model", required=True, help="Normal preset/model id to pass to llama-server and chat completions.")
+    parser.add_argument("--mtp-model", default=None, help="Optional preset/model id from the same models_preset.ini for MTP variants.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8092)
     parser.add_argument("--api-key", default="testkey")
-    parser.add_argument("--context", type=int, default=131072)
-    parser.add_argument("--max-tokens", type=int, default=1024)
+    parser.add_argument("--max-tokens", type=int, default=None, help="Optional completion limit. Omit to use server/model defaults.")
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--runs", type=int, default=3)
-    parser.add_argument("--prompt", default=DEFAULT_PROMPT)
+    parser.add_argument("--prompt", action="append", help="Prompt turn. Repeat for multi-turn benchmark. Defaults to five bridge-engineering turns.")
     parser.add_argument("--prompt-file", default=None)
+    parser.add_argument("--keep-full-responses", action="store_true", help="Store complete model responses in JSON instead of only previews.")
     parser.add_argument("--variant", action="append", type=parse_variant, help="Custom variant as NAME::ARG ARG ARG. Can be repeated.")
     parser.add_argument("--output-dir", default=".ambient_data/benchmarks")
     parser.add_argument("--startup-timeout", type=float, default=90.0)
@@ -313,12 +368,16 @@ def main() -> int:
     parser.add_argument("--log-settle-seconds", type=float, default=0.2)
     args = parser.parse_args()
 
-    prompt = Path(args.prompt_file).read_text(encoding="utf-8") if args.prompt_file else args.prompt
+    if args.prompt_file:
+        prompt_text = Path(args.prompt_file).read_text(encoding="utf-8")
+        prompts = [part.strip() for part in re.split(r"\n-{3,}\n", prompt_text) if part.strip()]
+    else:
+        prompts = args.prompt or DEFAULT_PROMPTS
     variants = args.variant or default_variants()
     results = []
     for variant in variants:
         print(f"Running {variant.name}: {' '.join(variant.args)}", flush=True)
-        result = benchmark_variant(args, variant, prompt)
+        result = benchmark_variant(args, variant, prompts)
         results.append(result)
         print(json.dumps({"variant": result["variant"], "status": result["status"], "summary": result.get("summary"), "error": result.get("error")}, indent=2), flush=True)
     payload = {
@@ -326,7 +385,9 @@ def main() -> int:
         "llama_server": args.llama_server,
         "models_preset": args.models_preset,
         "model": args.model,
-        "prompt_chars": len(prompt),
+        "mtp_model": args.mtp_model,
+        "prompt_count": len(prompts),
+        "prompt_chars": sum(len(item) for item in prompts),
         "results": results,
     }
     json_path, csv_path = write_outputs(Path(args.output_dir), payload)
