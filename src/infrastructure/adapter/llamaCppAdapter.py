@@ -33,6 +33,10 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
 
     async def load_model(self, model_name: str, unload_previous: bool = True) -> None:
         """Load a model through the llama.cpp server model-management endpoint."""
+        self.load_model_sync(model_name, unload_previous=unload_previous)
+
+    def load_model_sync(self, model_name: str, unload_previous: bool = True) -> None:
+        """Synchronously load a model through the llama.cpp model-management endpoint."""
         loaded_model = self._sync_loaded_model_state()
         if loaded_model == model_name:
             self.logger.info(f"Model {model_name} is already loaded.")
@@ -40,7 +44,7 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
             return
 
         if unload_previous and loaded_model is not None:
-            await self.unload_model()
+            self.unload_model_sync()
 
         model = {"model": model_name}
         response = requests.post(f"{self.base_url}/models/load", json=model)
@@ -59,9 +63,13 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
 
     async def unload_model(self) -> None:
         """Unload the currently tracked model from the llama.cpp server."""
+        self.unload_model_sync()
+
+    def unload_model_sync(self) -> Optional[str]:
+        """Synchronously unload the currently tracked model and return its name."""
         loaded_model = self._sync_loaded_model_state()
         if loaded_model is None:
-            return
+            return None
         model = {"model": loaded_model}
         response = requests.post(f"{self.base_url}/models/unload", json=model)
         if response.status_code == 200:
@@ -69,11 +77,14 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
             unloaded_model = loaded_model
             self._set_loaded_model_state(None)
             self._wait_for_model_status(unloaded_model, expected_status="unloaded")
+            return unloaded_model
         elif response.status_code == 400 and "model is not running" in response.text.lower():
             self.logger.info(f"Model {loaded_model} is not running.")
             self._set_loaded_model_state(None)
+            return loaded_model
         else:
             self.logger.error(f"Failed to unload model: {loaded_model}. Response: {response.text}")
+            return None
 
     def get_current_model(self) -> Optional[str]:
         """Return the model name this adapter currently tracks as loaded."""

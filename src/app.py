@@ -21,6 +21,7 @@ from application.services.scheduled_task_service import ScheduledTaskService
 from application.services.passive_observer_service import PassiveObserverService
 from application.services.semantic_deduplication_service import SemanticDeduplicationService
 from application.services.semantic_memory_service import SemanticMemoryService
+from application.services.semantic_model_guard_service import SemanticModelGuardService
 from application.services.screenshot_queue_service import ScreenshotQueueService
 from application.services.system_idle_service import SystemIdleService
 from application.services.training_data_service import TrainingDataService
@@ -168,6 +169,21 @@ SEMANTIC_VECTOR_LIMIT = CONFIG.get_int("semantic_memory", "vector_limit", 12)
 SEMANTIC_RERANK_LIMIT = CONFIG.get_int("semantic_memory", "rerank_limit", 6)
 SEMANTIC_SYNC_BATCH_SIZE = CONFIG.get_int("semantic_memory", "sync_batch_size", 32)
 SEMANTIC_TIMEOUT_SECONDS = CONFIG.get_float("semantic_memory", "timeout_seconds", 5.0)
+SEMANTIC_UNLOAD_MAIN_LLM_FOR_EMBEDDING = CONFIG.get_bool(
+    "semantic_memory",
+    "unload_main_llm_for_embedding",
+    False,
+)
+SEMANTIC_UNLOAD_MAIN_LLM_FOR_RERANK = CONFIG.get_bool(
+    "semantic_memory",
+    "unload_main_llm_for_rerank",
+    False,
+)
+SEMANTIC_RESTORE_MAIN_LLM_AFTER_SEMANTIC = CONFIG.get_bool(
+    "semantic_memory",
+    "restore_main_llm_after_semantic",
+    False,
+)
 PERSONALIZATION_ENABLED = CONFIG.get_bool("personalization", "enabled", True)
 PERSONALIZATION_STABLE_PROFILE_CHARS = CONFIG.get_int("personalization", "stable_profile_chars", 3000)
 PERSONALIZATION_WORKING_MEMORY_CHARS = CONFIG.get_int("personalization", "working_memory_chars", 3000)
@@ -630,12 +646,19 @@ class AmbientRuntime:
         semantic_adapter = None
         semantic_memory = None
         if SEMANTIC_MEMORY_ENABLED and EMBEDDING_MODEL:
+            semantic_model_guard = SemanticModelGuardService(
+                main_model_provider=raw_llm_adapter,
+                unload_for_embedding=SEMANTIC_UNLOAD_MAIN_LLM_FOR_EMBEDDING,
+                unload_for_rerank=SEMANTIC_UNLOAD_MAIN_LLM_FOR_RERANK,
+                restore_after_semantic=SEMANTIC_RESTORE_MAIN_LLM_AFTER_SEMANTIC,
+            )
             semantic_adapter = LlamaCppSemanticAdapter(
                 embedding_base_url=EMBEDDING_API_BASE_URL,
                 embedding_model=EMBEDDING_MODEL,
                 reranker_base_url=RERANKER_API_BASE_URL,
                 reranker_model=RERANKER_MODEL,
                 timeout_seconds=SEMANTIC_TIMEOUT_SECONDS,
+                semantic_model_guard=semantic_model_guard,
             )
             semantic_memory = SemanticMemoryService(
                 memory=memory_store,

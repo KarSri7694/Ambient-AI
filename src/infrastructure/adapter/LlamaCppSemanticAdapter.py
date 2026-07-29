@@ -17,12 +17,14 @@ class LlamaCppSemanticAdapter:
         reranker_base_url: Optional[str] = None,
         reranker_model: Optional[str] = None,
         timeout_seconds: float = 30.0,
+        semantic_model_guard: Optional[Any] = None,
     ):
         self.embedding_base_url = embedding_base_url.rstrip("/")
         self.embedding_model = embedding_model.strip()
         self.reranker_base_url = (reranker_base_url or embedding_base_url).rstrip("/")
         self.reranker_model = (reranker_model or "").strip()
         self.timeout_seconds = timeout_seconds
+        self.semantic_model_guard = semantic_model_guard
         self.logger = logging.getLogger(self.__class__.__name__)
 
     def is_enabled(self) -> bool:
@@ -32,11 +34,12 @@ class LlamaCppSemanticAdapter:
         normalized = [str(text).strip() for text in texts if str(text).strip()]
         if not normalized or not self.embedding_model:
             return []
-        response = requests.post(
-            f"{self.embedding_base_url}/v1/embeddings",
-            json={"model": self.embedding_model, "input": normalized},
-            timeout=self.timeout_seconds,
-        )
+        with self._guarded_operation("embedding"):
+            response = requests.post(
+                f"{self.embedding_base_url}/v1/embeddings",
+                json={"model": self.embedding_model, "input": normalized},
+                timeout=self.timeout_seconds,
+            )
         response.raise_for_status()
         payload = response.json()
         data = payload.get("data", [])
@@ -65,16 +68,17 @@ class LlamaCppSemanticAdapter:
             return []
         if self.reranker_model:
             try:
-                response = requests.post(
-                    f"{self.reranker_base_url}/v1/rerank",
-                    json={
-                        "model": self.reranker_model,
-                        "query": query,
-                        "documents": normalized_documents,
-                        "top_n": top_n or len(normalized_documents),
-                    },
-                    timeout=self.timeout_seconds,
-                )
+                with self._guarded_operation("rerank"):
+                    response = requests.post(
+                        f"{self.reranker_base_url}/v1/rerank",
+                        json={
+                            "model": self.reranker_model,
+                            "query": query,
+                            "documents": normalized_documents,
+                            "top_n": top_n or len(normalized_documents),
+                        },
+                        timeout=self.timeout_seconds,
+                    )
                 response.raise_for_status()
                 payload = response.json()
                 results = payload.get("results") or payload.get("data") or []
@@ -95,6 +99,20 @@ class LlamaCppSemanticAdapter:
             except Exception as exc:
                 self.logger.warning("Rerank endpoint unavailable, using lexical fallback: %s", exc)
         return self._fallback_rerank(query=query, documents=normalized_documents, top_n=top_n)
+
+    def _guarded_operation(self, operation: str):
+        guard = self.semantic_model_guard
+        if guard is not None and hasattr(guard, "semantic_operation"):
+            return guard.semantic_operation(operation)
+
+        class _NoopContext:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+        return _NoopContext()
 
     def _fallback_rerank(
         self,
