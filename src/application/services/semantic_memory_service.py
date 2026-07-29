@@ -61,8 +61,9 @@ class SemanticMemoryService:
                     continue
                 if not self._is_valid_embedding(embedding):
                     self.logger.warning(
-                        "Skipping invalid semantic embedding for chunk %s.",
+                        "Skipping invalid semantic embedding for chunk %s: %s",
                         chunk.chunk_id,
+                        self._embedding_diagnostics(embedding),
                     )
                     continue
                 try:
@@ -100,7 +101,10 @@ class SemanticMemoryService:
         if not query_embedding:
             return []
         if not self._is_valid_embedding(query_embedding[0]):
-            self.logger.warning("Semantic query embedding was invalid; skipping retrieval.")
+            self.logger.warning(
+                "Semantic query embedding was invalid; skipping retrieval: %s",
+                self._embedding_diagnostics(query_embedding[0]),
+            )
             return []
         allowed_source_types = [str(item).strip() for item in (source_types or []) if str(item).strip()]
         results = self.memory.vector_search(
@@ -121,7 +125,7 @@ class SemanticMemoryService:
         )
         if not reranked:
             return results[:rerank_count]
-        ordered: List[SemanticMemoryResult] = []
+        ordered = []
         for item in reranked:
             index = int(item.get("index", -1))
             if index < 0 or index >= len(results):
@@ -163,6 +167,22 @@ class SemanticMemoryService:
         if not embedding:
             return False
         try:
-            return all(math.isfinite(float(value)) for value in embedding)
+            values = [float(value) for value in embedding]
         except (TypeError, ValueError):
             return False
+        if not all(math.isfinite(value) for value in values):
+            return False
+        return any(abs(value) > 1e-12 for value in values)
+
+    def _embedding_diagnostics(self, embedding: List[float]) -> str:
+        try:
+            values = [float(value) for value in embedding]
+        except (TypeError, ValueError):
+            return f"length={len(embedding) if embedding is not None else 0}, non_numeric=true"
+        finite_values = [value for value in values if math.isfinite(value)]
+        nonzero_count = sum(1 for value in finite_values if abs(value) > 1e-12)
+        norm = math.sqrt(sum(value * value for value in finite_values)) if finite_values else 0.0
+        return (
+            f"length={len(values)}, finite={len(finite_values)}, "
+            f"nonzero={nonzero_count}, norm={norm:.6g}"
+        )
