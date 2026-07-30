@@ -240,14 +240,29 @@ button:disabled { cursor: not-allowed; opacity: .55; }
   .rw-speed-grid button.active { @apply border-accent bg-accent text-white shadow-md; }
   .rw-playback-note { @apply mt-auto flex items-start gap-2 rounded-xl bg-soft p-3 text-xs leading-5 text-muted; }
   .rw-dropzone { @apply flex min-h-44 cursor-pointer flex-col items-center justify-center rounded-2xl border border-dashed border-accent/40 bg-accent-soft/30 p-5 text-center transition hover:border-accent hover:bg-accent-soft/60; }
+  .rw-dropzone.active { @apply border-accent bg-accent-soft/80 ring-2 ring-accent/15; }
+  .rw-dropzone.unavailable { @apply cursor-not-allowed border-line bg-soft opacity-75 hover:border-line hover:bg-soft; }
   .rw-drop-icon { @apply mb-3 flex h-11 w-11 items-center justify-center rounded-2xl bg-surface text-accent shadow-sm; }
   .rw-dropzone strong { @apply text-sm; }
   .rw-dropzone > span:last-child { @apply mt-1 text-xs text-muted; }
-  .rw-upload-list { @apply mt-3 space-y-2; }
-  .rw-upload-item { @apply flex items-center gap-2 rounded-xl border border-line bg-surface px-3 py-2 text-sm; }
-  .rw-upload-item small { @apply ml-auto text-xs text-muted; }
-  .rw-upload-item button { @apply flex h-7 w-7 items-center justify-center rounded-lg text-muted transition hover:bg-danger/10 hover:text-danger; }
-  .rw-sequence-number { @apply flex h-6 w-6 shrink-0 items-center justify-center rounded-lg bg-soft text-[10px] font-bold text-muted; }
+  .rw-sequence-editor { @apply mt-4 overflow-hidden rounded-2xl border border-line bg-raised; }
+  .rw-sequence-head { @apply flex items-center justify-between gap-3 border-b border-line px-4 py-3; }
+  .rw-sequence-head strong { @apply block text-sm; }
+  .rw-sequence-head span { @apply mt-0.5 block text-xs text-muted; }
+  .rw-upload-list { @apply grid grid-flow-col auto-cols-[minmax(170px,210px)] gap-3 overflow-x-auto p-3; }
+  .rw-upload-item { @apply min-w-0 cursor-grab overflow-hidden rounded-xl border border-line bg-surface text-sm shadow-sm transition hover:border-accent/40 hover:shadow-md; }
+  .rw-upload-item:active { @apply cursor-grabbing; }
+  .rw-upload-item.dragging { @apply scale-[.98] border-accent opacity-60 ring-2 ring-accent/15; }
+  .rw-upload-preview { @apply relative flex aspect-video items-center justify-center overflow-hidden bg-soft text-muted; }
+  .rw-upload-preview img { @apply h-full w-full object-cover; }
+  .rw-drag-handle { @apply absolute right-2 top-2 flex h-7 w-7 items-center justify-center rounded-lg bg-surface/90 text-muted shadow-sm backdrop-blur; }
+  .rw-sequence-number { @apply absolute left-2 top-2 flex h-7 min-w-7 shrink-0 items-center justify-center rounded-lg bg-accent px-1.5 text-[11px] font-bold text-white shadow-sm; }
+  .rw-upload-copy { @apply min-w-0 border-t border-line px-3 py-2.5; }
+  .rw-upload-copy strong { @apply block truncate text-xs; }
+  .rw-upload-copy span { @apply mt-0.5 block text-[11px] text-muted; }
+  .rw-upload-actions { @apply flex items-center gap-1 border-t border-line px-2 py-1.5; }
+  .rw-upload-actions button { @apply flex h-7 flex-1 items-center justify-center rounded-lg text-muted transition hover:bg-accent-soft hover:text-accent disabled:bg-transparent; }
+  .rw-upload-actions button.remove { @apply ml-auto flex-none px-2 hover:bg-danger/10 hover:text-danger; }
   .rw-model-settings { @apply mt-4 overflow-hidden rounded-2xl border border-line bg-raised; }
   .rw-model-settings > summary { @apply flex cursor-pointer list-none items-center justify-between px-4 py-3.5; }
   .rw-model-settings > summary::-webkit-details-marker { display: none; }

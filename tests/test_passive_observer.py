@@ -986,5 +986,38 @@ class PassiveObserverTests(unittest.TestCase):
         payload = llm.calls[0]["payload"]
         self.assertEqual([item["observation_id"] for item in payload["observations"]], ["obs-pending"])
 
+    def test_user_biodata_service_extracts_from_audio_transcript_context(self):
+        llm = FakeVisualLLM(
+            [
+                json.dumps(
+                    {
+                        "entries": [
+                            {
+                                "note": "User is comparing ROCm inference configurations.",
+                                "bucket": "memory",
+                                "category": "work",
+                                "confidence": 0.9,
+                            }
+                        ]
+                    }
+                )
+            ]
+        )
+        service = UserBioDataService(memory=self.memory, llm_provider=llm)
+
+        result = asyncio.run(service.update_biodata(
+            model="test-model",
+            transcript_contexts=[{
+                "source_ref": "transcript://benchmark",
+                "created_at": "2026-07-29T10:00:00",
+                "text": "I need to compare the ROCm benchmark configurations tomorrow.",
+            }],
+        ))
+
+        self.assertEqual(result["processed_observation_ids"], [])
+        self.assertEqual(result["processed_transcript_refs"], ["transcript://benchmark"])
+        self.assertIn("ROCm inference configurations", self.memory.get_working_memory())
+        self.assertEqual(llm.calls[0]["payload"]["transcripts"][0]["source_ref"], "transcript://benchmark")
+
 if __name__ == "__main__":
     unittest.main()

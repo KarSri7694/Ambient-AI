@@ -1,6 +1,6 @@
 # Real-world testing lab
 
-The real-world testing lab evaluates Ambient AI against prerecorded screenshots and audio. It runs the production vision, audio, autonomy, model, and MCP tool pipeline without capturing the live desktop or microphone.
+The real-world testing lab evaluates Ambient AI against prerecorded screenshots and audio. It runs the production perception, autonomy, semantic-memory, user-biodata, reflection, future-action, model, and MCP tool pipeline without capturing the live desktop or microphone.
 
 The lab provides a local web UI where you can inspect:
 
@@ -10,6 +10,10 @@ The lab provides a local web UI where you can inspect:
 - Exact system, context, and user messages sent to each model
 - Model responses, exposed reasoning, timing, and token metrics
 - Tool definitions, tool calls, arguments, results, and errors
+- Semantic indexing before and after proactive reasoning
+- User biodata extracted into isolated `USER_INFO.md` and `MEMORY.md` files
+- Reflection cleanup, generated tasks, semantic dedupe decisions, and skipped duplicates
+- Bounded future actions executed through the normal tool-enabled interaction loop
 - The final result and manual 1–5 review scores
 
 ## Important safety warning
@@ -44,15 +48,27 @@ Run all commands from the repository root.
    mode = active
    ```
 
-4. Ensure `models_preset.ini` contains every model referenced by the task-specific model roles in `config.ini`.
+4. To exercise semantic retrieval and reranking, enable `[semantic_memory]` and configure a working embedding model (and optionally a reranker). The loop still runs when semantic memory is unavailable, but its trace records the semantic stage as skipped.
 
-5. Start the configured llama.cpp model router. The normal project configuration uses:
+5. Configure the finite live replay and its safety bounds:
+
+   ```ini
+   [real_world_tests]
+   full_proactive_loop = true
+   post_replay_idle_cycles = 3
+   max_future_actions = 1
+   semantic_sync_batches = 4
+   ```
+
+6. Ensure `models_preset.ini` contains every model referenced by the task-specific model roles in `config.ini`.
+
+7. Start the configured llama.cpp model router. The normal project configuration uses:
 
    ```powershell
    llama-server --models-preset .\models_preset.ini --models-max 1 --no-models-autoload --host 127.0.0.1 --port 8080 --api-key testkey
    ```
 
-6. Stop the normal Ambient AI process (`python src/app.py`). The lab and normal runtime intentionally cannot run at the same time because they share models, GPU resources, and MCP tools.
+8. Stop the normal Ambient AI process (`python src/app.py`). The lab and normal runtime intentionally cannot run at the same time because they share models, GPU resources, and MCP tools.
 
 ## Start the lab
 
@@ -66,6 +82,17 @@ Open the following page in a browser:
 
 ```text
 http://127.0.0.1:8766/real-world-tests
+```
+
+Do not use the Real-world Tests tab on the normal runtime at port `8765` for
+uploads. That process intentionally does not attach the isolated lab backend;
+the page reports this state and keeps its upload control disabled.
+
+When developing the React UI with Vite, point its API proxy at the lab:
+
+```powershell
+$env:VITE_API_PROXY_TARGET = "http://127.0.0.1:8766"
+npm --prefix src/infrastructure/runtime_ui run dev
 ```
 
 Optional launcher arguments:
@@ -174,7 +201,9 @@ The lab loads task-specific defaults from the `[models]` section of `config.ini`
 - `passive_observer_model`
 - `full_passive_observer_model`
 - `passive_followup_model`
+- `user_biodata_model`
 - `followup_execution_model`
+- `reflection_model`
 - `transcript_processing_model`
 - `reporter_model`
 - `browser_agent_model`
@@ -193,6 +222,20 @@ Lab data is written under `.ambient_data/real_world_tests` by default:
 ```
 
 Each scenario receives fresh memory, autonomy, voice, capture, transcript, task, and artifact state. Uploaded media and completed results remain available after restarting the lab.
+
+For image scenarios, prerecorded files replace only the live screenshot-capture source. Each image is released in sequence and follows the same downstream route used by `app.py`:
+
+1. Apply the production SSIM screenshot filter.
+2. Copy the accepted image into the normal capture store without modifying the source file.
+3. Enqueue a `lightweight_visual_capture` event with manifest-provided UI context.
+4. Let `AutonomyCoordinatorService.process_batch()` perform vision enrichment, judgment, personalization, investigation, tools, artifacts, and inbox handling.
+5. Trigger user-biodata processing at the configured live `biodata_update_event_interval`.
+
+The lab does not call the vision observer directly and does not force reflection immediately after every image. Once the finite image stream ends, it advances up to `post_replay_idle_cycles` normal idle work units. These use `ReflectionService.run_if_due()`, semantic dedupe, and one queued task per idle cycle, matching live priority and cadence while keeping the test finite. Set `post_replay_idle_cycles = 0` to stop exactly when the final image's autonomy batch finishes.
+
+Audio scenarios retain the explicit full proactive tail controlled by `full_proactive_loop`.
+
+Audio transcripts are stored as semantic evidence and passed to the same production `UserBioDataService`, so audio-only scenarios can also populate working memory before reflection. The transcript is treated as untrusted contextual evidence, not as instructions. Empty or non-useful observations may still produce no biodata or future task; skipped stages remain visible in the trace and are never reported as completed.
 
 Use **Cancel safely** to request cancellation. Cancellation occurs between scheduled inputs, model iterations, or tool calls. An external tool call that is already executing is allowed to finish.
 

@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  Activity, AlertTriangle, AudioLines, Check, ChevronRight, Clock3, Cpu, Download,
-  FileAudio, FileImage, Gauge, ImageIcon, Layers3, Play, Save, Settings2, ShieldAlert,
-  Sparkles, Square, UploadCloud, Wrench, X,
+  Activity, AlertTriangle, ArrowLeft, ArrowRight, AudioLines, Check, ChevronRight, Clock3,
+  Cpu, Download, FileAudio, FileImage, Gauge, GripVertical, ImageIcon, Layers3, Play,
+  Save, Settings2, ShieldAlert, Sparkles, Square, UploadCloud, Wrench, X,
 } from "lucide-react";
 import { getJson, sendJson, uploadBinary } from "../api";
 import {
@@ -16,6 +16,10 @@ type SourceMode = "suite" | "upload";
 type TraceFilter = "all" | "model" | "tools" | "pipeline";
 
 const SPEEDS = [1, 2, 5, 10];
+const ACCEPTED_MEDIA = {
+  image: ".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp",
+  audio: ".wav,.mp3,.m4a,.opus,.flac,audio/wav,audio/mpeg,audio/mp4,audio/ogg,audio/flac",
+} as const;
 const SCORE_FIELDS = [
   ["perception_score", "Perception"],
   ["decision_score", "Decision"],
@@ -41,6 +45,9 @@ export function RealWorldTestsPage() {
   const [uploads, setUploads] = useState<Uploaded[]>([]);
   const [uploadKind, setUploadKind] = useState<"image" | "audio">("image");
   const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState("");
+  const [dropzoneActive, setDropzoneActive] = useState(false);
+  const [draggedUploadId, setDraggedUploadId] = useState<string | null>(null);
   const [traceFilter, setTraceFilter] = useState<TraceFilter>("all");
   const selectedSuite = useMemo(
     () => suites.data?.suites?.find((item: any) => item.suite_id === suiteId),
@@ -86,21 +93,59 @@ export function RealWorldTestsPage() {
   const cancel = useMutation({ mutationFn: (id: string) => sendJson(`/api/real-world/runs/${id}/cancel`, "POST") });
 
   const upload = async (files: FileList | null) => {
-    if (!files) return;
+    if (!files?.length) return;
+    if (suites.data?.available !== true) {
+      setUploadError("The real-world test lab is not running. Stop the normal Ambient AI runtime, start tests/real_world_tests/run_lab.py, and open http://127.0.0.1:8766/real-world-tests.");
+      return;
+    }
+    setUploadError("");
     setUploading(true);
     try {
-      const added: Uploaded[] = [];
-      for (const file of Array.from(files)) {
-        const payload = await uploadBinary<any>(
+      const results = await Promise.allSettled(Array.from(files).map(async (file) => {
+        const payload = await uploadBinary<{ media: Uploaded }>(
           `/api/real-world/uploads?filename=${encodeURIComponent(file.name)}&kind=${uploadKind}`,
           file,
         );
-        added.push(payload.media);
-      }
+        return payload.media;
+      }));
+      const added = results
+        .filter((result): result is PromiseFulfilledResult<Uploaded> => result.status === "fulfilled")
+        .map((result) => result.value);
       setUploads((current) => [...current, ...added]);
+      const failed = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+      if (failed.length) {
+        const firstError = failed[0].reason;
+        const message = firstError instanceof Error ? firstError.message : "Upload failed.";
+        setUploadError(`${failed.length} of ${results.length} file${failed.length === 1 ? "" : "s"} failed to upload: ${message}`);
+      }
     } finally {
       setUploading(false);
     }
+  };
+
+  const moveUpload = (mediaId: string, direction: -1 | 1) => {
+    setUploads((current) => {
+      const fromIndex = current.findIndex((item) => item.media_id === mediaId);
+      const toIndex = fromIndex + direction;
+      if (fromIndex < 0 || toIndex < 0 || toIndex >= current.length) return current;
+      const next = [...current];
+      const [moved] = next.splice(fromIndex, 1);
+      next.splice(toIndex, 0, moved);
+      return next;
+    });
+  };
+
+  const dragUploadTo = (targetId: string) => {
+    if (!draggedUploadId || draggedUploadId === targetId) return;
+    setUploads((current) => {
+      const fromIndex = current.findIndex((item) => item.media_id === draggedUploadId);
+      const toIndex = current.findIndex((item) => item.media_id === targetId);
+      if (fromIndex < 0 || toIndex < 0) return current;
+      const next = [...current];
+      const [moved] = next.splice(fromIndex, 1);
+      next.splice(toIndex, 0, moved);
+      return next;
+    });
   };
 
   const run = detail.data?.run;
@@ -122,13 +167,14 @@ export function RealWorldTestsPage() {
   });
   const validSource = sourceMode === "upload" ? uploads.length > 0 : scenarioIds.length > 0;
   const armed = confirmation === "RUN LIVE TOOLS";
+  const labAvailable = suites.data?.available === true;
 
   return <div className="rw-page">
     <PageHeader
       eyebrow="Evaluation studio"
       title="Real-world tests"
       description="Replay authentic media through the complete ambient pipeline, then inspect every perception, model, and tool decision in one trace."
-      actions={<><Badge tone={active ? "warn" : "good"}>{active ? "Run in progress" : "Lab ready"}</Badge><Badge>{tunedProfile ? "ROCm tuned" : "ROCm untuned"}</Badge><Button variant="secondary" onClick={() => downloadRocm("json")}><Download size={14} />Tuning JSON</Button><Button variant="secondary" onClick={() => downloadRocm("csv")}><Download size={14} />CSV</Button></>}
+      actions={<><Badge tone={active ? "warn" : labAvailable ? "good" : suites.isLoading ? "neutral" : "danger"}>{active ? "Run in progress" : labAvailable ? "Lab ready" : suites.isLoading ? "Checking lab" : "Lab offline"}</Badge><Badge>{tunedProfile ? "ROCm tuned" : "ROCm untuned"}</Badge><Button variant="secondary" onClick={() => downloadRocm("json")}><Download size={14} />Tuning JSON</Button><Button variant="secondary" onClick={() => downloadRocm("csv")}><Download size={14} />CSV</Button></>}
     />
 
     <section className="rw-hero">
@@ -143,7 +189,7 @@ export function RealWorldTestsPage() {
       </div>
     </section>
 
-    {!suites.data?.available && !suites.isLoading && <div className="panel mb-5 p-4"><EmptyState title="Start the evaluation lab" description="Launch tests/real_world_tests/run_lab.py to configure and run evaluations." /></div>}
+    {!labAvailable && !suites.isLoading && <div className="panel mb-5 p-4"><EmptyState title="Start the evaluation lab" description="The normal runtime cannot execute isolated real-world tests. Stop python src/app.py, run python tests/real_world_tests/run_lab.py, then open http://127.0.0.1:8766/real-world-tests." /></div>}
 
     <section className="rw-launch-card">
       <div className="rw-section-head">
@@ -171,13 +217,56 @@ export function RealWorldTestsPage() {
             </div>}
           </> : <>
             <div className="segmented mb-3"><button type="button" className={uploadKind === "image" ? "active" : ""} onClick={() => { setUploadKind("image"); setUploads([]); }}><FileImage size={15} />Images</button><button type="button" className={uploadKind === "audio" ? "active" : ""} onClick={() => { setUploadKind("audio"); setUploads([]); }}><FileAudio size={15} />Audio</button></div>
-            <label className="rw-dropzone">
-              <input className="sr-only" type="file" multiple accept={uploadKind === "image" ? "image/*" : "audio/*"} onChange={(event) => upload(event.target.files)} />
+            <label
+              className={`rw-dropzone ${dropzoneActive ? "active" : ""} ${!labAvailable ? "unavailable" : ""}`}
+              onDragEnter={(event) => { event.preventDefault(); setDropzoneActive(true); }}
+              onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "copy"; }}
+              onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setDropzoneActive(false); }}
+              onDrop={(event) => { event.preventDefault(); setDropzoneActive(false); void upload(event.dataTransfer.files); }}
+            >
+              <input className="sr-only" type="file" multiple disabled={!labAvailable || uploading} accept={ACCEPTED_MEDIA[uploadKind]} onChange={(event) => { void upload(event.target.files); event.target.value = ""; }} />
               <span className="rw-drop-icon"><UploadCloud size={24} /></span>
-              <strong>{uploading ? "Uploading media…" : `Choose ${uploadKind} files`}</strong>
-              <span>Files stay in the local evaluation workspace</span>
+              <strong>{uploading ? "Uploading media…" : suites.isLoading ? "Checking lab availability…" : !labAvailable ? "Real-world test lab is offline" : `Drop or choose ${uploadKind} files`}</strong>
+              <span>{suites.isLoading ? "Uploads enable when the isolated backend responds" : labAvailable ? "Files stay in the local evaluation workspace" : "Start the standalone lab on port 8766 to enable uploads"}</span>
             </label>
-            {uploads.length > 0 && <div className="rw-upload-list">{uploads.map((item, index) => <div className="rw-upload-item" key={item.media_id}><span className="rw-sequence-number">{index + 1}</span>{item.kind === "image" ? <FileImage size={17} /> : <FileAudio size={17} />}<span className="truncate">{item.original_name}</span><small>+{index * 10}s</small><button type="button" aria-label={`Remove ${item.original_name}`} onClick={() => setUploads((current) => current.filter((media) => media.media_id !== item.media_id))}><X size={15} /></button></div>)}</div>}
+            {uploadError && <div className="rw-inline-error mt-3" role="alert">{uploadError}</div>}
+            {uploads.length > 0 && <div className="rw-sequence-editor">
+              <div className="rw-sequence-head">
+                <div><strong>Ambient AI input order</strong><span>Drag to edit the sequence. Items are sent from left to right.</span></div>
+                <Badge>{uploads.length} {uploadKind === "image" ? "frames" : "clips"}</Badge>
+              </div>
+              <div className="rw-upload-list" role="list" aria-label="Ambient AI input order">
+                {uploads.map((item, index) => <div
+                  className={`rw-upload-item ${draggedUploadId === item.media_id ? "dragging" : ""}`}
+                  key={item.media_id}
+                  role="listitem"
+                  draggable={uploads.length > 1}
+                  onDragStart={(event) => {
+                    setDraggedUploadId(item.media_id);
+                    event.dataTransfer.effectAllowed = "move";
+                    event.dataTransfer.setData("text/plain", item.media_id);
+                  }}
+                  onDragEnter={(event) => { event.preventDefault(); dragUploadTo(item.media_id); }}
+                  onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "move"; }}
+                  onDrop={(event) => { event.preventDefault(); setDraggedUploadId(null); }}
+                  onDragEnd={() => setDraggedUploadId(null)}
+                >
+                  <div className="rw-upload-preview">
+                    {item.kind === "image"
+                      ? <img src={`/api/real-world/media/${item.media_id}`} alt={`Input ${index + 1}: ${item.original_name}`} />
+                      : <FileAudio size={28} />}
+                    <span className="rw-drag-handle" aria-hidden="true"><GripVertical size={17} /></span>
+                    <span className="rw-sequence-number">{index + 1}</span>
+                  </div>
+                  <div className="rw-upload-copy"><strong title={item.original_name}>{item.original_name}</strong><span>{index === 0 ? "First input" : `After ${index * 10} seconds`}</span></div>
+                  <div className="rw-upload-actions">
+                    <button type="button" disabled={index === 0} aria-label={`Move ${item.original_name} earlier`} title="Move earlier" onClick={() => moveUpload(item.media_id, -1)}><ArrowLeft size={15} /></button>
+                    <button type="button" disabled={index === uploads.length - 1} aria-label={`Move ${item.original_name} later`} title="Move later" onClick={() => moveUpload(item.media_id, 1)}><ArrowRight size={15} /></button>
+                    <button className="remove" type="button" aria-label={`Remove ${item.original_name}`} title="Remove" onClick={() => setUploads((current) => current.filter((media) => media.media_id !== item.media_id))}><X size={15} /></button>
+                  </div>
+                </div>)}
+              </div>
+            </div>}
           </>}
         </div>
 
@@ -192,7 +281,7 @@ export function RealWorldTestsPage() {
 
       <div className="rw-arm-panel">
         <div className="rw-arm-copy"><span className="rw-danger-icon"><ShieldAlert size={20} /></span><div><strong>Arm live tool execution</strong><p>The production MCP surface can change external systems. Actions are audited and cannot be rolled back.</p></div></div>
-        <div className="rw-arm-action"><label><span>Type RUN LIVE TOOLS</span><input value={confirmation} onChange={(event) => setConfirmation(event.target.value)} placeholder="RUN LIVE TOOLS" /></label><Button variant="primary" disabled={start.isPending || !armed || !validSource} onClick={() => start.mutate()}><Play size={16} />{start.isPending ? "Starting…" : "Start evaluation"}</Button></div>
+        <div className="rw-arm-action"><label><span>Type RUN LIVE TOOLS</span><input value={confirmation} onChange={(event) => setConfirmation(event.target.value)} placeholder="RUN LIVE TOOLS" /></label><Button variant="primary" disabled={start.isPending || !labAvailable || !armed || !validSource} onClick={() => start.mutate()}><Play size={16} />{start.isPending ? "Starting…" : "Start evaluation"}</Button></div>
       </div>
       {start.isError && <div className="mt-4"><ErrorState error={start.error} /></div>}
     </section>

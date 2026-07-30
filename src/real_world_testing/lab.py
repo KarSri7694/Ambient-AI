@@ -32,7 +32,8 @@ except Exception:
 LOGGER = logging.getLogger(__name__)
 MODEL_ROLE_NAMES = (
     "passive_observer_model", "full_passive_observer_model", "passive_followup_model",
-    "followup_execution_model", "transcript_processing_model", "reporter_model", "browser_agent_model",
+    "user_biodata_model", "followup_execution_model", "reflection_model",
+    "transcript_processing_model", "reporter_model", "browser_agent_model",
 )
 
 
@@ -326,15 +327,58 @@ class _StaticScreenCapture:
 class _InMemoryTaskQueue:
     def __init__(self):
         self.items: list[Any] = []
-    def get_pending_tasks(self): return list(self.items)
-    def get_all_pending_tasks(self): return list(self.items)
-    def get_due_tasks(self, now_utc): return []
-    def add_task(self, description, priority="medium", metadata=None):
-        item = type("Task", (), {"description": description, "priority": priority,
-                                  "metadata_json": json.dumps(metadata or {})})()
+        self._next_id = 1
+
+    def get_pending_tasks(self):
+        return [item for item in self.items if item.status == "pending" and not item.run_at_utc]
+
+    def get_all_pending_tasks(self):
+        return [item for item in self.items if item.status == "pending"]
+
+    def get_due_tasks(self, now_utc):
+        return [
+            item for item in self.items
+            if item.status == "pending" and item.run_at_utc and item.run_at_utc <= now_utc
+        ]
+
+    def add_task(self, description, priority="medium", metadata=None, run_at_utc=None):
+        from core.models import NightTask
+        item = NightTask(
+            id=self._next_id,
+            description=description,
+            priority=priority,
+            status="pending",
+            created_at=datetime.now().isoformat(),
+            metadata_json=json.dumps(metadata or {}, ensure_ascii=False),
+            run_at_utc=run_at_utc,
+        )
+        self._next_id += 1
         self.items.append(item)
-        return str(len(self.items))
-    def mark_task_complete(self, task_id, status="completed"): return None
+        return "Task queued."
+
+    def mark_task_complete(self, task_id, status="completed"):
+        item = self._find(task_id)
+        if item is not None:
+            item.status = status
+            item.completed_at = datetime.now().isoformat()
+
+    def claim_task(self, task_id):
+        item = self._find(task_id)
+        if item is None or item.status != "pending":
+            return False
+        item.status = "running"
+        item.claimed_at = datetime.now().isoformat()
+        return True
+
+    def cancel_task(self, task_id):
+        item = self._find(task_id)
+        if item is None or item.status != "pending":
+            return False
+        self.mark_task_complete(task_id, status="cancelled")
+        return True
+
+    def _find(self, task_id):
+        return next((item for item in self.items if item.id == task_id), None)
 
 
 class ProductionScenarioExecutor:
@@ -354,7 +398,11 @@ class ProductionScenarioExecutor:
         from application.services.llm_interaction_service import LLMInteractionService
         from application.services.opportunity_judgment_service import OpportunityJudgmentService
         from application.services.autonomy_coordinator_service import AutonomyCoordinatorService
+        from application.services.reflection_service import ReflectionService
+        from application.services.semantic_deduplication_service import SemanticDeduplicationService
         from application.services.semantic_memory_service import SemanticMemoryService
+        from application.services.semantic_model_guard_service import SemanticModelGuardService
+        from application.services.user_bio_data_service import UserBioDataService
         from application.services.user_context_service import UserContextService
         from infrastructure.adapter.LlamaCppSemanticAdapter import LlamaCppSemanticAdapter
         from infrastructure.adapter.MCPToolAdapter import MCPToolAdapter
@@ -376,6 +424,18 @@ class ProductionScenarioExecutor:
         semantic_enabled = parser.getboolean("semantic_memory", "enabled", fallback=False)
         embedding_model = parser.get("semantic_memory", "embedding_model", fallback="").strip()
         if semantic_enabled and embedding_model:
+            semantic_model_guard = SemanticModelGuardService(
+                main_model_provider=raw,
+                unload_for_embedding=parser.getboolean(
+                    "semantic_memory", "unload_main_llm_for_embedding", fallback=False,
+                ),
+                unload_for_rerank=parser.getboolean(
+                    "semantic_memory", "unload_main_llm_for_rerank", fallback=False,
+                ),
+                restore_after_semantic=parser.getboolean(
+                    "semantic_memory", "restore_main_llm_after_semantic", fallback=False,
+                ),
+            )
             semantic_adapter = LlamaCppSemanticAdapter(
                 embedding_base_url=parser.get(
                     "semantic_memory",
@@ -394,6 +454,7 @@ class ProductionScenarioExecutor:
                 ),
                 reranker_model=parser.get("semantic_memory", "reranker_model", fallback="").strip(),
                 timeout_seconds=parser.getfloat("semantic_memory", "timeout_seconds", fallback=5.0),
+                semantic_model_guard=semantic_model_guard,
             )
             semantic_memory = SemanticMemoryService(
                 memory=memory,
@@ -442,6 +503,47 @@ class ProductionScenarioExecutor:
             semantic_memory=semantic_memory,
         )
         await service.initialize_tools()
+        task_queue = _InMemoryTaskQueue()
+        default_model = parser.get("runtime", "default_model", fallback="").strip()
+        dedupe_model = parser.get("semantic_dedupe", "model", fallback="").strip()
+        dedupe_model = dedupe_model or self.model_roles.get("reflection_model") or default_model
+        semantic_dedupe = SemanticDeduplicationService(
+            memory=memory,
+            llm_provider=llm,
+            enabled=parser.getboolean("semantic_dedupe", "enabled", fallback=True),
+            model=dedupe_model,
+            candidate_limit=parser.getint("semantic_dedupe", "candidate_limit", fallback=8),
+            default_ttl_seconds=parser.getint(
+                "semantic_dedupe", "default_ttl_seconds", fallback=86400,
+            ),
+            per_entity_ttl_seconds=self._semantic_dedupe_ttls(parser),
+            debug_log_reasoning=parser.getboolean(
+                "semantic_dedupe", "debug_log_reasoning", fallback=False,
+            ),
+        )
+        user_biodata = UserBioDataService(
+            memory=memory,
+            llm_provider=llm,
+            semantic_memory=semantic_memory,
+        )
+        reflection = (
+            ReflectionService(
+                memory=memory,
+                task_queue=task_queue,
+                llm_provider=llm,
+                semantic_memory=semantic_memory,
+                semantic_dedupe_service=semantic_dedupe,
+                history_path=str(self.workspace / "reflection" / "history.json"),
+                cadence_mode=parser.get("reflection", "cadence_mode", fallback="daily"),
+                interval_hours=parser.getint("reflection", "interval_hours", fallback=24),
+                max_generated_tasks=parser.getint("reflection", "max_generated_tasks", fallback=8),
+                max_task_generation_runs=parser.getint(
+                    "reflection", "max_task_generation_runs", fallback=3,
+                ),
+            )
+            if parser.getboolean("reflection", "enabled", fallback=True)
+            else None
+        )
         coordinator = AutonomyCoordinatorService(
             store=autonomy_store, judgment=OpportunityJudgmentService(llm_provider=llm),
             policy=policy, mode="active", capture_store=capture_store,
@@ -451,7 +553,18 @@ class ProductionScenarioExecutor:
         self._apply_seed(memory, scenario.seed)
         started = time.monotonic()
         final_response = ""
+        autonomy_results: list[dict[str, Any]] = []
         transcript_parts: list[str] = []
+        transcript_contexts: list[dict[str, str]] = []
+        proactive_result: dict[str, Any] = {
+            "enabled": False,
+            "reason": "not_started",
+            "semantic": {},
+            "biodata": {},
+            "reflection": {},
+            "semantic_dedupe": {},
+            "future_actions": [],
+        }
         try:
             if scenario.modality == "image_sequence":
                 from application.services.passive_observer_service import PassiveObserverService
@@ -473,6 +586,11 @@ class ProductionScenarioExecutor:
                     ssim_threshold=parser.getfloat("passive_observer", "ssim_threshold", fallback=0.92),
                     ssim_compare_count=parser.getint("passive_observer", "ssim_compare_count", fallback=4),
                 )
+                biodata_context_events = 0
+                biodata_interval = max(
+                    1,
+                    parser.getint("personalization", "biodata_update_event_interval", fallback=3),
+                )
                 for index, event in enumerate(scenario.events):
                     await self._wait_for_event(started, event.offset_seconds / playback_speed)
                     capture.path = event.media_path
@@ -481,33 +599,58 @@ class ProductionScenarioExecutor:
                     if job is None:
                         self.emit("vision", "image_deduplicated", {"index": index})
                         continue
-                    await llm.load_model(self.model_roles["followup_execution_model"])
-                    observation = await observer.process_screenshot(
-                        screenshot_path=event.media_path,
-                        model=self.model_roles["followup_execution_model"],
-                        recent_context=user_context.build_prompt_context(
-                            include_semantic=False,
-                            max_chars=parser.getint("personalization", "prompt_context_chars", fallback=8000),
-                        ), captured_at=event.captured_at,
-                        similarity_score=job.similarity_score,
-                        uiat_context_override=event.screen_context or None,
-                        archive_source=False,
+                    screenshot_ref = capture_store.store_file(
+                        event.media_path,
+                        kind="screenshot",
+                        delete_source=False,
                     )
-                    if observation is None:
-                        self.emit("vision", "observation_skipped", {"index": index})
-                        continue
-                    self.emit("vision", "visual_observation", {
-                        "index": index, "observation": dict(observation.__dict__),
-                    })
-                    coordinator.enqueue_visual_observation(observation)
+                    lightweight_context = self._screen_context_for_replay(event.screen_context)
+                    ambient_event = coordinator.enqueue_lightweight_visual(
+                        screenshot_ref=screenshot_ref,
+                        captured_at=job.captured_at,
+                        context=lightweight_context,
+                        similarity_score=job.similarity_score,
+                    )
+                    self.emit(
+                        "vision",
+                        "lightweight_visual_enqueued",
+                        {
+                            "index": index,
+                            "event_id": ambient_event.event_id,
+                            "screenshot_ref": screenshot_ref,
+                            "captured_at": job.captured_at,
+                            "similarity_score": job.similarity_score,
+                            "context": lightweight_context,
+                        },
+                    )
                     await llm.load_model(self.model_roles["followup_execution_model"])
-                    result = await coordinator.process_next(
-                        model=self.model_roles["followup_execution_model"], llm_service=service,
+                    batch_result = await coordinator.process_batch(
+                        model=self.model_roles["followup_execution_model"],
+                        llm_service=service,
                         personalization_context=user_context.build_prompt_context(include_semantic=True),
+                        max_events=parser.getint("resource_governor", "batch_max_events", fallback=8),
+                        max_seconds=parser.getfloat("resource_governor", "batch_max_seconds", fallback=90.0),
+                        should_preempt=self.should_cancel,
                         event_callback=self._interaction_event,
                     )
-                    final_response = json.dumps(result, ensure_ascii=False)
-                    self.emit("autonomy", "autonomy_result", result)
+                    autonomy_results.extend(batch_result.get("results") or [])
+                    final_response = json.dumps(batch_result, ensure_ascii=False)
+                    self.emit("autonomy", "autonomy_batch_result", batch_result)
+                    biodata_context_events += sum(
+                        1
+                        for result in batch_result.get("results") or []
+                        if result.get("event_type") in {
+                            "lightweight_visual_capture",
+                            "visual_context_changed",
+                        }
+                    )
+                    if biodata_context_events >= biodata_interval:
+                        await self._run_replay_biodata_if_pending(
+                            memory=memory,
+                            user_biodata=user_biodata,
+                            llm=llm,
+                        )
+                        biodata_context_events = 0
             else:
                 for index, event in enumerate(scenario.events):
                     await self._wait_for_event(started, event.offset_seconds / playback_speed)
@@ -515,6 +658,24 @@ class ProductionScenarioExecutor:
                     transcript_path = await asyncio.to_thread(self._run_audio_chain, event.media_path, scenario.seed)
                     transcript = Path(transcript_path).read_text(encoding="utf-8").strip()
                     transcript_parts.append(transcript)
+                    transcript_contexts.append({
+                        "source_ref": str(transcript_path),
+                        "created_at": event.captured_at or datetime.now().isoformat(),
+                        "text": transcript,
+                    })
+                    transcript_source_id = hashlib.sha256(
+                        f"{transcript_path}:{transcript}".encode("utf-8")
+                    ).hexdigest()
+                    memory.upsert_semantic_chunk(
+                        source_type="transcript_evidence",
+                        source_id=transcript_source_id,
+                        source_ref=str(transcript_path),
+                        content=transcript,
+                        metadata_json=json.dumps(
+                            {"created_at": event.captured_at, "source": "real_world_audio_pipeline"},
+                            ensure_ascii=False,
+                        ),
+                    )
                     self.emit("audio", "transcript_merged", {"index": index, "transcript_path": transcript_path,
                                                               "transcript_text": transcript})
                     coordinator.enqueue_transcript(transcript_path=transcript_path, transcript_text=transcript)
@@ -528,15 +689,554 @@ class ProductionScenarioExecutor:
                         event_callback=self._interaction_event,
                     )
                     final_response = json.dumps(result, ensure_ascii=False)
+                    autonomy_results.append(result)
                     self.emit("autonomy", "autonomy_result", result)
+
+            if scenario.modality == "image_sequence":
+                proactive_result = await self._run_replay_idle_cycles(
+                    parser=parser,
+                    memory=memory,
+                    user_biodata=user_biodata,
+                    reflection=reflection,
+                    task_queue=task_queue,
+                    semantic_dedupe=semantic_dedupe,
+                    llm=llm,
+                    llm_service=service,
+                )
+                completed_actions = proactive_result.get("future_actions") or []
+                if completed_actions and completed_actions[-1].get("response"):
+                    final_response = str(completed_actions[-1]["response"])
+            elif parser.getboolean("real_world_tests", "full_proactive_loop", fallback=True):
+                proactive_result = await self._run_proactive_tail(
+                    parser=parser,
+                    memory=memory,
+                    semantic_memory=semantic_memory,
+                    user_biodata=user_biodata,
+                    reflection=reflection,
+                    task_queue=task_queue,
+                    semantic_dedupe=semantic_dedupe,
+                    llm=llm,
+                    llm_service=service,
+                    transcript_contexts=transcript_contexts,
+                )
+                completed_actions = proactive_result.get("future_actions") or []
+                if completed_actions and completed_actions[-1].get("response"):
+                    final_response = str(completed_actions[-1]["response"])
+            else:
+                proactive_result = {
+                    "enabled": False,
+                    "reason": "disabled_by_real_world_tests_config",
+                    "semantic": {},
+                    "biodata": {},
+                    "reflection": {},
+                    "semantic_dedupe": {},
+                    "future_actions": [],
+                }
+                self.emit(
+                    "proactive",
+                    "proactive_loop_skipped",
+                    proactive_result,
+                    status="skipped",
+                )
         finally:
             try:
                 await llm.unload_model()
             finally:
                 await tools.cleanup()
-        return {"transcript_text": "\n\n".join(transcript_parts) or None,
-                "final_response": final_response or None,
-                "summary": {"event_count": len(scenario.events), "modality": scenario.modality}}
+        return {
+            "transcript_text": "\n\n".join(transcript_parts) or None,
+            "final_response": final_response or None,
+            "summary": {
+                "event_count": len(scenario.events),
+                "modality": scenario.modality,
+                "autonomy_results": autonomy_results,
+                "proactive_loop": proactive_result,
+            },
+        }
+
+    def _screen_context_for_replay(self, screen_context: dict[str, Any] | None) -> dict[str, Any]:
+        """Normalize manifest context to the lightweight UIAT payload used by app.py."""
+        source = dict(screen_context or {})
+        return {
+            **source,
+            "app_name": source.get("app_name") or source.get("app_hint") or "",
+            "window_title": source.get("window_title") or source.get("title") or "",
+            "window_class": source.get("window_class") or "",
+            "url": source.get("url") or source.get("foreground_url") or "",
+            "domain": source.get("domain") or source.get("domain_hint") or "",
+            "accessible_text": source.get("accessible_text") or source.get("visible_text_summary") or "",
+            "contains_dialog": bool(source.get("contains_dialog", False)),
+            "contains_notification": bool(source.get("contains_notification", False)),
+        }
+
+    async def _run_replay_biodata_if_pending(self, *, memory, user_biodata, llm) -> dict[str, Any] | None:
+        if not user_biodata.has_pending_biodata_observations():
+            return None
+        model = (
+            self.model_roles.get("user_biodata_model")
+            or self.model_roles.get("passive_followup_model")
+            or self.model_roles.get("followup_execution_model")
+        )
+        self.emit("memory", "user_biodata_started", {"model": model}, model=model, status="running")
+        await llm.load_model(model)
+        result = await user_biodata.update_biodata(model=model)
+        self.emit(
+            "memory",
+            "user_biodata_completed",
+            {
+                **result,
+                "user_info": memory.get_user_info(),
+                "working_memory": memory.get_working_memory(),
+            },
+            model=model,
+        )
+        return result
+
+    async def _run_replay_idle_cycles(
+        self,
+        *,
+        parser: configparser.ConfigParser,
+        memory,
+        user_biodata,
+        reflection,
+        task_queue,
+        semantic_dedupe,
+        llm,
+        llm_service,
+    ) -> dict[str, Any]:
+        """Advance a finite number of app.py-style idle work units after image replay."""
+        from application.services.interaction_trace import interaction_trace
+
+        max_cycles = max(
+            0,
+            parser.getint("real_world_tests", "post_replay_idle_cycles", fallback=3),
+        )
+        max_future_actions = max(
+            0,
+            parser.getint("real_world_tests", "max_future_actions", fallback=1),
+        )
+        result: dict[str, Any] = {
+            "enabled": True,
+            "reason": "live_replay_idle_complete",
+            "mode": "app_py_live_replay",
+            "idle_cycles": [],
+            "biodata": {},
+            "reflection": {},
+            "semantic_dedupe": {},
+            "future_actions": [],
+        }
+
+        # In app.py the periodic biodata check runs before the lower-priority idle unit.
+        biodata_result = await self._run_replay_biodata_if_pending(
+            memory=memory,
+            user_biodata=user_biodata,
+            llm=llm,
+        )
+        if biodata_result is not None:
+            result["biodata"] = biodata_result
+
+        for cycle_index in range(max_cycles):
+            if self.should_cancel():
+                raise RunCancelled("Run cancelled during post-replay idle processing")
+            cycle: dict[str, Any] = {"cycle_index": cycle_index, "work_unit": "none"}
+            self.emit("runtime", "replay_idle_cycle_started", cycle, status="running")
+
+            pending = task_queue.get_pending_tasks()
+            if pending and len(result["future_actions"]) < max_future_actions:
+                task = pending[0]
+                cycle["work_unit"] = "queued_future_action"
+                if task_queue.claim_task(task.id):
+                    future_model = self.model_roles.get("followup_execution_model")
+                    self.emit(
+                        "future_action",
+                        "future_action_started",
+                        {
+                            "task_id": task.id,
+                            "description": task.description,
+                            "priority": task.priority,
+                            "metadata": self._task_metadata(task),
+                            "idle_cycle": cycle_index,
+                        },
+                        model=future_model,
+                        status="running",
+                    )
+                    await llm.load_model(future_model)
+                    llm_service.reset_context()
+                    try:
+                        with interaction_trace(
+                            "real_world.future_action",
+                            {"task_id": task.id, "source": "reflection_service"},
+                        ):
+                            response = await llm_service.run_interaction(
+                                user_input=task.description,
+                                system_prompt=self._followup_execution_prompt(),
+                                model=future_model,
+                                report_policy="auto_surface",
+                            )
+                    except Exception as exc:
+                        task_queue.mark_task_complete(task.id, status="failed")
+                        self.emit(
+                            "future_action",
+                            "future_action_failed",
+                            {"task_id": task.id, "error": str(exc)},
+                            model=future_model,
+                            status="failed",
+                        )
+                        raise
+                    else:
+                        task_queue.mark_task_complete(task.id)
+                        metadata = self._task_metadata(task)
+                        dedupe_item_id = str(metadata.get("dedupe_item_id") or "").strip()
+                        if dedupe_item_id:
+                            semantic_dedupe.mark_completed(dedupe_item_id)
+                        action = {
+                            "task_id": task.id,
+                            "description": task.description,
+                            "status": "completed",
+                            "response": response,
+                            "dedupe_item_id": dedupe_item_id or None,
+                        }
+                        result["future_actions"].append(action)
+                        self.emit("future_action", "future_action_completed", action, model=future_model)
+                    finally:
+                        llm_service.reset_context()
+            elif reflection is not None and not result["reflection"]:
+                cycle["work_unit"] = "reflection_check"
+                reflection_model = (
+                    self.model_roles.get("reflection_model")
+                    or self.model_roles.get("followup_execution_model")
+                )
+                self.emit(
+                    "reflection",
+                    "reflection_due_check_started",
+                    {"idle_cycle": cycle_index, "model": reflection_model},
+                    model=reflection_model,
+                    status="running",
+                )
+                await llm.load_model(reflection_model)
+                reflection_result = await reflection.run_if_due(model=reflection_model)
+                result["reflection"] = reflection_result
+                self.emit(
+                    "reflection",
+                    "reflection_completed" if reflection_result.get("ran") else "reflection_not_due",
+                    reflection_result,
+                    model=reflection_model,
+                    status="completed" if reflection_result.get("ran") else "skipped",
+                )
+                records = memory.list_semantic_dedupe_items(
+                    entity_kinds=["reflection_task"],
+                    limit=max(1, len(reflection_result.get("generated_tasks") or [])),
+                )
+                dedupe_result = {
+                    "enabled": bool(getattr(semantic_dedupe, "enabled", False)),
+                    "model": str(getattr(semantic_dedupe, "model", "") or ""),
+                    "created_records": [
+                        dict(record.__dict__) if hasattr(record, "__dict__") else str(record)
+                        for record in records
+                    ],
+                    "skipped_tasks": reflection_result.get("skipped_tasks") or [],
+                }
+                result["semantic_dedupe"] = dedupe_result
+                self.emit(
+                    "reflection",
+                    "semantic_dedupe_completed" if dedupe_result["enabled"] else "semantic_dedupe_skipped",
+                    dedupe_result,
+                    model=dedupe_result["model"] or None,
+                    status="completed" if dedupe_result["enabled"] else "skipped",
+                )
+            elif reflection is None and not result["reflection"]:
+                cycle["work_unit"] = "reflection_disabled"
+                result["reflection"] = {"ran": False, "reason": "reflection_disabled"}
+                self.emit("reflection", "reflection_skipped", result["reflection"], status="skipped")
+            else:
+                result["idle_cycles"].append(cycle)
+                self.emit("runtime", "replay_idle_cycle_completed", cycle)
+                break
+
+            result["idle_cycles"].append(cycle)
+            self.emit("runtime", "replay_idle_cycle_completed", cycle)
+
+        self.emit("proactive", "live_replay_completed", result)
+        return result
+
+    async def _run_proactive_tail(
+        self,
+        *,
+        parser: configparser.ConfigParser,
+        memory,
+        semantic_memory,
+        user_biodata,
+        reflection,
+        task_queue,
+        semantic_dedupe,
+        llm,
+        llm_service,
+        transcript_contexts: list[dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        """Finish a scenario with the production memory/reflection/action loop."""
+        from application.services.interaction_trace import interaction_trace
+
+        result: dict[str, Any] = {
+            "enabled": True,
+            "reason": "completed",
+            "semantic": {"enabled": semantic_memory is not None, "initial_synced": 0, "final_synced": 0},
+            "biodata": {},
+            "reflection": {},
+            "semantic_dedupe": {},
+            "future_actions": [],
+        }
+
+        if semantic_memory is None:
+            self.emit(
+                "memory",
+                "semantic_sync_skipped",
+                {"reason": "semantic_memory_disabled_or_embedding_model_missing"},
+                status="skipped",
+            )
+        else:
+            self.emit("memory", "semantic_sync_started", {"phase": "after_perception"}, status="running")
+            synced = await asyncio.to_thread(
+                semantic_memory.ensure_embeddings_synced,
+                max_batches=max(1, parser.getint("real_world_tests", "semantic_sync_batches", fallback=4)),
+            )
+            result["semantic"]["initial_synced"] = synced
+            self.emit(
+                "memory",
+                "semantic_sync_completed",
+                {"phase": "after_perception", "synced_chunks": synced},
+            )
+
+        biodata_model = (
+            self.model_roles.get("user_biodata_model")
+            or self.model_roles.get("passive_followup_model")
+            or self.model_roles.get("followup_execution_model")
+        )
+        transcript_contexts = transcript_contexts or []
+        if user_biodata.has_pending_biodata_observations() or transcript_contexts:
+            self.emit(
+                "memory",
+                "user_biodata_started",
+                {"model": biodata_model},
+                model=biodata_model,
+                status="running",
+            )
+            await llm.load_model(biodata_model)
+            biodata_result = await user_biodata.update_biodata(
+                model=biodata_model,
+                transcript_contexts=transcript_contexts,
+            )
+            result["biodata"] = biodata_result
+            self.emit(
+                "memory",
+                "user_biodata_completed",
+                {
+                    **biodata_result,
+                    "user_info": memory.get_user_info(),
+                    "working_memory": memory.get_working_memory(),
+                },
+                model=biodata_model,
+            )
+        else:
+            result["biodata"] = {
+                "processed_observation_ids": [],
+                "processed_transcript_refs": [],
+                "entries": [],
+                "reason": "no_biodata_pending_visual_observations_or_transcripts",
+            }
+            self.emit("memory", "user_biodata_skipped", result["biodata"], status="skipped")
+
+        reflection_model = (
+            self.model_roles.get("reflection_model")
+            or self.model_roles.get("followup_execution_model")
+        )
+        self.emit(
+            "reflection",
+            "reflection_started",
+            {
+                "model": reflection_model,
+                "user_info": memory.get_user_info(),
+                "working_memory": memory.get_working_memory(),
+            },
+            model=reflection_model,
+            status="running",
+        )
+        await llm.load_model(reflection_model)
+        reflection_result = await reflection.run(model=reflection_model)
+        result["reflection"] = reflection_result
+        self.emit(
+            "reflection",
+            "reflection_completed",
+            {
+                **reflection_result,
+                "user_info": memory.get_user_info(),
+                "working_memory": memory.get_working_memory(),
+            },
+            model=reflection_model,
+        )
+
+        dedupe_records = memory.list_semantic_dedupe_items(
+            entity_kinds=["reflection_task"],
+            limit=max(1, len(reflection_result.get("generated_tasks") or [])),
+        )
+        dedupe_result = {
+            "enabled": bool(getattr(semantic_dedupe, "enabled", False)),
+            "model": str(getattr(semantic_dedupe, "model", "") or ""),
+            "created_records": [
+                dict(record.__dict__) if hasattr(record, "__dict__") else str(record)
+                for record in dedupe_records
+            ],
+            "skipped_tasks": reflection_result.get("skipped_tasks") or [],
+        }
+        result["semantic_dedupe"] = dedupe_result
+        self.emit(
+            "reflection",
+            "semantic_dedupe_completed" if dedupe_result["enabled"] else "semantic_dedupe_skipped",
+            dedupe_result,
+            model=dedupe_result["model"] or None,
+            status="completed" if dedupe_result["enabled"] else "skipped",
+        )
+
+        max_future_actions = max(
+            0,
+            parser.getint("real_world_tests", "max_future_actions", fallback=1),
+        )
+        future_model = self.model_roles.get("followup_execution_model") or reflection_model
+        pending_tasks = task_queue.get_pending_tasks()
+        if not pending_tasks:
+            self.emit(
+                "future_action",
+                "future_action_skipped",
+                {"reason": "reflection_queued_no_tasks"},
+                status="skipped",
+            )
+        elif max_future_actions == 0:
+            self.emit(
+                "future_action",
+                "future_action_skipped",
+                {"reason": "max_future_actions_is_zero", "queued_tasks": len(pending_tasks)},
+                status="skipped",
+            )
+
+        for task in pending_tasks[:max_future_actions]:
+            if self.should_cancel():
+                raise RunCancelled("Run cancelled before future-action execution")
+            if not task_queue.claim_task(task.id):
+                continue
+            self.emit(
+                "future_action",
+                "future_action_started",
+                {
+                    "task_id": task.id,
+                    "description": task.description,
+                    "priority": task.priority,
+                    "metadata": self._task_metadata(task),
+                },
+                model=future_model,
+                status="running",
+            )
+            await llm.load_model(future_model)
+            llm_service.reset_context()
+            try:
+                with interaction_trace(
+                    "real_world.future_action",
+                    {"task_id": task.id, "source": "reflection_service"},
+                ):
+                    action_response = await llm_service.run_interaction(
+                        user_input=task.description,
+                        system_prompt=self._followup_execution_prompt(),
+                        model=future_model,
+                        report_policy="auto_surface",
+                    )
+            except Exception as exc:
+                task_queue.mark_task_complete(task.id, status="failed")
+                failed_action = {
+                    "task_id": task.id,
+                    "description": task.description,
+                    "status": "failed",
+                    "error": str(exc),
+                }
+                result["future_actions"].append(failed_action)
+                self.emit(
+                    "future_action",
+                    "future_action_failed",
+                    failed_action,
+                    model=future_model,
+                    status="failed",
+                )
+                raise
+            else:
+                task_queue.mark_task_complete(task.id)
+                dedupe_item_id = str(self._task_metadata(task).get("dedupe_item_id") or "").strip()
+                if dedupe_item_id:
+                    semantic_dedupe.mark_completed(dedupe_item_id)
+                completed_action = {
+                    "task_id": task.id,
+                    "description": task.description,
+                    "status": "completed",
+                    "response": action_response,
+                    "dedupe_item_id": dedupe_item_id or None,
+                }
+                result["future_actions"].append(completed_action)
+                self.emit(
+                    "future_action",
+                    "future_action_completed",
+                    completed_action,
+                    model=future_model,
+                )
+            finally:
+                llm_service.reset_context()
+
+        if semantic_memory is not None:
+            self.emit("memory", "semantic_sync_started", {"phase": "after_future_action"}, status="running")
+            synced = await asyncio.to_thread(
+                semantic_memory.ensure_embeddings_synced,
+                max_batches=max(1, parser.getint("real_world_tests", "semantic_sync_batches", fallback=4)),
+            )
+            result["semantic"]["final_synced"] = synced
+            self.emit(
+                "memory",
+                "semantic_sync_completed",
+                {"phase": "after_future_action", "synced_chunks": synced},
+            )
+
+        self.emit(
+            "proactive",
+            "proactive_loop_completed",
+            result,
+        )
+        return result
+
+    def _task_metadata(self, task) -> dict[str, Any]:
+        try:
+            payload = json.loads(task.metadata_json or "{}")
+        except (json.JSONDecodeError, TypeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _semantic_dedupe_ttls(self, parser: configparser.ConfigParser) -> dict[str, int]:
+        return {
+            entity_kind: parser.getint(
+                "semantic_dedupe",
+                f"{entity_kind}_ttl_seconds",
+                fallback=parser.getint("semantic_dedupe", "default_ttl_seconds", fallback=86400),
+            )
+            for entity_kind in (
+                "todoist_reminder",
+                "internal_task",
+                "reflection_task",
+                "do_now_action",
+                "calendar_event",
+            )
+        }
+
+    def _followup_execution_prompt(self) -> str:
+        return (
+            "You are an ambient assistant executing a queued follow-up task. "
+            "Treat the user message as an execution brief, not as a question. "
+            "Use the available tools when needed. "
+            "Do not ask the user for clarification if the brief provides enough context to act. "
+            "When the task is complete, state the concrete result."
+        )
 
     async def _wait_for_event(self, started: float, due_seconds: float) -> None:
         while True:
@@ -582,6 +1282,22 @@ class ProductionScenarioExecutor:
 
     def _apply_seed(self, memory, seed: dict[str, Any]) -> None:
         if seed.get("user_info"):
-            memory.save_user_info(str(seed["user_info"]))
+            user_info = str(seed["user_info"])
+            memory.save_user_info(user_info)
+            memory.upsert_semantic_chunk(
+                source_type="user_info_note",
+                source_id="real_world_seed_user_info",
+                source_ref="scenario.seed.user_info",
+                content=user_info,
+                metadata_json=json.dumps({"source": "real_world_scenario_seed"}),
+            )
         if seed.get("working_memory"):
-            memory.save_working_memory(str(seed["working_memory"]))
+            working_memory = str(seed["working_memory"])
+            memory.save_working_memory(working_memory)
+            memory.upsert_semantic_chunk(
+                source_type="working_memory_note",
+                source_id="real_world_seed_working_memory",
+                source_ref="scenario.seed.working_memory",
+                content=working_memory,
+                metadata_json=json.dumps({"source": "real_world_scenario_seed"}),
+            )

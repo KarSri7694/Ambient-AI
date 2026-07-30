@@ -14,7 +14,7 @@ sys.path.insert(0, str(SRC_ROOT))
 
 from infrastructure.runtime_log_server import RuntimeLogBuffer, create_runtime_log_app
 from real_world_testing.case_loader import load_suite
-from real_world_testing.lab import RealWorldLab
+from real_world_testing.lab import ProductionScenarioExecutor, RealWorldLab, _InMemoryTaskQueue
 from real_world_testing.store import SQLiteRealWorldTestStore
 from real_world_testing.runtime_lock import RuntimeOwnershipLock
 
@@ -177,6 +177,209 @@ mode = active
             })
             self.assertEqual(started.status_code, 200)
             self.assertTrue(lab.wait_for_idle(2))
+
+    def test_isolated_task_queue_supports_reflection_and_future_action_lifecycle(self):
+        queue = _InMemoryTaskQueue()
+        queue.add_task("Research the observed topic", metadata={"dedupe_item_id": "dedupe-1"})
+        task = queue.get_pending_tasks()[0]
+        self.assertEqual(task.id, 1)
+        self.assertTrue(queue.claim_task(task.id))
+        self.assertFalse(queue.claim_task(task.id))
+        queue.mark_task_complete(task.id)
+        self.assertEqual(task.status, "completed")
+        self.assertEqual(queue.get_pending_tasks(), [])
+
+    def test_proactive_tail_runs_memory_reflection_and_future_action_in_order(self):
+        class Memory:
+            def get_user_info(self): return "User studies GPU inference."
+            def get_working_memory(self): return "Compare current ROCm benchmark results."
+            def list_semantic_dedupe_items(self, **kwargs): return []
+
+        class SemanticMemory:
+            def __init__(self): self.calls = 0
+            def ensure_embeddings_synced(self, **kwargs):
+                self.calls += 1
+                return self.calls
+
+        class Biodata:
+            def has_pending_biodata_observations(self): return True
+            async def update_biodata(self, *, model, transcript_contexts=None):
+                return {"processed_observation_ids": ["observation-1"], "entries": [
+                    {"note": "User studies GPU inference.", "bucket": "user_info"}
+                ]}
+
+        class Reflection:
+            def __init__(self, queue): self.queue = queue
+            async def run(self, *, model):
+                self.queue.add_task(
+                    "Summarize the best ROCm benchmark configuration",
+                    priority="high",
+                    metadata={"dedupe_item_id": "dedupe-reflection-1"},
+                )
+                return {
+                    "ran": True,
+                    "reason": "completed",
+                    "generated_tasks": [{"description": "Summarize the best ROCm benchmark configuration"}],
+                    "queued_tasks": [{"description": "Summarize the best ROCm benchmark configuration"}],
+                    "skipped_tasks": [],
+                }
+
+        class LLM:
+            def __init__(self): self.loaded = []
+            async def load_model(self, model): self.loaded.append(model)
+
+        class Interaction:
+            def __init__(self): self.reset_calls = 0
+            def reset_context(self): self.reset_calls += 1
+            async def run_interaction(self, **kwargs): return "Saved the benchmark summary."
+
+        class Dedupe:
+            def __init__(self):
+                self.completed = []
+                self.enabled = True
+                self.model = "reflection-model"
+            def mark_completed(self, item_id): self.completed.append(item_id)
+
+        parser = __import__("configparser").ConfigParser()
+        parser.read_string("""
+[real_world_tests]
+max_future_actions = 1
+semantic_sync_batches = 2
+""")
+        queue = _InMemoryTaskQueue()
+        semantic = SemanticMemory()
+        llm = LLM()
+        interaction = Interaction()
+        dedupe = Dedupe()
+        events = []
+
+        def emit(stage, event_type, payload, **kwargs):
+            events.append((stage, event_type, payload, kwargs))
+
+        executor = ProductionScenarioExecutor(
+            project_root=Path.cwd(),
+            config_path=Path("config.ini"),
+            workspace=Path.cwd(),
+            model_roles={
+                "user_biodata_model": "biodata-model",
+                "reflection_model": "reflection-model",
+                "followup_execution_model": "action-model",
+            },
+            emit=emit,
+            should_cancel=lambda: False,
+        )
+        result = asyncio.run(executor._run_proactive_tail(
+            parser=parser,
+            memory=Memory(),
+            semantic_memory=semantic,
+            user_biodata=Biodata(),
+            reflection=Reflection(queue),
+            task_queue=queue,
+            semantic_dedupe=dedupe,
+            llm=llm,
+            llm_service=interaction,
+        ))
+
+        event_types = [item[1] for item in events]
+        self.assertLess(event_types.index("semantic_sync_completed"), event_types.index("user_biodata_started"))
+        self.assertLess(event_types.index("user_biodata_completed"), event_types.index("reflection_started"))
+        self.assertLess(event_types.index("reflection_completed"), event_types.index("future_action_started"))
+        self.assertEqual(event_types[-1], "proactive_loop_completed")
+        self.assertEqual(semantic.calls, 2)
+        self.assertEqual(dedupe.completed, ["dedupe-reflection-1"])
+        self.assertEqual(queue.items[0].status, "completed")
+        self.assertEqual(result["future_actions"][0]["response"], "Saved the benchmark summary.")
+
+    def test_image_replay_idle_cycles_use_due_reflection_then_one_queued_action(self):
+        class Memory:
+            def get_user_info(self): return "User studies GPU inference."
+            def get_working_memory(self): return "Compare benchmark results."
+            def list_semantic_dedupe_items(self, **kwargs): return []
+
+        class Biodata:
+            def has_pending_biodata_observations(self): return False
+
+        queue = _InMemoryTaskQueue()
+
+        class Reflection:
+            async def run_if_due(self, *, model):
+                queue.add_task(
+                    "Prepare a benchmark comparison",
+                    metadata={"dedupe_item_id": "replay-dedupe-1"},
+                )
+                return {
+                    "ran": True,
+                    "generated_tasks": [{"description": "Prepare a benchmark comparison"}],
+                    "queued_tasks": [{"description": "Prepare a benchmark comparison"}],
+                    "skipped_tasks": [],
+                }
+
+        class LLM:
+            async def load_model(self, model): return None
+
+        class Interaction:
+            def reset_context(self): return None
+            async def run_interaction(self, **kwargs): return "Benchmark comparison prepared."
+
+        class Dedupe:
+            enabled = True
+            model = "reflection-model"
+            def __init__(self): self.completed = []
+            def mark_completed(self, item_id): self.completed.append(item_id)
+
+        parser = __import__("configparser").ConfigParser()
+        parser.read_string("""
+[real_world_tests]
+post_replay_idle_cycles = 3
+max_future_actions = 1
+""")
+        events = []
+        dedupe = Dedupe()
+        executor = ProductionScenarioExecutor(
+            project_root=Path.cwd(),
+            config_path=Path("config.ini"),
+            workspace=Path.cwd(),
+            model_roles={
+                "reflection_model": "reflection-model",
+                "followup_execution_model": "action-model",
+            },
+            emit=lambda stage, event_type, payload, **kwargs: events.append(event_type),
+            should_cancel=lambda: False,
+        )
+
+        result = asyncio.run(executor._run_replay_idle_cycles(
+            parser=parser,
+            memory=Memory(),
+            user_biodata=Biodata(),
+            reflection=Reflection(),
+            task_queue=queue,
+            semantic_dedupe=dedupe,
+            llm=LLM(),
+            llm_service=Interaction(),
+        ))
+
+        self.assertEqual([cycle["work_unit"] for cycle in result["idle_cycles"][:2]], [
+            "reflection_check", "queued_future_action",
+        ])
+        self.assertEqual(result["future_actions"][0]["response"], "Benchmark comparison prepared.")
+        self.assertEqual(dedupe.completed, ["replay-dedupe-1"])
+        self.assertLess(events.index("reflection_completed"), events.index("future_action_started"))
+
+    def test_image_replay_normalizes_manifest_context_like_lightweight_capture(self):
+        executor = ProductionScenarioExecutor(
+            project_root=Path.cwd(), config_path=Path("config.ini"), workspace=Path.cwd(),
+            model_roles={}, emit=lambda *args, **kwargs: None, should_cancel=lambda: False,
+        )
+        context = executor._screen_context_for_replay({
+            "app_hint": "Browser",
+            "title": "ROCm documentation",
+            "foreground_url": "https://rocm.docs.amd.com/",
+            "visible_text_summary": "ROCm installation guide",
+        })
+        self.assertEqual(context["app_name"], "Browser")
+        self.assertEqual(context["window_title"], "ROCm documentation")
+        self.assertEqual(context["url"], "https://rocm.docs.amd.com/")
+        self.assertEqual(context["accessible_text"], "ROCm installation guide")
 
 
 if __name__ == "__main__":
