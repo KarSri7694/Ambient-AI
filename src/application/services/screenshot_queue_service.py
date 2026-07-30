@@ -1,7 +1,7 @@
 import logging
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 import threading
 from typing import Callable, Deque, Optional
@@ -68,7 +68,10 @@ class ScreenshotQueueService:
                     self.discard_handler(dropped.screenshot_path, "queue_overflow")
             job = ScreenshotJob(
                 screenshot_path=screenshot_path,
-                captured_at=captured_at or datetime.now().isoformat(),
+                # Durable autonomy events are ordered as UTC. A naive local
+                # timestamp is otherwise interpreted as UTC by SQLite and can
+                # leave every capture queued several hours in the future.
+                captured_at=captured_at or datetime.now(timezone.utc).isoformat(),
                 similarity_score=similarity_score,
             )
             if retain:

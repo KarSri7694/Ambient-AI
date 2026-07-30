@@ -2,6 +2,7 @@ import sys
 import tempfile
 import types
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -34,6 +35,13 @@ class _FakeKernel32:
 
 
 class SystemIdleAndQueueTests(unittest.TestCase):
+    def test_default_capture_timestamp_is_aware_utc(self):
+        queue = ScreenshotQueueService(maxlen=1, ssim_compare_count=0)
+        job = queue.enqueue("unused.png")
+        captured_at = datetime.fromisoformat(job.captured_at)
+        self.assertIsNotNone(captured_at.tzinfo)
+        self.assertEqual(captured_at.utcoffset(), timezone.utc.utcoffset(captured_at))
+
     def test_system_idle_service_reports_idle_after_threshold(self):
         fake_windll = types.SimpleNamespace(
             user32=_FakeUser32(last_input_tick=1000),

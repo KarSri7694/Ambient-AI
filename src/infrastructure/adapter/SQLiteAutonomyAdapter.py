@@ -48,6 +48,7 @@ class SQLiteAutonomyAdapter(AutonomyStorePort):
         self.db_path = str(Path(db_path))
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self.recovered_future_capture_timestamps = 0
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
@@ -266,6 +267,57 @@ class SQLiteAutonomyAdapter(AutonomyStorePort):
                 conn.execute(
                     "ALTER TABLE daily_briefings ADD COLUMN failures_json TEXT NOT NULL DEFAULT '[]'"
                 )
+            self.recovered_future_capture_timestamps = self._repair_future_capture_timestamps(conn)
+
+    @staticmethod
+    def _repair_future_capture_timestamps(conn: sqlite3.Connection) -> int:
+        """Make screen captures produced by the old naive-local clock immediately runnable."""
+        now = _utcnow()
+        future_cutoff = now + timedelta(minutes=2)
+        rows = conn.execute(
+            """
+            SELECT event_id, occurred_at, available_at
+            FROM ambient_events
+            WHERE event_type='lightweight_visual_capture'
+              AND status IN ('pending', 'resource_deferred')
+              AND julianday(occurred_at) > julianday(?)
+            """,
+            (_utciso(future_cutoff),),
+        ).fetchall()
+        if not rows:
+            return 0
+
+        local_offset = datetime.now().astimezone().utcoffset() or timedelta(0)
+        repaired = 0
+        for row in rows:
+            try:
+                occurred = datetime.fromisoformat(str(row["occurred_at"]).replace("Z", "+00:00"))
+                available = datetime.fromisoformat(str(row["available_at"]).replace("Z", "+00:00"))
+                if occurred.tzinfo is None:
+                    occurred = occurred.replace(tzinfo=timezone.utc)
+                if available.tzinfo is None:
+                    available = available.replace(tzinfo=timezone.utc)
+                occurred = occurred.astimezone(timezone.utc)
+                available = available.astimezone(timezone.utc)
+            except (TypeError, ValueError):
+                continue
+
+            corrected_occurred = occurred - local_offset if local_offset else now
+            if corrected_occurred > future_cutoff or corrected_occurred < now - timedelta(days=30):
+                corrected_occurred = now
+            corrected_available = available - local_offset if local_offset else now
+            if corrected_available > future_cutoff or corrected_available < corrected_occurred:
+                corrected_available = corrected_occurred
+            conn.execute(
+                "UPDATE ambient_events SET occurred_at=?, available_at=? WHERE event_id=?",
+                (
+                    _utciso(corrected_occurred),
+                    _utciso(min(corrected_available, now)),
+                    row["event_id"],
+                ),
+            )
+            repaired += 1
+        return repaired
 
     def enqueue_event(self, event: AmbientEvent) -> AmbientEvent:
         occurred_at = _normalize_utciso(event.occurred_at, fallback=_utciso())

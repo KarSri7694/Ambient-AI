@@ -2569,6 +2569,11 @@ if __name__ == "__main__":
         persistence_path=USER_DATA_DIR / "privacy" / "capture_exclusions.json",
     )
     autonomy_api_store = SQLiteAutonomyAdapter(str(AUTONOMY_DB_PATH))
+    if autonomy_api_store.recovered_future_capture_timestamps:
+        logger.warning(
+            "Recovered %s screen capture event(s) that were incorrectly timestamped in the future.",
+            autonomy_api_store.recovered_future_capture_timestamps,
+        )
     resource_governor = ResourceGovernorService(
         monitor=WindowsResourceMonitor(),
         preset=RESOURCE_PRESET,

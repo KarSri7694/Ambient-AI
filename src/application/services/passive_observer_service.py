@@ -363,6 +363,16 @@ Rules:
 
         # Window/title text is a fallback only. Unlike the old fixed TLD list,
         # this accepts arbitrary DNS suffixes, localhost, IP addresses and ports.
+        process_name = Path(str(uiat_context.get("process_name") or "")).stem.lower()
+        window_class = str(uiat_context.get("window_class") or "").lower()
+        browser_processes = {
+            "chrome", "msedge", "firefox", "brave", "opera", "vivaldi",
+            "chromium", "waterfox", "librewolf", "zen",
+        }
+        if process_name not in browser_processes and not any(
+            marker in window_class for marker in ("mozilla", "chrome_widget")
+        ):
+            return None
         fallback_text = str(uiat_context.get("window_title") or "").lower()
         pattern = re.compile(
             r"(?<![a-z0-9-])((?:localhost|(?:\d{1,3}\.){3}\d{1,3}|[a-z0-9-]+(?:\.[a-z0-9-]+)+)(?::\d{1,5})?)(?![a-z0-9-])"

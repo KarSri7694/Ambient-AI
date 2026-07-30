@@ -198,6 +198,35 @@ def test_event_store_claims_offset_timestamp_as_same_instant(tmp_path):
     assert claimed.event_id == event.event_id
 
 
+def test_event_store_repairs_future_screen_timestamps_from_legacy_local_clock(tmp_path):
+    db_path = tmp_path / "autonomy.db"
+    store = SQLiteAutonomyAdapter(str(db_path))
+    future = (datetime.now(timezone.utc) + timedelta(hours=5)).isoformat()
+    event = AmbientEvent(
+        event_id="future-screen-event",
+        event_type="lightweight_visual_capture",
+        source_kind="screen_capture",
+        source_ref="capture://00000000000000000000000000000001",
+        occurred_at=future,
+        payload_json="{}",
+        confidence=0.5,
+        privacy_label="sensitive_visual",
+        fingerprint="future-screen-fingerprint",
+        status="pending",
+        priority=0.5,
+        available_at=future,
+    )
+    store.enqueue_event(event)
+    assert store.has_ready_events() is False
+
+    restarted = SQLiteAutonomyAdapter(str(db_path))
+    assert restarted.recovered_future_capture_timestamps == 1
+    assert restarted.has_ready_events() is True
+    claimed = restarted.claim_next_event()
+    assert claimed is not None
+    assert datetime.fromisoformat(claimed.occurred_at) <= datetime.now(timezone.utc)
+
+
 def test_shadow_coordinator_judges_active_context_without_idle_trigger(tmp_path):
     store = SQLiteAutonomyAdapter(str(tmp_path / "autonomy.db"))
     provider = _JudgmentProvider()

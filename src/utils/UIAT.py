@@ -166,13 +166,17 @@ def _browser_address_bar_url(window, *, max_controls: int = 300) -> str | None:
             control_type = str(control.ControlTypeName or "").lower()
         except Exception:
             control_type = ""
+        try:
+            is_edit = control.ControlType == auto.ControlType.EditControl
+        except Exception:
+            is_edit = "edit" in control_type
         value = ""
-        if "edit" in control_type:
+        if is_edit:
             try:
                 value = str(control.GetValuePattern().Value or "").strip()
             except Exception:
                 value = ""
-            candidate = _url_from_candidate(value)
+            candidate = _url_from_candidate(value) or _url_from_candidate(name)
             label = name.lower()
             if candidate and any(
                 marker in label
