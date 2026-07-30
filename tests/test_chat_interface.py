@@ -105,6 +105,22 @@ def test_chat_store_marks_interrupted_responses_failed(tmp_path):
     assert "stopped" in message["error_text"]
 
 
+def test_chat_store_locks_session_while_approval_is_pending(tmp_path):
+    store = SQLiteChatAdapter(str(tmp_path / "chat.db"))
+    session = store.create_session()
+    turn = store.enqueue_turn(session["id"], "Use the browser")
+    store.claim_next_turn()
+    store.mark_awaiting_approval(
+        turn["assistant_message"]["id"], "Waiting for browser approval"
+    )
+
+    with pytest.raises(ValueError, match="awaiting approval"):
+        store.enqueue_turn(session["id"], "Send another request")
+
+    store.complete_message(turn["assistant_message"]["id"], "Approval denied")
+    assert store.enqueue_turn(session["id"], "Now continue")["assistant_message"]["status"] == "queued"
+
+
 def test_loopback_chat_api_supports_terminal_sse_without_authentication(tmp_path):
     store = SQLiteChatAdapter(str(tmp_path / "chat.db"))
     broker = ChatEventBroker()

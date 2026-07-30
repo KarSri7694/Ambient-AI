@@ -10,7 +10,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC_ROOT = REPO_ROOT / "src"
 sys.path.insert(0, str(SRC_ROOT))
 
-from application.services.llm_interaction_service import LLMInteractionService
+from application.services.llm_interaction_service import InteractionSuspended, LLMInteractionService
 from application.services.capability_policy_service import CapabilityPolicyService
 from application.services.autonomy_coordinator_service import AutonomyCoordinatorService
 from infrastructure.adapter.BrowserMCPToolAdapter import (
@@ -19,7 +19,7 @@ from infrastructure.adapter.BrowserMCPToolAdapter import (
 )
 from infrastructure.adapter.MCPToolAdapter import MCPToolAdapter
 from infrastructure.adapter.SQLiteAutonomyAdapter import SQLiteAutonomyAdapter
-from core.models import AmbientEvent
+from core.models import AmbientEvent, ApprovalGrant
 
 
 def _tool(name: str, description: str = "") -> dict:
@@ -118,6 +118,47 @@ class _BrowserFlowProvider:
         return _result_stream()
 
 
+class _BrowserRequestProvider(_BrowserFlowProvider):
+    async def chat_completion_stream(self, *, model, messages, tools, image="", **kwargs):
+        self.calls.append({"model": model, "messages": messages, "tools": tools})
+        call = SimpleNamespace(
+            index=0, id="use-browser-1",
+            function=SimpleNamespace(
+                name="use_browser",
+                arguments=json.dumps({
+                    "task": "Open example.com and report its title",
+                    "reason": "The user asked for current page information",
+                }),
+            ),
+        )
+        async def stream():
+            yield _Chunk(tool_calls=[call])
+        return stream()
+
+
+class _BrowserClickProvider(_BrowserFlowProvider):
+    async def chat_completion_stream(self, *, model, messages, tools, image="", **kwargs):
+        self.calls.append({"model": model, "messages": messages, "tools": tools})
+        self.browser_turn += 1
+        if self.browser_turn == 1:
+            call = SimpleNamespace(
+                index=0,
+                id="browser-click-1",
+                function=SimpleNamespace(
+                    name="browser_click",
+                    arguments=json.dumps({"element": "Repository link", "ref": "e12"}),
+                ),
+            )
+
+            async def click_stream():
+                yield _Chunk(tool_calls=[call])
+
+            return click_stream()
+        return await super().chat_completion_stream(
+            model=model, messages=messages, tools=tools, image=image, **kwargs
+        )
+
+
 class _SlowBrowserProvider(_BrowserFlowProvider):
     async def chat_completion_stream(self, *, model, messages, tools, image="", **kwargs):
         await asyncio.sleep(1)
@@ -171,7 +212,7 @@ class _Judgment:
 
 
 def test_use_browser_creates_pending_approval_without_running_agent(tmp_path):
-    provider = _BrowserFlowProvider()
+    provider = _BrowserRequestProvider()
     main_bridge = _MainToolBridge()
     browser_bridge = _BrowserBridge()
     store = SQLiteAutonomyAdapter(str(tmp_path / "autonomy.db"))
@@ -190,31 +231,13 @@ def test_use_browser_creates_pending_approval_without_running_agent(tmp_path):
         "demo",
     ]
 
-    result = asyncio.run(
-        service._execute_tool_calls(
-            [
-                {
-                    "id": "use-browser-1",
-                    "type": "function",
-                    "function": {
-                        "name": "use_browser",
-                        "arguments": json.dumps(
-                            {
-                                "task": "Open example.com and report its title",
-                                "headless": False,
-                            }
-                        ),
-                    },
-                }
-            ],
-            agent_depth=0,
-        )
-    )
-
-    payload = json.loads(result[0][1])
+    with pytest.raises(InteractionSuspended) as caught:
+        asyncio.run(service.run_interaction(
+            user_input="Check example.com", system_prompt="Help the user.", model="main-model"
+        ))
     approvals = store.list_approvals(status="pending")
-    assert payload["status"] == "awaiting_user_approval"
     assert len(approvals) == 1
+    assert caught.value.approval_id == approvals[0].approval_id
     assert approvals[0].capability == "browser.use"
     assert json.loads(approvals[0].constraints_json)["approval_kind"] == "browser_use_deployment"
     assert browser_bridge.headless_calls == []
@@ -245,6 +268,10 @@ def test_browser_agent_isolates_tools_and_restores_parent_after_approval():
         "status": "completed",
         "summary": "Opened example.com.",
         "browser_exited": True,
+        "details": "",
+        "actions_performed": [],
+        "sources": [],
+        "blockers": [],
     }
     assert browser_bridge.headless_calls == [True]
     assert browser_bridge.sessions[0].executions == [
@@ -266,6 +293,44 @@ def test_browser_agent_isolates_tools_and_restores_parent_after_approval():
     finish_schema = provider.calls[0]["tools"][-1]["function"]["parameters"]
     assert finish_schema["required"] == ["exit_browser", "status", "summary"]
     assert finish_schema["additionalProperties"] is False
+
+
+def test_scoped_browser_approval_covers_child_clicks_without_more_prompts(tmp_path):
+    store = SQLiteAutonomyAdapter(str(tmp_path / "autonomy.db"))
+    store.create_approval(
+        ApprovalGrant(
+            approval_id="approved-browser-task",
+            capability="browser.use",
+            action_fingerprint="browser-task-fingerprint",
+            constraints_json="{}",
+            status="approved",
+            created_at="2026-07-30T10:00:00+00:00",
+            expires_at="2026-07-30T11:00:00+00:00",
+            approver="local_user",
+        )
+    )
+    provider = _BrowserClickProvider()
+    browser_bridge = _BrowserBridge()
+    service = LLMInteractionService(
+        llm_provider=provider,
+        tool_bridge=_MainToolBridge(),
+        browser_tool_bridge=browser_bridge,
+        browser_agent_model="browser-model",
+        capability_policy=CapabilityPolicyService(store=store),
+    )
+
+    result = asyncio.run(
+        service.deploy_browser_agent(
+            task="Open the approved repository link",
+            approval_id="approved-browser-task",
+        )
+    )
+
+    assert json.loads(result)["status"] == "completed"
+    assert browser_bridge.sessions[0].executions == [
+        ("browser_click", {"element": "Repository link", "ref": "e12"})
+    ]
+    assert store.list_approvals(status="pending") == []
 
 
 def test_browser_approval_event_deploys_browser_agent_once(tmp_path):
@@ -347,6 +412,10 @@ def test_finish_browser_task_can_return_without_closing_browser():
         "status": "completed",
         "summary": "Opened example.com.",
         "browser_exited": False,
+        "details": "",
+        "actions_performed": [],
+        "sources": [],
+        "blockers": [],
     }
     assert browser_bridge.sessions[0].cleaned is False
     assert service._retained_browser_sessions == [browser_bridge.sessions[0]]

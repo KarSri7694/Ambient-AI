@@ -32,6 +32,7 @@ class UIATAdapter:
             "window_title": None,
             "window_class": None,
             "process_id": None,
+            "process_name": None,
             "is_chromium": False,
             "visible_items": [],
             "visible_text_summary": "",

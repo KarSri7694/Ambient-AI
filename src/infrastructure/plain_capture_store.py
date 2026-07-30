@@ -80,6 +80,10 @@ class PlainCaptureStore:
         data, metadata = self.read_bytes(uri)
         return data, str(metadata.get("original_name") or f"{self._capture_id(uri)}.bin")
 
+    def metadata(self, uri: str) -> dict:
+        """Return a defensive copy of capture metadata for local management UIs."""
+        return dict(self._metadata(uri))
+
     def size_bytes(self) -> int:
         return sum(
             path.stat().st_size

@@ -13,7 +13,10 @@ Usage:
 import sys
 import time
 import ctypes
+import os
 import re
+from pathlib import Path
+from urllib.parse import urlsplit
 import uiautomation as auto
 
 
@@ -93,6 +96,95 @@ CONTENT_CONTROL_TYPES = {
 
 MAX_ITEM_NAME_CHARS = 50
 DEDUPE_OVERLAP_THRESHOLD = 0.85
+
+
+def _query_process_name(process_id: int | None) -> str | None:
+    """Resolve the executable for a foreground PID without another dependency."""
+    if os.name != "nt" or not process_id:
+        return None
+    process_query_limited_information = 0x1000
+    handle = ctypes.windll.kernel32.OpenProcess(
+        process_query_limited_information, False, int(process_id)
+    )
+    if not handle:
+        return None
+    try:
+        size = ctypes.c_ulong(32768)
+        buffer = ctypes.create_unicode_buffer(size.value)
+        if ctypes.windll.kernel32.QueryFullProcessImageNameW(
+            handle, 0, buffer, ctypes.byref(size)
+        ):
+            return Path(buffer.value).name or None
+    finally:
+        ctypes.windll.kernel32.CloseHandle(handle)
+    return None
+
+
+def _url_from_candidate(value: str) -> str | None:
+    """Extract a URL/host while supporting any TLD, localhost, IPs and ports."""
+    raw = str(value or "").strip().strip("<>[](){}\"'")
+    if not raw:
+        return None
+    explicit = re.search(r"https?://[^\s<>\"']+", raw, re.IGNORECASE)
+    if explicit:
+        raw = explicit.group(0).rstrip(",.;)")
+    elif any(char.isspace() for char in raw):
+        return None
+    candidate = raw if "://" in raw else f"//{raw}"
+    try:
+        parsed = urlsplit(candidate)
+        hostname = parsed.hostname
+    except ValueError:
+        return None
+    if not hostname:
+        return None
+    host = hostname.lower().rstrip(".")
+    plausible = (
+        host == "localhost"
+        or "." in host
+        or ":" in host
+        or bool(re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", host))
+    )
+    if not plausible:
+        return None
+    return raw if "://" in raw else f"https://{raw}"
+
+
+def _browser_address_bar_url(window, *, max_controls: int = 300) -> str | None:
+    """Prefer the Chromium address-bar value over text inferred from page content."""
+    pending = [window]
+    visited = 0
+    fallback = None
+    while pending and visited < max_controls:
+        control = pending.pop(0)
+        visited += 1
+        try:
+            name = str(control.Name or "").strip()
+        except Exception:
+            name = ""
+        try:
+            control_type = str(control.ControlTypeName or "").lower()
+        except Exception:
+            control_type = ""
+        value = ""
+        if "edit" in control_type:
+            try:
+                value = str(control.GetValuePattern().Value or "").strip()
+            except Exception:
+                value = ""
+            candidate = _url_from_candidate(value)
+            label = name.lower()
+            if candidate and any(
+                marker in label
+                for marker in ("address", "search", "url", "omnibox", "location")
+            ):
+                return candidate
+            fallback = fallback or candidate
+        try:
+            pending.extend(control.GetChildren() or [])
+        except Exception:
+            continue
+    return fallback
 
 
 def _virtual_screen_bounds() -> tuple[int, int, int, int]:
@@ -498,8 +590,11 @@ def inspect_foreground_window(mode: str = "interactive_only") -> dict:
         process_id = int(window.ProcessId)
     except Exception:
         process_id = None
+    process_name = _query_process_name(process_id)
 
     chromium = is_chromium_window(window)
+    browser_processes = {"chrome", "msedge", "firefox", "brave", "opera", "vivaldi"}
+    is_browser = chromium or Path(str(process_name or "")).stem.lower() in browser_processes
     accessibility_activated = False
     if chromium:
         original_state = _get_screen_reader_state()
@@ -507,8 +602,11 @@ def inspect_foreground_window(mode: str = "interactive_only") -> dict:
             enable_chromium_accessibility()
             accessibility_activated = True
 
+    address_bar_url = None
     try:
         rows = deduplicate_results(scan_window(window, mode=mode))
+        if is_browser:
+            address_bar_url = _browser_address_bar_url(window)
     finally:
         if accessibility_activated:
             disable_chromium_accessibility()
@@ -527,18 +625,12 @@ def inspect_foreground_window(mode: str = "interactive_only") -> dict:
         for row in rows
     ]
     visible_text_summary = "\n".join(item["name"] for item in items[:80])
-    foreground_url = None
-    url_pattern = re.compile(r"https?://[^\s]+", re.IGNORECASE)
-    domain_pattern = re.compile(r"^(?:www\.)?[a-z0-9-]+(?:\.[a-z0-9-]+)+(?::\d+)?(?:/\S*)?$", re.IGNORECASE)
-    for item in items:
-        candidate = str(item.get("name") or "").strip()
-        match = url_pattern.search(candidate)
-        if match:
-            foreground_url = match.group(0).rstrip(",.;)")
-            break
-        if domain_pattern.match(candidate) and " " not in candidate:
-            foreground_url = "https://" + candidate
-            break
+    foreground_url = address_bar_url
+    if foreground_url is None and not is_browser:
+        for item in items:
+            foreground_url = _url_from_candidate(str(item.get("name") or ""))
+            if foreground_url:
+                break
     lowered = visible_text_summary.lower()
     return {
         "ok": True,
@@ -546,6 +638,7 @@ def inspect_foreground_window(mode: str = "interactive_only") -> dict:
         "window_title": str(window_title),
         "window_class": window_class,
         "process_id": process_id,
+        "process_name": process_name,
         "is_chromium": chromium,
         "visible_items": items,
         "visible_text_summary": visible_text_summary,

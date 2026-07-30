@@ -186,6 +186,175 @@ def test_mcp_config_rejects_unresolved_environment_reference(monkeypatch):
         expand_environment_references("%MCP_MISSING_TOKEN%")
 
 
+def test_runtime_delegates_one_untimed_task_to_autonomy():
+    task = types.SimpleNamespace(
+        id=7,
+        description="Prepare a concise ROCm benchmark report.",
+        priority="low",
+        metadata_json='{"source":"reflection_service"}',
+    )
+
+    class _TaskQueue:
+        def __init__(self):
+            self.completed = []
+
+        def get_pending_tasks(self):
+            return [task]
+
+        def claim_task(self, task_id):
+            return task_id == task.id
+
+        def mark_task_complete(self, task_id, status="completed"):
+            self.completed.append((task_id, status))
+
+    class _Coordinator:
+        def __init__(self):
+            self.calls = []
+
+        def enqueue_background_task(self, **kwargs):
+            self.calls.append(kwargs)
+
+    task_queue = _TaskQueue()
+    coordinator = _Coordinator()
+    runtime = AmbientRuntime.__new__(AmbientRuntime)
+
+    delegated = runtime._enqueue_pending_background_tasks(
+        task_queue=task_queue,
+        autonomy_coordinator=coordinator,
+    )
+
+    assert delegated == 1
+    assert coordinator.calls == [
+        {
+            "task_id": 7,
+            "description": "Prepare a concise ROCm benchmark report.",
+            "priority": "low",
+            "metadata_json": '{"source":"reflection_service"}',
+        }
+    ]
+    assert task_queue.completed == [(7, "delegated_to_autonomy")]
+
+
+def test_biodata_scheduler_runs_at_threshold_or_first_idle_window(monkeypatch):
+    monkeypatch.setattr(app, "BIODATA_UPDATE_EVENT_INTERVAL", 5)
+
+    assert AmbientRuntime._biodata_work_due(
+        user_idle=False,
+        ran_in_idle_window=False,
+        context_events_since_update=4,
+    ) is False
+    assert AmbientRuntime._biodata_work_due(
+        user_idle=False,
+        ran_in_idle_window=False,
+        context_events_since_update=5,
+    ) is True
+    assert AmbientRuntime._biodata_work_due(
+        user_idle=True,
+        ran_in_idle_window=False,
+        context_events_since_update=0,
+    ) is True
+    assert AmbientRuntime._biodata_work_due(
+        user_idle=True,
+        ran_in_idle_window=True,
+        context_events_since_update=0,
+    ) is False
+
+
+def test_production_idle_scheduler_runs_due_automatic_reflection(monkeypatch):
+    class _Reflection:
+        def __init__(self):
+            self.calls = []
+
+        def is_due(self):
+            return True
+
+        async def run_if_due(self, *, model):
+            self.calls.append(model)
+            return {
+                "ran": True,
+                "cleaned_user_info_changed": True,
+                "cleaned_working_memory_changed": True,
+                "generated_tasks": ["one"],
+                "queued_tasks": ["one"],
+                "skipped_tasks": [],
+            }
+
+    runtime = AmbientRuntime(transcription_queue=queue.Queue())
+    reflection = _Reflection()
+    ensure_calls = []
+
+    async def _ensure_runtime(**kwargs):
+        ensure_calls.append(kwargs)
+        return True
+
+    runtime._ensure_runtime = _ensure_runtime
+    monkeypatch.setattr(app, "ALWAYS_ON_MODE", False)
+    monkeypatch.setattr(app, "REFLECTION_MODEL", "reflection-model")
+
+    attempted, initialized = asyncio.run(
+        runtime._run_automatic_reflection(
+            llm_adapter=object(),
+            reflection_service=reflection,
+            services_initialized=False,
+        )
+    )
+
+    assert attempted is True
+    assert initialized is True
+    assert reflection.calls == ["reflection-model"]
+    assert ensure_calls[0]["role"] == "automatic_reflection"
+    assert ensure_calls[0]["background"] is True
+
+
+def test_manual_biodata_request_runs_pending_observations(monkeypatch):
+    class _Biodata:
+        def __init__(self):
+            self.calls = []
+
+        def has_pending_biodata_observations(self):
+            return True
+
+        async def update_biodata(self, *, model):
+            self.calls.append(model)
+            return {
+                "processed_observation_ids": ["observation-1", "observation-2"],
+                "entries": [{"bucket": "user_info", "note": "User works on Ambient AI."}],
+            }
+
+    runtime = AmbientRuntime(transcription_queue=queue.Queue())
+    biodata = _Biodata()
+    ensure_calls = []
+
+    async def _ensure_runtime(**kwargs):
+        ensure_calls.append(kwargs)
+        return True
+
+    runtime._ensure_runtime = _ensure_runtime
+    monkeypatch.setattr(app, "USER_BIODATA_MODEL", "biodata-model")
+
+    requested = runtime.request_biodata_update()
+    handled, initialized = asyncio.run(
+        runtime._run_manual_biodata_update(
+            llm_adapter=object(),
+            user_biodata_service=biodata,
+            services_initialized=False,
+        )
+    )
+
+    status = runtime.manual_biodata_status()
+    assert requested["accepted"] is True
+    assert handled is True
+    assert initialized is True
+    assert biodata.calls == ["biodata-model"]
+    assert ensure_calls[0]["role"] == "manual_biodata_update"
+    assert status["running"] is False
+    assert status["last_result"] == {
+        "processed_count": 2,
+        "entry_count": 1,
+        "reason": None,
+    }
+
+
 def test_ambient_runtime_separates_mcp_lifetime_from_model_lifetime():
     runtime = AmbientRuntime(transcription_queue=queue.Queue())
     llm = _FakeModelManager()

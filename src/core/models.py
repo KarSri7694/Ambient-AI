@@ -663,6 +663,35 @@ class ApprovalGrant:
 
 
 @dataclass(frozen=True)
+class DelegatedTask:
+    """Durable browser/computer work that resumes its originating workflow."""
+    delegation_id: str
+    approval_id: str
+    capability: str
+    task: str
+    reason: str
+    expected_result: str
+    continuation_instruction: str
+    origin_kind: str
+    origin_json: str
+    parent_model: str
+    status: str
+    created_at: str
+    updated_at: str
+    parent_delegation_id: Optional[str] = None
+    started_at: Optional[str] = None
+    control_started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    result_json: Optional[str] = None
+    error_text: Optional[str] = None
+    continuation_event_id: Optional[str] = None
+    checkpoint_json: Optional[str] = None
+    suspended_tool_call_id: Optional[str] = None
+    resumed_at: Optional[str] = None
+    final_response: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class ProactiveInboxItem:
     """A durable user-facing result or approval request."""
     inbox_id: str

@@ -37,7 +37,7 @@ class ArtifactCandidate:
 
 
 def _now() -> str:
-    return datetime.now().isoformat(timespec="seconds")
+    return datetime.now().isoformat(timespec="microseconds")
 
 
 def _truncate_words(text: str, limit: int) -> str:
@@ -111,8 +111,47 @@ class ArtifactOrganizer:
                     created_at TEXT NOT NULL,
                     last_ai_edited_at TEXT NOT NULL,
                     last_source_ref TEXT,
-                    content_hash TEXT
+                    content_hash TEXT,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    canonical_artifact_id TEXT,
+                    archived_at TEXT
                 )
+                """
+            )
+            existing = {row[1] for row in conn.execute("PRAGMA table_info(artifacts)").fetchall()}
+            migrations = {
+                "status": "TEXT NOT NULL DEFAULT 'active'",
+                "canonical_artifact_id": "TEXT",
+                "archived_at": "TEXT",
+            }
+            for name, definition in migrations.items():
+                if name not in existing:
+                    conn.execute(f"ALTER TABLE artifacts ADD COLUMN {name} {definition}")
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS artifact_maintenance_runs (
+                    run_id TEXT PRIMARY KEY,
+                    trigger_kind TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    scanned_count INTEGER NOT NULL DEFAULT 0,
+                    candidate_pair_count INTEGER NOT NULL DEFAULT 0,
+                    cluster_count INTEGER NOT NULL DEFAULT 0,
+                    merged_cluster_count INTEGER NOT NULL DEFAULT 0,
+                    archived_count INTEGER NOT NULL DEFAULT 0,
+                    continuation_required INTEGER NOT NULL DEFAULT 0,
+                    error_text TEXT
+                );
+                CREATE TABLE IF NOT EXISTS artifact_merge_history (
+                    merge_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    canonical_artifact_id TEXT NOT NULL,
+                    archived_artifact_ids_json TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    rationale TEXT,
+                    created_at TEXT NOT NULL
+                );
                 """
             )
 
@@ -265,7 +304,7 @@ class ArtifactOrganizer:
             return result
 
         row = self._get_by_id(target_id)
-        if row is None:
+        if row is None or str(row["status"] or "active") != "active":
             result = self.save_new(
                 title=final_title,
                 summary=short_summary,
@@ -309,6 +348,245 @@ class ArtifactOrganizer:
             "artifact_action": "merged",
             "artifact_reason": reason or f"Merged into existing artifact: {row['title']}",
             "dedupe_notes": dedupe_notes,
+        }
+
+    def list_artifacts(self, *, status: str = "active", limit: int = 500) -> list[dict[str, Any]]:
+        normalized = status if status in {"active", "archived"} else "active"
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM artifacts WHERE status = ? ORDER BY last_ai_edited_at DESC LIMIT ?",
+                (normalized, max(1, int(limit))),
+            ).fetchall()
+        return [self._record_payload(row, include_content=False) for row in rows]
+
+    def get_artifact(self, artifact_id: str, *, include_content: bool = True) -> dict[str, Any] | None:
+        row = self._get_by_id(str(artifact_id))
+        return self._record_payload(row, include_content=include_content) if row is not None else None
+
+    def reconcile_and_reindex(self) -> int:
+        """Register loose files and ensure every active registry row has a semantic chunk."""
+        self.backfill_registry()
+        rows = self._list_records()
+        for row in rows:
+            self._index_semantic_record(
+                artifact_id=row["artifact_id"],
+                title=row["title"],
+                artifact_path=row["artifact_path"],
+                artifact_kind=row["artifact_kind"],
+                short_summary=row["short_summary"],
+                detailed_summary=row["detailed_summary"],
+                topics=_safe_json(row["topics_json"], []),
+                source_count=row["source_count"],
+                last_ai_edited_at=row["last_ai_edited_at"],
+                sync=False,
+            )
+        if rows and self.semantic_memory is not None and hasattr(self.semantic_memory, "ensure_embeddings_synced"):
+            self.semantic_memory.ensure_embeddings_synced(max_batches=None)
+        return len(rows)
+
+    def maintenance_status(self, *, min_changes: int, interval_hours: float) -> dict[str, Any]:
+        with self._connection() as conn:
+            last = conn.execute(
+                "SELECT * FROM artifact_maintenance_runs ORDER BY started_at DESC LIMIT 1"
+            ).fetchone()
+            last_success = conn.execute(
+                "SELECT * FROM artifact_maintenance_runs WHERE status = 'completed' "
+                "ORDER BY completed_at DESC LIMIT 1"
+            ).fetchone()
+            active_count = int(
+                conn.execute("SELECT COUNT(*) FROM artifacts WHERE status = 'active'").fetchone()[0]
+            )
+            archived_count = int(
+                conn.execute("SELECT COUNT(*) FROM artifacts WHERE status = 'archived'").fetchone()[0]
+            )
+            if last_success is None:
+                changed_count = active_count
+            else:
+                changed_count = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM artifacts WHERE status = 'active' AND last_ai_edited_at > ?",
+                        (last_success["completed_at"],),
+                    ).fetchone()[0]
+                )
+        now = datetime.now()
+        elapsed_hours = None
+        if last_success is not None and last_success["completed_at"]:
+            try:
+                elapsed_hours = max(
+                    0.0,
+                    (now - datetime.fromisoformat(last_success["completed_at"])).total_seconds() / 3600.0,
+                )
+            except ValueError:
+                elapsed_hours = None
+        continuation = bool(last_success and last_success["continuation_required"])
+        due_reasons: list[str] = []
+        if last_success is None:
+            due_reasons.append("initial_scan")
+        if changed_count >= max(1, int(min_changes)):
+            due_reasons.append("artifact_changes")
+        if elapsed_hours is not None and elapsed_hours >= max(1.0, float(interval_hours)):
+            due_reasons.append("daily_interval")
+        if continuation:
+            due_reasons.append("continuation")
+        return {
+            "active_count": active_count,
+            "archived_count": archived_count,
+            "changed_count": changed_count,
+            "due": bool(due_reasons),
+            "due_reasons": due_reasons,
+            "last_run": dict(last) if last is not None else None,
+            "last_success": dict(last_success) if last_success is not None else None,
+        }
+
+    def list_maintenance_history(self, *, limit: int = 50) -> dict[str, Any]:
+        with self._connection() as conn:
+            runs = conn.execute(
+                "SELECT * FROM artifact_maintenance_runs ORDER BY started_at DESC LIMIT ?",
+                (max(1, int(limit)),),
+            ).fetchall()
+            merges = conn.execute(
+                "SELECT * FROM artifact_merge_history ORDER BY created_at DESC LIMIT ?",
+                (max(1, int(limit)),),
+            ).fetchall()
+        return {"runs": [dict(row) for row in runs], "merges": [dict(row) for row in merges]}
+
+    def start_maintenance_run(self, trigger_kind: str) -> str:
+        run_id = uuid.uuid4().hex
+        with self._connection() as conn:
+            conn.execute(
+                "INSERT INTO artifact_maintenance_runs "
+                "(run_id, trigger_kind, status, started_at) VALUES (?, ?, 'running', ?)",
+                (run_id, str(trigger_kind), _now()),
+            )
+        return run_id
+
+    def finish_maintenance_run(self, run_id: str, *, status: str, **metrics: Any) -> None:
+        allowed = {
+            "scanned_count", "candidate_pair_count", "cluster_count",
+            "merged_cluster_count", "archived_count", "continuation_required", "error_text",
+        }
+        updates = {key: value for key, value in metrics.items() if key in allowed}
+        assignments = ["status = ?", "completed_at = ?"]
+        params: list[Any] = [str(status), _now()]
+        for key, value in updates.items():
+            assignments.append(f"{key} = ?")
+            params.append(int(bool(value)) if key == "continuation_required" else value)
+        params.append(str(run_id))
+        with self._connection() as conn:
+            conn.execute(
+                f"UPDATE artifact_maintenance_runs SET {', '.join(assignments)} WHERE run_id = ?",
+                params,
+            )
+
+    def consolidate_cluster(
+        self,
+        *,
+        run_id: str,
+        canonical_artifact_id: str,
+        artifact_ids: list[str],
+        final_title: str,
+        short_summary: str,
+        detailed_summary: str,
+        merged_content: str,
+        confidence: float,
+        rationale: str,
+        archive_dir: str = "archived",
+    ) -> dict[str, Any]:
+        ordered_ids = list(dict.fromkeys(str(item) for item in artifact_ids))
+        if canonical_artifact_id not in ordered_ids or len(ordered_ids) < 2:
+            raise ValueError("A maintenance cluster requires a canonical artifact and a duplicate.")
+        rows = [self._get_by_id(item) for item in ordered_ids]
+        if any(row is None or str(row["status"] or "active") != "active" for row in rows):
+            raise ValueError("Maintenance cluster contains a missing or inactive artifact.")
+        row_by_id = {str(row["artifact_id"]): row for row in rows if row is not None}
+        canonical = row_by_id[canonical_artifact_id]
+        duplicates = [row_by_id[item] for item in ordered_ids if item != canonical_artifact_id]
+        canonical_path = self._resolve_artifact_path(canonical["artifact_path"])
+        previous_canonical = canonical_path.read_text(encoding="utf-8", errors="replace")
+        timestamp = _now()
+        formatted = self._ensure_standard_format(
+            title=final_title,
+            last_edit=timestamp,
+            short_summary=short_summary,
+            detailed_summary=detailed_summary,
+            merged_content=merged_content,
+            source_ref=f"artifact-maintenance/{run_id}",
+        )
+        if len(formatted.strip()) < 200:
+            raise ValueError("Maintenance merge output was too short to replace the canonical artifact.")
+        archive_root = (self.artifact_root / archive_dir).resolve(strict=False)
+        archive_root.relative_to(self.artifact_root.resolve(strict=False))
+        archive_root.mkdir(parents=True, exist_ok=True)
+        moved: list[tuple[Path, Path]] = []
+        temp_path = canonical_path.with_name(f".{canonical_path.name}.{run_id}.tmp")
+        archived_rows: list[tuple[sqlite3.Row, Path]] = []
+        try:
+            temp_path.write_text(formatted, encoding="utf-8")
+            for duplicate in duplicates:
+                source = self._resolve_artifact_path(duplicate["artifact_path"])
+                destination = self._unique_archive_path(archive_root, source.name)
+                source.replace(destination)
+                moved.append((source, destination))
+                archived_rows.append((duplicate, destination))
+            temp_path.replace(canonical_path)
+            total_sources = sum(max(1, int(row["source_count"] or 0)) for row in rows if row is not None)
+            merge_id = uuid.uuid4().hex
+            with self._connection() as conn:
+                conn.execute(
+                    "UPDATE artifacts SET title=?, short_summary=?, detailed_summary=?, source_count=?, "
+                    "last_ai_edited_at=?, last_source_ref=?, content_hash=?, status='active', "
+                    "canonical_artifact_id=NULL, archived_at=NULL WHERE artifact_id=?",
+                    (
+                        final_title, _truncate_words(short_summary, self.candidate_summary_words),
+                        detailed_summary, total_sources, timestamp,
+                        f"artifact-maintenance/{run_id}", self._hash(formatted), canonical_artifact_id,
+                    ),
+                )
+                for duplicate, destination in archived_rows:
+                    conn.execute(
+                        "UPDATE artifacts SET artifact_path=?, status='archived', "
+                        "canonical_artifact_id=?, archived_at=? WHERE artifact_id=?",
+                        (str(destination), canonical_artifact_id, timestamp, duplicate["artifact_id"]),
+                    )
+                conn.execute(
+                    "INSERT INTO artifact_merge_history "
+                    "(merge_id, run_id, canonical_artifact_id, archived_artifact_ids_json, confidence, rationale, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        merge_id, run_id, canonical_artifact_id,
+                        json.dumps([row["artifact_id"] for row in duplicates]),
+                        float(confidence), str(rationale or ""), timestamp,
+                    ),
+                )
+        except Exception:
+            if temp_path.exists():
+                temp_path.unlink()
+            canonical_path.write_text(previous_canonical, encoding="utf-8")
+            for source, destination in reversed(moved):
+                if destination.exists():
+                    destination.replace(source)
+            raise
+        canonical_payload = self.get_artifact(canonical_artifact_id, include_content=False) or {}
+        self._index_semantic_record(
+            artifact_id=canonical_artifact_id,
+            title=final_title,
+            artifact_path=canonical_path,
+            artifact_kind=canonical["artifact_kind"],
+            short_summary=short_summary,
+            detailed_summary=detailed_summary,
+            topics=_safe_json(canonical["topics_json"], []),
+            source_count=canonical_payload.get("source_count", 1),
+            last_ai_edited_at=timestamp,
+        )
+        memory = getattr(self.semantic_memory, "memory", None)
+        if memory is not None and hasattr(memory, "delete_semantic_chunk"):
+            for duplicate in duplicates:
+                memory.delete_semantic_chunk(f"artifact:{duplicate['artifact_id']}")
+        return {
+            "canonical_artifact_id": canonical_artifact_id,
+            "archived_artifact_ids": [row["artifact_id"] for row in duplicates],
+            "archived_count": len(duplicates),
+            "artifact_path": str(canonical_path),
         }
 
     def _ensure_standard_format(
@@ -386,7 +664,9 @@ class ArtifactOrganizer:
 
     def _list_records(self) -> list[sqlite3.Row]:
         with self._connection() as conn:
-            return conn.execute("SELECT * FROM artifacts ORDER BY last_ai_edited_at DESC").fetchall()
+            return conn.execute(
+                "SELECT * FROM artifacts WHERE status = 'active' ORDER BY last_ai_edited_at DESC"
+            ).fetchall()
 
     def _upsert_record(self, **values: Any) -> None:
         with self._connection() as conn:
@@ -395,8 +675,9 @@ class ArtifactOrganizer:
                 INSERT OR REPLACE INTO artifacts (
                     artifact_id, title, artifact_path, artifact_kind, short_summary,
                     detailed_summary, topics_json, source_count, created_at,
-                    last_ai_edited_at, last_source_ref, content_hash
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    last_ai_edited_at, last_source_ref, content_hash, status,
+                    canonical_artifact_id, archived_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     values["artifact_id"],
@@ -411,6 +692,9 @@ class ArtifactOrganizer:
                     values["last_ai_edited_at"],
                     values.get("last_source_ref"),
                     values.get("content_hash"),
+                    values.get("status", "active"),
+                    values.get("canonical_artifact_id"),
+                    values.get("archived_at"),
                 ),
             )
         self._index_semantic_record(**values)
@@ -461,7 +745,7 @@ class ArtifactOrganizer:
             if not artifact_id:
                 continue
             row = self._get_by_id(artifact_id)
-            if row is None:
+            if row is None or str(row["status"] or "active") != "active":
                 continue
             semantic_score = result.rerank_score
             if semantic_score is None:
@@ -479,7 +763,7 @@ class ArtifactOrganizer:
             )
         return candidates
 
-    def _index_semantic_record(self, **values: Any) -> None:
+    def _index_semantic_record(self, *, sync: bool = True, **values: Any) -> None:
         semantic_memory = self.semantic_memory
         if semantic_memory is None or not getattr(semantic_memory, "is_enabled", lambda: False)():
             return
@@ -513,7 +797,7 @@ class ArtifactOrganizer:
                 content=content,
                 metadata_json=json.dumps(metadata, ensure_ascii=False),
             )
-            if self.semantic_sync_on_write and hasattr(semantic_memory, "ensure_embeddings_synced"):
+            if sync and self.semantic_sync_on_write and hasattr(semantic_memory, "ensure_embeddings_synced"):
                 semantic_memory.ensure_embeddings_synced(max_batches=1)
         except Exception as exc:
             self.logger.warning("Artifact semantic indexing failed for %s: %s", artifact_id, exc)
@@ -536,6 +820,43 @@ class ArtifactOrganizer:
         suffix = 1
         while candidate.exists():
             candidate = self.artifact_root / f"{safe}_{suffix}.md"
+            suffix += 1
+        return candidate
+
+    def _record_payload(self, row: sqlite3.Row, *, include_content: bool) -> dict[str, Any]:
+        path = self._resolve_artifact_path(row["artifact_path"])
+        payload = {
+            "artifact_id": row["artifact_id"],
+            "title": row["title"],
+            "artifact_path": str(path),
+            "artifact_filename": path.name,
+            "artifact_kind": row["artifact_kind"],
+            "short_summary": row["short_summary"] or "",
+            "detailed_summary": row["detailed_summary"] or "",
+            "topics": _safe_json(row["topics_json"], []),
+            "source_count": int(row["source_count"] or 0),
+            "created_at": row["created_at"],
+            "last_ai_edited_at": row["last_ai_edited_at"],
+            "last_source_ref": row["last_source_ref"],
+            "status": row["status"] or "active",
+            "canonical_artifact_id": row["canonical_artifact_id"],
+            "archived_at": row["archived_at"],
+            "exists": path.exists(),
+            "size_bytes": path.stat().st_size if path.exists() else None,
+        }
+        if include_content:
+            payload["content"] = (
+                path.read_text(encoding="utf-8", errors="replace")[: self.max_existing_artifact_chars]
+                if path.exists() else ""
+            )
+        return payload
+
+    @staticmethod
+    def _unique_archive_path(archive_root: Path, filename: str) -> Path:
+        candidate = archive_root / filename
+        suffix = 1
+        while candidate.exists():
+            candidate = archive_root / f"{Path(filename).stem}_{suffix}{Path(filename).suffix}"
             suffix += 1
         return candidate
 

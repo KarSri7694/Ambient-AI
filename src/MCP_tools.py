@@ -533,6 +533,8 @@ async def use_browser(
         str,
         "Short explanation shown to the user before they allow browser use",
     ] = "",
+    expected_result: Annotated[str, "Information or verified state the parent agent needs back"] = "",
+    continuation_instruction: Annotated[str, "What Ambient AI should do after browser control finishes"] = "",
 ) -> str:
     """
     Request permission to deploy the dedicated browser-control model.
@@ -591,6 +593,8 @@ async def request_computer_use(
         str,
         "Short explanation shown to the user before they allow computer use",
     ],
+    expected_result: Annotated[str, "Verified desktop state the parent agent needs back"] = "",
+    continuation_instruction: Annotated[str, "What Ambient AI should do after computer control finishes"] = "",
 ) -> str:
     """
     Request permission to deploy the dedicated computer-use agent.

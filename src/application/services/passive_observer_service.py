@@ -6,6 +6,7 @@ from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
 from application.ports.LLMProvider import LLMProvider
 from application.ports.memory_port import MemoryPort
@@ -117,6 +118,8 @@ Rules:
         return {
             "window_title": payload.get("window_title"),
             "window_class": payload.get("window_class"),
+            "process_id": payload.get("process_id"),
+            "process_name": payload.get("process_name"),
             "app_name": payload.get("app_hint"),
             "url": payload.get("foreground_url"),
             "domain": payload.get("domain_hint"),
@@ -348,15 +351,29 @@ Rules:
         return payload
 
     def _infer_domain_hint(self, uiat_context: Dict[str, Any]) -> Optional[str]:
-        candidates = [
-            str(uiat_context.get("foreground_url") or ""),
-            str(uiat_context.get("window_title") or ""),
-            str(uiat_context.get("visible_text_summary") or ""),
-        ]
-        for candidate in candidates:
-            match = re.search(r"\b([a-z0-9-]+\.(?:com|in|org|net|ai|io|co|app|dev))\b", candidate.lower())
-            if match:
-                return match.group(1)
+        foreground_url = str(uiat_context.get("foreground_url") or "").strip()
+        if foreground_url:
+            candidate = foreground_url if "://" in foreground_url else f"//{foreground_url}"
+            try:
+                hostname = (urlsplit(candidate).hostname or "").lower().rstrip(".")
+            except ValueError:
+                hostname = ""
+            if hostname:
+                return hostname
+
+        # Window/title text is a fallback only. Unlike the old fixed TLD list,
+        # this accepts arbitrary DNS suffixes, localhost, IP addresses and ports.
+        fallback_text = str(uiat_context.get("window_title") or "").lower()
+        pattern = re.compile(
+            r"(?<![a-z0-9-])((?:localhost|(?:\d{1,3}\.){3}\d{1,3}|[a-z0-9-]+(?:\.[a-z0-9-]+)+)(?::\d{1,5})?)(?![a-z0-9-])"
+        )
+        for match in pattern.finditer(fallback_text):
+            try:
+                hostname = urlsplit(f"//{match.group(1)}").hostname
+            except ValueError:
+                hostname = None
+            if hostname:
+                return hostname.lower().rstrip(".")
         return None
 
     def _infer_app_hint(self, uiat_context: Dict[str, Any]) -> Optional[str]:
@@ -404,14 +421,24 @@ Rules:
             domain_switched,
             has_override,
         )
-        excluded = (
-            self._matches_policy(app_name, self.ignore_apps)
-            or self._matches_policy(domain_hint, self.ignore_domains)
-            or (
-                self.capture_control is not None
-                and self.capture_control.is_excluded(app_name=app_name, domain=domain_hint)
+        policy_applied_at_capture = bool(uiat_context.get("capture_policy_applied"))
+        if policy_applied_at_capture:
+            # Exclusions are future-only. A queued capture keeps the decision
+            # made when the pixels were captured even if the policy changes.
+            excluded = False
+        elif self.capture_control is not None:
+            excluded = self.capture_control.is_excluded(
+                app_name=app_name,
+                domain=domain_hint,
+                process_name=str(uiat_context.get("process_name") or ""),
+                window_title=str(uiat_context.get("window_title") or ""),
+                window_class=str(uiat_context.get("window_class") or ""),
+                url=str(uiat_context.get("foreground_url") or ""),
             )
-        )
+        else:
+            excluded = self._matches_policy(app_name, self.ignore_apps) or self._matches_policy(
+                domain_hint, self.ignore_domains
+            )
         if excluded:
             self.logger.debug("Routing decision=skip reason=policy_ignore")
             return "skip"

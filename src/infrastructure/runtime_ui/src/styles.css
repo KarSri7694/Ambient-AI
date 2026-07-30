@@ -128,6 +128,54 @@ button:disabled { cursor: not-allowed; opacity: .55; }
   .sub-card pre { @apply max-h-40 overflow-auto whitespace-pre-wrap rounded-lg bg-soft p-2 font-mono text-xs text-muted; }
   .sticky-card { @apply h-fit xl:sticky xl:top-24; }
 
+  .home-page { @apply space-y-5; }
+  .home-hero { @apply relative flex flex-col gap-5 overflow-hidden rounded-3xl border border-accent/20 bg-[linear-gradient(130deg,var(--accent-soft),var(--surface)_62%)] p-5 shadow-[var(--shadow)] md:flex-row md:items-center md:justify-between md:p-7; }
+  .home-hero::after { content: ""; @apply pointer-events-none absolute -right-20 -top-28 h-64 w-64 rounded-full border-[46px] border-accent/5; }
+  .home-hero-copy { @apply relative z-10 flex items-start gap-4; }
+  .home-spark { @apply flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-accent text-white shadow-lg; }
+  .home-hero h1 { @apply text-3xl font-bold tracking-[-.04em] md:text-4xl; }
+  .home-hero-copy p:last-child { @apply mt-2 text-sm leading-6 text-muted; }
+  .home-date-nav { @apply relative z-10 flex flex-wrap items-center gap-2; }
+  .home-date-nav > span { @apply min-w-28 text-center text-sm font-bold; }
+  .home-stat-grid { @apply grid gap-3 sm:grid-cols-2 xl:grid-cols-4; }
+  .home-stat { @apply grid grid-cols-[auto_1fr] items-center gap-x-3 rounded-2xl border border-line bg-surface p-4 shadow-sm; }
+  .home-stat > span { @apply row-span-2 flex h-10 w-10 items-center justify-center rounded-xl bg-accent-soft text-accent; }
+  .home-stat strong { @apply text-2xl leading-none; }
+  .home-stat small { @apply mt-1 text-[10px] font-bold uppercase tracking-wider text-muted; }
+  .home-layout { @apply grid gap-5 xl:grid-cols-[minmax(0,1.55fr)_minmax(320px,.55fr)]; }
+  .home-briefing { @apply rounded-3xl border border-line bg-surface p-5 shadow-[var(--shadow)] md:p-7; }
+  .home-section-head { @apply mb-4 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between; }
+  .home-section-head h2 { @apply text-lg font-bold tracking-tight md:text-xl; }
+  .home-overview { @apply max-w-5xl text-[15px] leading-7 text-muted; }
+  .home-overview .markdown { @apply text-[15px] leading-7; }
+  .home-brief-columns { @apply mt-5 grid gap-3 md:grid-cols-2 xl:grid-cols-4; }
+  .home-brief-columns > div { @apply rounded-2xl bg-raised p-4; }
+  .home-brief-columns h3 { @apply mb-2 text-xs font-bold uppercase tracking-wider text-strong; }
+  .home-brief-columns ul { @apply space-y-2 text-sm leading-6 text-muted; }
+  .home-brief-columns li { @apply relative pl-4 before:absolute before:left-0 before:top-[.65rem] before:h-1.5 before:w-1.5 before:rounded-full before:bg-accent; }
+  .home-brief-columns p { @apply text-sm text-muted; }
+  .home-generated { @apply mt-4 text-xs text-muted; }
+  .home-timeline { @apply divide-y divide-line; }
+  .home-timeline-item { @apply grid grid-cols-[12px_minmax(0,1fr)] gap-3 p-5 md:grid-cols-[12px_minmax(0,1fr)_auto] md:items-start; }
+  .home-timeline-dot { @apply mt-2 h-2.5 w-2.5 rounded-full bg-muted; }
+  .home-timeline-dot.good { @apply bg-good; }
+  .home-timeline-dot.warn { @apply bg-warn; }
+  .home-timeline-dot.danger { @apply bg-danger; }
+  .home-timeline-item time { @apply ml-auto text-xs text-muted; }
+  .home-timeline-item h3 { @apply mt-2 font-bold; }
+  .home-timeline-item p { @apply mt-1 text-sm leading-6 text-muted; }
+  .home-timeline-item > .button { @apply col-start-2 md:col-start-3; }
+  .home-attention { @apply rounded-2xl border border-line bg-raised p-4; }
+  .home-attention h3 { @apply mt-3 text-sm font-bold; }
+  .home-attention p { @apply mt-1 text-xs leading-5 text-muted; }
+  .home-pulse-grid { @apply grid grid-cols-2 gap-2; }
+  .home-pulse-grid > div { @apply rounded-xl bg-soft p-3; }
+  .home-pulse-grid strong { @apply block text-xl; }
+  .home-pulse-grid span { @apply mt-1 block text-[10px] font-bold uppercase tracking-wide text-muted; }
+  .home-quick-link { @apply flex w-full items-center gap-3 rounded-xl border border-line bg-raised p-3 text-left transition hover:border-accent/40 hover:bg-soft; }
+  .home-quick-link > span { @apply text-accent; }
+  .home-quick-link strong { @apply flex-1 text-sm; }
+
   .details { @apply overflow-hidden rounded-xl border border-line bg-raised; }
   .details summary { @apply cursor-pointer px-3 py-2 text-xs font-bold text-muted hover:text-strong; }
   .details pre { @apply max-h-80 overflow-auto border-t border-line bg-soft p-3 whitespace-pre-wrap break-words font-mono text-xs leading-5 text-muted; }

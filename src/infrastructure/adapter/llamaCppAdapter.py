@@ -20,8 +20,10 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
     def __init__(self, base_url: str, api_key: str = "testkey"):
         """Create an adapter for a llama.cpp-compatible OpenAI API server."""
         self.logger = logging.getLogger(self.__class__.__name__)
-        self.base_url = base_url
-        self.api_uri_v1 = f"{base_url}/v1"
+        # Keep all endpoint joins canonical. Some reverse proxies treat //v1 as
+        # a different route and return an HTML 404 instead of the OpenAI API.
+        self.base_url = str(base_url).rstrip("/")
+        self.api_uri_v1 = f"{self.base_url}/v1"
         self.client = openai.AsyncOpenAI(
             base_url=self.api_uri_v1,
             api_key=api_key

@@ -1,4 +1,5 @@
 import logging
+import gc
 import json
 import re
 import sys
@@ -15,7 +16,8 @@ sys.path.insert(0, str(SRC_ROOT))
 
 from infrastructure.runtime_log_server import RuntimeLogBuffer, RuntimeLogBufferHandler, create_runtime_log_app
 from application.services.training_data_service import TrainingDataService
-from core.models import InteractionLogEntry
+from core.models import AmbientEvent, InteractionLogEntry
+from infrastructure.adapter.SQLiteAutonomyAdapter import SQLiteAutonomyAdapter
 from infrastructure.adapter.SQLiteInteractionLogAdapter import SQLiteInteractionLogAdapter
 from infrastructure.adapter.SQLiteTrainingDataAdapter import SQLiteTrainingDataAdapter
 from infrastructure.plain_capture_store import PlainCaptureStore
@@ -32,6 +34,7 @@ class _AuditStore:
 class _RuntimeControl:
     def __init__(self):
         self.requested = False
+        self.biodata_requested = False
 
     def manual_reflection_status(self):
         return {"requested": self.requested, "running": False}
@@ -39,6 +42,31 @@ class _RuntimeControl:
     def request_reflection(self):
         self.requested = True
         return {"ok": True, "accepted": True, "status": self.manual_reflection_status()}
+
+    def manual_biodata_status(self):
+        return {"requested": self.biodata_requested, "running": False}
+
+    def request_biodata_update(self):
+        self.biodata_requested = True
+        return {"ok": True, "accepted": True, "status": self.manual_biodata_status()}
+
+    def artifact_maintenance_status(self):
+        return {"available": True, "active_count": 1, "archived_count": 1, "runtime": {"requested": False}}
+
+    def request_artifact_maintenance(self):
+        return {"ok": True, "accepted": True}
+
+    def artifact_maintenance_history(self, *, limit=50):
+        return {"runs": [{"run_id": "run-1"}], "merges": []}
+
+    def list_artifacts(self, *, status="active", limit=500):
+        return [{"artifact_id": "artifact-1", "status": status}]
+
+    def get_artifact(self, artifact_id):
+        return {"artifact_id": artifact_id, "content": "# Note"} if artifact_id == "artifact-1" else None
+
+    def home_snapshot(self, *, date_value=None, since=None):
+        return {"date": date_value, "since": since, "counts": {}, "timeline": [], "attention": []}
 
 
 class RuntimeLogServerTests(unittest.TestCase):
@@ -94,7 +122,7 @@ class RuntimeLogServerTests(unittest.TestCase):
         app = create_runtime_log_app(buffer)
         client = TestClient(app)
 
-        for route in ["/", "/chat", "/interactions", "/reports", "/logs", "/benchmarks", "/training"]:
+        for route in ["/", "/home", "/chat", "/interactions", "/processing-queue", "/reports", "/artifacts", "/logs", "/benchmarks", "/training"]:
             response = client.get(route)
             self.assertEqual(response.status_code, 200)
             self.assertIn("Ambient Agent", response.text)
@@ -117,6 +145,89 @@ class RuntimeLogServerTests(unittest.TestCase):
         self.assertEqual(started.status_code, 200)
         self.assertTrue(started.json()["status"]["requested"])
         self.assertTrue(runtime.requested)
+
+    def test_manual_biodata_runtime_api_uses_runtime_control(self):
+        runtime = _RuntimeControl()
+        client = TestClient(create_runtime_log_app(RuntimeLogBuffer(), runtime_control=runtime))
+
+        status = client.get("/api/runtime/biodata/status")
+        started = client.post("/api/runtime/biodata/run")
+
+        self.assertEqual(status.status_code, 200)
+        self.assertFalse(status.json()["status"]["requested"])
+        self.assertEqual(started.status_code, 200)
+        self.assertTrue(started.json()["status"]["requested"])
+        self.assertTrue(runtime.biodata_requested)
+
+    def test_home_runtime_api_uses_date_and_visit_watermark(self):
+        runtime = _RuntimeControl()
+        client = TestClient(create_runtime_log_app(RuntimeLogBuffer(), runtime_control=runtime))
+        response = client.get("/api/home?date=2026-07-30&since=2026-07-30T08:00:00%2B00:00")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["date"], "2026-07-30")
+        self.assertEqual(response.json()["since"], "2026-07-30T08:00:00+00:00")
+
+    def test_artifact_library_runtime_api_uses_runtime_control(self):
+        runtime = _RuntimeControl()
+        client = TestClient(create_runtime_log_app(RuntimeLogBuffer(), runtime_control=runtime))
+
+        status = client.get("/api/artifacts/maintenance/status")
+        items = client.get("/api/artifacts?status=archived")
+        detail = client.get("/api/artifacts/artifact-1")
+        history = client.get("/api/artifacts/maintenance/history")
+        started = client.post("/api/artifacts/maintenance/run")
+
+        self.assertTrue(status.json()["status"]["available"])
+        self.assertEqual(items.json()["items"][0]["status"], "archived")
+        self.assertEqual(detail.json()["artifact"]["content"], "# Note")
+        self.assertEqual(history.json()["runs"][0]["run_id"], "run-1")
+        self.assertTrue(started.json()["accepted"])
+
+    def test_processing_queue_lists_previews_and_removes_pending_media(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            store = SQLiteAutonomyAdapter(str(root / "autonomy.db"))
+            captures = PlainCaptureStore(str(root / "captures"))
+            uri = captures.store_bytes(
+                b"fake-png-data",
+                original_name="screen.png",
+                kind="screenshot",
+                mime_type="image/png",
+            )
+            store.enqueue_event(
+                AmbientEvent(
+                    event_id="image-event",
+                    event_type="lightweight_visual_capture",
+                    source_kind="screen_capture",
+                    source_ref=uri,
+                    occurred_at="2026-07-30T10:00:00+00:00",
+                    payload_json=json.dumps({"screenshot_ref": uri}),
+                    confidence=0.7,
+                    privacy_label="sensitive_visual",
+                    fingerprint="image-fingerprint",
+                    status="pending",
+                    priority=0.5,
+                    available_at="2026-07-30T10:00:00+00:00",
+                )
+            )
+            with TestClient(create_runtime_log_app(
+                RuntimeLogBuffer(), autonomy_store=store, capture_store=captures
+            )) as client:
+                listed = client.get("/api/processing-queue").json()
+                self.assertEqual(listed["count"], 1)
+                self.assertEqual(listed["image_count"], 1)
+                self.assertEqual(listed["items"][0]["original_name"], "screen.png")
+                self.assertEqual(
+                    client.get("/api/processing-queue/image-event/media").content,
+                    b"fake-png-data",
+                )
+
+                removed = client.delete("/api/processing-queue/image-event")
+                self.assertEqual(removed.status_code, 200)
+                self.assertTrue(removed.json()["file_deleted"])
+                self.assertEqual(store.get_media_event("image-event").status, "ignored")
+                self.assertEqual(client.get("/api/processing-queue").json()["count"], 0)
+            gc.collect()
 
     def test_interaction_store_filters_sorts_and_counts_deterministically(self):
         with tempfile.TemporaryDirectory() as tmpdir:

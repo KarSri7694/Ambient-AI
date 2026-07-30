@@ -288,6 +288,11 @@ class MemoryPort(ABC):
         pass
 
     @abstractmethod
+    def delete_semantic_chunk(self, chunk_id: str) -> bool:
+        """Delete a semantic chunk and its vector embedding."""
+        pass
+
+    @abstractmethod
     def get_chunks_missing_embeddings(self, limit: int = 100) -> List[SemanticMemoryChunk]:
         pass
 

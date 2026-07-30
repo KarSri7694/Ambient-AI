@@ -705,6 +705,25 @@ class SQLiteMemoryAdapter(MemoryPort):
                 )
         return self._semantic_chunk_from_row(row)
 
+    def delete_semantic_chunk(self, chunk_id: str) -> bool:
+        with self._managed_connection() as conn:
+            row = conn.execute(
+                "SELECT rowid FROM semantic_memory_chunks WHERE chunk_id = ?",
+                (str(chunk_id),),
+            ).fetchone()
+            if row is None:
+                return False
+            if self._vector_table_exists(conn):
+                conn.execute(
+                    "DELETE FROM semantic_memory_embeddings WHERE rowid = ?",
+                    (row["rowid"],),
+                )
+            conn.execute(
+                "DELETE FROM semantic_memory_chunks WHERE chunk_id = ?",
+                (str(chunk_id),),
+            )
+        return True
+
     def get_chunks_missing_embeddings(self, limit: int = 100) -> List[SemanticMemoryChunk]:
         with self._managed_connection() as conn:
             if self._vector_table_exists(conn):

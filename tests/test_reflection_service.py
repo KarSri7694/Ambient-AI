@@ -130,6 +130,7 @@ class ReflectionServiceTests(unittest.TestCase):
         result = asyncio.run(service.run_if_due(model="reflection-model", now=datetime(2026, 6, 28, 12, 0, 0)))
 
         self.assertTrue(result["ran"])
+        self.assertFalse(service.is_due(now=datetime(2026, 6, 28, 12, 1, 0)))
         user_info = self.memory.get_user_info()
         self.assertEqual(user_info.count("User likes budget TV research."), 1)
         self.assertEqual(len(task_queue.items), 1)
@@ -164,6 +165,7 @@ class ReflectionServiceTests(unittest.TestCase):
             cadence_mode="daily",
         )
 
+        self.assertFalse(service.is_due(now=datetime(2026, 6, 28, 12, 0, 0)))
         result = asyncio.run(service.run_if_due(model="reflection-model", now=datetime(2026, 6, 28, 12, 0, 0)))
 
         self.assertFalse(result["ran"])

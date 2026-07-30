@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  Activity, BarChart3, Bot, BrainCircuit, Database, FileText, Inbox,
-  MessageSquare, Moon, Pause, Play, RotateCcw, ScrollText, Sun, TestTube2,
+  Activity, Archive, BarChart3, Bot, BrainCircuit, Database, FileText, Home, Inbox,
+  ListRestart, MessageSquare, Moon, Pause, Play, RotateCcw, ScrollText, Sun, TestTube2,
+  UserRound,
 } from "lucide-react";
 import { getJson, sendJson } from "./api";
 import { Badge, Button } from "./components/ui";
@@ -14,12 +15,18 @@ import { TrainingPage } from "./pages/TrainingPage";
 import { LogsPage } from "./pages/LogsPage";
 import { InteractionsPage } from "./pages/InteractionsPage";
 import { RealWorldTestsPage } from "./pages/RealWorldTestsPage";
+import { ProcessingQueuePage } from "./pages/ProcessingQueuePage";
+import { ArtifactsPage } from "./pages/ArtifactsPage";
+import { HomePage } from "./pages/HomePage";
 
 const routes = [
+  { path: "/home", label: "Home", icon: Home },
   { path: "/chat", label: "Chat", icon: MessageSquare },
   { path: "/interactions", label: "Interactions", icon: Database },
   { path: "/inbox", label: "Proactive Inbox", icon: Inbox },
+  { path: "/processing-queue", label: "Processing Queue", icon: ListRestart },
   { path: "/reports", label: "Reports", icon: FileText },
+  { path: "/artifacts", label: "Artifacts", icon: Archive },
   { path: "/benchmarks", label: "Benchmarks", icon: BarChart3 },
   { path: "/real-world-tests", label: "Real-world Tests", icon: TestTube2 },
   { path: "/training", label: "Training", icon: BrainCircuit },
@@ -28,7 +35,7 @@ const routes = [
 
 function normalizedPath(): string {
   const path = window.location.pathname.replace(/\/$/, "") || "/";
-  return path === "/" ? "/chat" : routes.some((route) => route.path === path) ? path : "/chat";
+  return path === "/" ? "/home" : routes.some((route) => route.path === path) ? path : "/home";
 }
 
 function useRoute() {
@@ -81,9 +88,17 @@ export function App() {
     refetchInterval: 2000,
     retry: false,
   });
+  const biodata = useQuery({
+    queryKey: ["manual-biodata-status"],
+    queryFn: () => getJson<any>("/api/runtime/biodata/status"),
+    refetchInterval: 2000,
+    retry: false,
+  });
   const capturePaused = Boolean(privacy.data?.capture?.paused);
   const reflectionStatus = reflection.data?.status || {};
   const reflectionBusy = Boolean(reflectionStatus.running || reflectionStatus.requested);
+  const biodataStatus = biodata.data?.status || {};
+  const biodataBusy = Boolean(biodataStatus.running || biodataStatus.requested);
   const captureMutation = useMutation({
     mutationFn: () => sendJson(`/api/privacy/capture/${capturePaused ? "resume" : "pause"}`, "POST"),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["privacy-status"] }),
@@ -92,18 +107,25 @@ export function App() {
     mutationFn: () => sendJson("/api/runtime/reflection/run", "POST"),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["manual-reflection-status"] }),
   });
+  const biodataMutation = useMutation({
+    mutationFn: () => sendJson("/api/runtime/biodata/run", "POST"),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["manual-biodata-status"] }),
+  });
   const page = useMemo(() => {
     switch (path) {
+      case "/home": return <HomePage onNavigate={navigate} />;
       case "/interactions": return <InteractionsPage />;
       case "/inbox": return <InboxPage privacy={privacy.data} resources={resources.data} />;
+      case "/processing-queue": return <ProcessingQueuePage />;
       case "/reports": return <ReportsPage />;
+      case "/artifacts": return <ArtifactsPage />;
       case "/benchmarks": return <BenchmarksPage />;
       case "/real-world-tests": return <RealWorldTestsPage />;
       case "/training": return <TrainingPage />;
       case "/logs": return <LogsPage />;
       default: return <ChatPage />;
     }
-  }, [path, privacy.data, resources.data]);
+  }, [path, privacy.data, resources.data, navigate]);
   const loadedModel = resources.data?.residency?.loaded_model || "On demand";
 
   return (
@@ -146,6 +168,10 @@ export function App() {
           <div className="flex items-center gap-2">
             <Badge tone={capturePaused ? "warn" : "good"}>{capturePaused ? "Capture paused" : "Capture active"}</Badge>
             {reflectionBusy && <Badge tone={reflectionStatus.running ? "warn" : "neutral"}>{reflectionStatus.running ? "Reflection running" : "Reflection queued"}</Badge>}
+            {biodataBusy && <Badge tone={biodataStatus.running ? "warn" : "neutral"}>{biodataStatus.running ? "Biodata running" : "Biodata queued"}</Badge>}
+            <Button variant="secondary" onClick={() => biodataMutation.mutate()} disabled={biodataMutation.isPending || biodataBusy} title="Extract pending observations into USER_INFO.md and MEMORY.md now">
+              <UserRound size={16} />{biodataBusy ? "Biodata queued" : "Update biodata"}
+            </Button>
             <Button variant="secondary" onClick={() => reflectionMutation.mutate()} disabled={reflectionMutation.isPending || reflectionBusy} title="Run reflection now, bypassing cadence and idle checks">
               <RotateCcw size={16} />{reflectionBusy ? "Reflection queued" : "Run reflection"}
             </Button>

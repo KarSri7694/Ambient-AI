@@ -12,6 +12,13 @@ from infrastructure.adapter.llamaCppAdapter import LlamaCppAdapter
 from utils.kv_state_handling import KVStateControl
 
 
+def test_adapter_normalizes_trailing_slash_in_base_url():
+    adapter = LlamaCppAdapter("https://example.test/")
+
+    assert adapter.base_url == "https://example.test"
+    assert adapter.api_uri_v1 == "https://example.test/v1"
+
+
 def test_kv_state_filename_round_trips_model_name_with_path_chars():
     model_name = "Qwen/Qwen2.5-VL-3B Instruct:latest"
     filename = (

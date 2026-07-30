@@ -127,6 +127,14 @@ Rules:
             }
         return await self.run(model=model, now=now, history=history)
 
+    def is_due(self, *, now: Optional[datetime] = None) -> bool:
+        """Return whether the configured automatic reflection cadence is due."""
+        now = now or datetime.now()
+        history = self._load_history()
+        if self._task_generation_limit_reached(history):
+            return False
+        return self._is_due(history, now)
+
     async def run(self, *, model: str, now: Optional[datetime] = None, history: Optional[dict] = None) -> dict:
         now = now or datetime.now()
         history = history or self._load_history()

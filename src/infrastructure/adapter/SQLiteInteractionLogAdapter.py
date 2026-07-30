@@ -228,6 +228,20 @@ class SQLiteInteractionLogAdapter:
             ).fetchall()
         return [self._from_row(row) for row in rows]
 
+    def list_reports_between(
+        self, start_iso: str, end_iso: str, *, limit: int = 200
+    ) -> List[InteractionLogEntry]:
+        with self._managed_connection() as conn:
+            rows = conn.execute(
+                """SELECT * FROM interaction_logs
+                   WHERE report_json IS NOT NULL AND TRIM(report_json) <> ''
+                     AND julianday(created_at) >= julianday(?)
+                     AND julianday(created_at) < julianday(?)
+                   ORDER BY julianday(created_at) DESC LIMIT ?""",
+                (start_iso, end_iso, max(1, min(int(limit), 1000))),
+            ).fetchall()
+        return [self._from_row(row) for row in rows]
+
     def _from_row(self, row: sqlite3.Row) -> InteractionLogEntry:
         return InteractionLogEntry(
             interaction_id=row["interaction_id"],

@@ -135,6 +135,18 @@ def mark_task_complete(task_id, status="completed"):
     conn.close()
 
 
+def mark_task_waiting_for_approval(task_id):
+    _ensure_db()
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        "UPDATE night_queue SET status='awaiting_approval', completed_at=NULL WHERE id=?",
+        (task_id,),
+    )
+    conn.commit()
+    conn.close()
+
+
 def cancel_task(task_id):
     _ensure_db()
     conn = sqlite3.connect(DB_FILE)

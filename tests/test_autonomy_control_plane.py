@@ -16,7 +16,8 @@ from application.services.autonomy_coordinator_service import AutonomyCoordinato
 from application.services.capability_policy_service import CapabilityPolicyService
 from application.services.capture_control_service import CaptureControlService
 from application.services.opportunity_judgment_service import OpportunityJudgmentService
-from core.models import AmbientEvent
+from application.services.llm_interaction_service import InteractionSuspended
+from core.models import AmbientEvent, ApprovalGrant, DelegatedTask
 from infrastructure.adapter.SQLiteAutonomyAdapter import SQLiteAutonomyAdapter
 from infrastructure.plain_capture_store import PlainCaptureStore
 from infrastructure.runtime_log_server import RuntimeLogBuffer, create_runtime_log_app
@@ -68,6 +69,56 @@ class _UserContext:
         return "User profile: user is building Ambient AI for ROCm hackathon."
 
 
+class _SuspendingInvestigationService:
+    def reset_context(self):
+        return None
+
+    def available_tool_definitions(self):
+        return [{"type": "function", "function": {"name": "use_browser", "parameters": {}}}]
+
+    async def run_interaction(self, **kwargs):
+        now = datetime.now(timezone.utc).isoformat()
+        approval = ApprovalGrant(
+            approval_id="a" * 32, capability="browser.use", action_fingerprint="fingerprint",
+            constraints_json="{}", status="pending", created_at=now,
+            expires_at=(datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat(),
+            approver="pending",
+        )
+        task = DelegatedTask(
+            delegation_id="d" * 32, approval_id=approval.approval_id,
+            capability="browser.use", task="Research the official hackathon deadline",
+            reason="Current information is needed", expected_result="Verified deadline",
+            continuation_instruction="Complete the original report", origin_kind="autonomy",
+            origin_json="{}", parent_model="test-model", status="awaiting_approval",
+            created_at=now, updated_at=now,
+        )
+        raise InteractionSuspended(approval=approval, delegated_task=task, tool_call_id="call-1")
+
+
+class _NeverJudgeQueuedTask:
+    async def judge(self, **_kwargs):
+        raise AssertionError("queued background tasks must not be judged a second time")
+
+    @staticmethod
+    def qualifies_for_enrichment(candidate):
+        return candidate.expected_value >= 0.6
+
+
+class _CompletingInvestigationService:
+    def __init__(self):
+        self.calls = []
+
+    def reset_context(self):
+        return None
+
+    def available_tool_definitions(self):
+        return []
+
+    async def run_interaction(self, **kwargs):
+        self.calls.append(kwargs)
+        return "Completed the queued ROCm benchmark comparison."
+
+
 def _event(event_id: str = "event-1", fingerprint: str = "fingerprint-1") -> AmbientEvent:
     now = datetime.now(timezone.utc).isoformat()
     return AmbientEvent(
@@ -110,6 +161,41 @@ def test_event_store_deduplicates_leases_and_recovers_expired_work(tmp_path):
     assert reclaimed is not None and reclaimed.event_id == claimed.event_id
     store.complete_event(reclaimed.event_id)
     assert store.claim_next_event() is None
+
+
+def test_event_store_claims_offset_timestamp_as_same_instant(tmp_path):
+    store = SQLiteAutonomyAdapter(str(tmp_path / "autonomy.db"))
+    india = timezone(timedelta(hours=5, minutes=30))
+    local_timestamp = (datetime.now(india) - timedelta(minutes=1)).isoformat()
+    event = AmbientEvent(
+        event_id="offset-approval-event",
+        event_type="approval_granted",
+        source_kind="local_approval",
+        source_ref="approval-1",
+        occurred_at=local_timestamp,
+        payload_json="{}",
+        confidence=1.0,
+        privacy_label="private",
+        fingerprint="offset-approval-fingerprint",
+        priority=1.0,
+        available_at=local_timestamp,
+    )
+
+    stored = store.enqueue_event(event)
+    assert stored.available_at.endswith("+00:00")
+
+    # Reproduce a row written by the older local-time API. SQLite must compare
+    # the instant represented by the offset, not the timestamp text itself.
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE ambient_events SET occurred_at=?, available_at=? WHERE event_id=?",
+            (local_timestamp, local_timestamp, event.event_id),
+        )
+
+    assert store.has_ready_events() is True
+    claimed = store.claim_next_event()
+    assert claimed is not None
+    assert claimed.event_id == event.event_id
 
 
 def test_shadow_coordinator_judges_active_context_without_idle_trigger(tmp_path):
@@ -164,6 +250,66 @@ def test_coordinator_builds_event_specific_personalization_context(tmp_path):
     assert "ROCm hackathon" in judgment.personalization_contexts[-1]
     assert "Applications close Friday" in user_context.queries[-1]["query_text"]
     assert user_context.queries[-1]["include_semantic"] is True
+
+
+def test_active_investigation_becomes_awaiting_approval_without_retry(tmp_path):
+    store = SQLiteAutonomyAdapter(str(tmp_path / "autonomy.db"))
+    coordinator = AutonomyCoordinatorService(
+        store=store,
+        judgment=OpportunityJudgmentService(llm_provider=_JudgmentProvider()),
+        policy=CapabilityPolicyService(store=store),
+        mode="active",
+    )
+    store.enqueue_event(_event())
+
+    result = asyncio.run(coordinator.process_next(
+        model="test-model",
+        llm_service=_SuspendingInvestigationService(),
+        personalization_context="User likes local AI.",
+    ))
+
+    assert result["outcome"] == "awaiting_approval"
+    assert store.event_counts()["processed"] == 1
+    assert store.event_counts().get("pending", 0) == 0
+    inbox = store.list_inbox_items()
+    assert len(inbox) == 1
+    assert inbox[0].status == "awaiting_approval"
+
+
+def test_untimed_queued_task_executes_through_active_coordinator(tmp_path):
+    store = SQLiteAutonomyAdapter(str(tmp_path / "autonomy.db"))
+    service = _CompletingInvestigationService()
+    coordinator = AutonomyCoordinatorService(
+        store=store,
+        judgment=_NeverJudgeQueuedTask(),
+        policy=CapabilityPolicyService(store=store),
+        mode="active",
+    )
+    event = coordinator.enqueue_background_task(
+        task_id=17,
+        description="Compare the completed ROCm benchmark configurations.",
+        priority="medium",
+        metadata_json=json.dumps(
+            {"source": "reflection_service", "reason": "Benchmarking has finished."}
+        ),
+    )
+
+    result = asyncio.run(
+        coordinator.process_next(
+            model="test-model",
+            llm_service=service,
+            personalization_context="User is optimizing llama.cpp on Radeon.",
+        )
+    )
+
+    assert event.event_type == "queued_background_task"
+    assert result["outcome"] == "completed"
+    assert len(service.calls) == 1
+    assert "Compare the completed ROCm benchmark" in service.calls[0]["user_input"]
+    inbox = store.list_inbox_items()
+    assert len(inbox) == 1
+    assert inbox[0].status == "completed"
+    assert "Completed the queued ROCm" in inbox[0].detailed_report
 
 
 def test_policy_blocks_inferred_shell_and_requires_approval_for_browser_mutation(tmp_path):
@@ -253,6 +399,31 @@ def test_loopback_control_api_works_without_login():
     assert exclusions.status_code == 200
     assert capture.is_excluded(app_name="1password.exe") is True
     assert capture.is_excluded(domain="login.bank.example") is True
+
+
+def test_expired_approval_cannot_enqueue_execution(tmp_path):
+    store = SQLiteAutonomyAdapter(str(tmp_path / "autonomy.db"))
+    now = datetime.now(timezone.utc)
+    store.create_approval(
+        ApprovalGrant(
+            approval_id="expired-approval", capability="browser.use",
+            action_fingerprint="expired-fingerprint", constraints_json="{}",
+            status="pending", created_at=(now - timedelta(hours=2)).isoformat(),
+            expires_at=(now - timedelta(hours=1)).isoformat(), approver="pending",
+        )
+    )
+    client = TestClient(
+        create_runtime_log_app(RuntimeLogBuffer(), autonomy_store=store)
+    )
+
+    response = client.post(
+        "/api/autonomy/approvals/expired-approval/decision", json={"approved": True}
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "approval_expired"
+    assert store.get_approval("expired-approval").status == "expired"
+    assert store.event_counts().get("pending", 0) == 0
 
 
 def test_plain_capture_store_keeps_normal_readable_files(tmp_path):

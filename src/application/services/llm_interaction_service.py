@@ -27,7 +27,7 @@ from application.services.capability_policy_service import (
     PolicyDeniedError,
 )
 from application.services.artifact_organizer_service import ArtifactOrganizer
-from core.models import ApprovalGrant
+from core.models import ApprovalGrant, DelegatedTask
 from local_control.computer import ComputerControlSession
 from local_control.filesystem import FilesystemControlSession
 from local_control.safety import ComputerControlTerminated
@@ -43,6 +43,32 @@ class AgentFrame:
     tool_bridge: Optional[Any] = None
     browser_exit_requested: Optional[bool] = None
     computer_exit_requested: Optional[bool] = None
+    delegated_approval_id: Optional[str] = None
+    preauthorized_tool_names: set[str] = field(default_factory=set)
+
+
+class InteractionSuspended(Exception):
+    """Signals that an interaction is durably waiting for local approval."""
+
+    def __init__(
+        self,
+        *,
+        approval: ApprovalGrant,
+        delegated_task: DelegatedTask,
+        tool_call_id: str = "",
+    ):
+        super().__init__(f"Interaction is awaiting approval {approval.approval_id}.")
+        self.approval = approval
+        self.delegated_task = delegated_task
+        self.tool_call_id = tool_call_id
+
+    @property
+    def approval_id(self) -> str:
+        return self.approval.approval_id
+
+    @property
+    def delegation_id(self) -> str:
+        return self.delegated_task.delegation_id
 
 
 class LLMInteractionService:
@@ -92,6 +118,10 @@ class LLMInteractionService:
                         "type": "string",
                         "description": "Concrete result and material actions performed for the main model.",
                     },
+                    "details": {"type": "string"},
+                    "actions_performed": {"type": "array", "items": {"type": "string"}},
+                    "sources": {"type": "array", "items": {"type": "string"}},
+                    "blockers": {"type": "array", "items": {"type": "string"}},
                 },
                 "required": ["exit_browser", "status", "summary"],
                 "additionalProperties": False,
@@ -108,6 +138,10 @@ class LLMInteractionService:
                 "properties": {
                     "status": {"type": "string"},
                     "summary": {"type": "string"},
+                    "details": {"type": "string"},
+                    "actions_performed": {"type": "array", "items": {"type": "string"}},
+                    "sources": {"type": "array", "items": {"type": "string"}},
+                    "blockers": {"type": "array", "items": {"type": "string"}},
                 },
                 "required": ["status", "summary"],
                 "additionalProperties": False,
@@ -124,6 +158,10 @@ class LLMInteractionService:
                 "properties": {
                     "status": {"type": "string"},
                     "summary": {"type": "string"},
+                    "details": {"type": "string"},
+                    "actions_performed": {"type": "array", "items": {"type": "string"}},
+                    "sources": {"type": "array", "items": {"type": "string"}},
+                    "blockers": {"type": "array", "items": {"type": "string"}},
                 },
                 "required": ["status", "summary"],
                 "additionalProperties": False,
@@ -243,6 +281,7 @@ class LLMInteractionService:
         computer_task_timeout_seconds: float = 180.0,
         computer_max_actions_per_task: int = 40,
         computer_enabled: bool = False,
+        local_control_approval_ttl_minutes: int = 30,
         scheduled_task_service: Optional[ScheduledTaskService] = None,
         reporter_model: Optional[str] = None,
         artifact_root: Optional[str] = None,
@@ -268,6 +307,7 @@ class LLMInteractionService:
         self.computer_task_timeout_seconds = computer_task_timeout_seconds
         self.computer_max_actions_per_task = computer_max_actions_per_task
         self.computer_enabled = computer_enabled
+        self.local_control_approval_ttl_minutes = max(1, int(local_control_approval_ttl_minutes))
         self.scheduled_task_service = scheduled_task_service
         self.logger = logging.getLogger(self.__class__.__name__)
         self._tools: Optional[List[Dict[str, Any]]] = None
@@ -278,6 +318,7 @@ class LLMInteractionService:
         self._retained_browser_sessions: List[BrowserToolSessionPort] = []
         self.reporter_model = reporter_model
         self.capability_policy = capability_policy
+        self.semantic_memory = semantic_memory
         self.artifact_root = Path(artifact_root) if artifact_root else (self.PARENT_DIR / "artifacts")
         self.artifact_root.mkdir(parents=True, exist_ok=True)
         self.artifact_organizer = (
@@ -304,6 +345,8 @@ class LLMInteractionService:
         *,
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_bridge: Optional[Any] = None,
+        delegated_approval_id: Optional[str] = None,
+        preauthorized_tool_names: Optional[set[str]] = None,
     ) -> None:
         self._frame_stack.append(
             AgentFrame(
@@ -311,6 +354,8 @@ class LLMInteractionService:
                 depth=depth,
                 tools=tools,
                 tool_bridge=tool_bridge or self.tool_bridge,
+                delegated_approval_id=str(delegated_approval_id or "").strip() or None,
+                preauthorized_tool_names=set(preauthorized_tool_names or set()),
             )
         )
 
@@ -469,6 +514,8 @@ class LLMInteractionService:
         *,
         task: str,
         agent_depth: int,
+        approval_id: str = "",
+        event_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> str:
         if agent_depth != 0:
             raise RuntimeError("use_browser can only be called by the root agent.")
@@ -508,6 +555,12 @@ class LLMInteractionService:
                     *browser_tools,
                     copy.deepcopy(self.FINISH_BROWSER_TASK_TOOL),
                 ]
+                delegated_tool_names = {
+                    tool.get("function", {}).get("name")
+                    for tool in browser_tools
+                    if tool.get("function", {}).get("name")
+                    and tool.get("function", {}).get("name") not in self.TERMINAL_TOOL_NAMES
+                }
 
                 await self.llm.load_model(self.browser_agent_model)
                 self._push_frame(
@@ -515,6 +568,8 @@ class LLMInteractionService:
                     depth=agent_depth + 1,
                     tools=browser_tools,
                     tool_bridge=browser_session,
+                    delegated_approval_id=approval_id,
+                    preauthorized_tool_names=(delegated_tool_names if approval_id else set()),
                 )
                 child_frame_pushed = True
                 allowed_tool_names = {
@@ -529,7 +584,8 @@ class LLMInteractionService:
                         model=self.browser_agent_model,
                         agent_depth=agent_depth + 1,
                         allowed_tool_names=allowed_tool_names,
-                        report_policy="silent",
+                    report_policy="silent",
+                    event_callback=event_callback,
                     ),
                     timeout=self.browser_task_timeout_seconds,
                 )
@@ -582,7 +638,114 @@ class LLMInteractionService:
 
             return browser_result
 
-    def _request_browser_use(self, *, task: str, reason: str, agent_depth: int) -> str:
+    def _delegation_origin(self) -> tuple[str, dict[str, Any], Optional[str]]:
+        metadata = current_interaction_metadata()
+        source = current_interaction_source()
+        if source == "direct_chat" and metadata.get("chat_session_id"):
+            origin_kind = "direct_chat"
+        elif metadata.get("opportunity_id"):
+            origin_kind = "autonomy"
+        elif source == "scheduled_chat_task" or metadata.get("scheduled_task_id"):
+            origin_kind = "scheduled_task"
+        else:
+            origin_kind = "unknown"
+        latest_goal = str(metadata.get("origin_goal") or "").strip()[:8000]
+        if not latest_goal:
+            for message in reversed(self._frame.messages):
+                if message.get("role") == "user" and message.get("content"):
+                    latest_goal = str(message["content"]).strip()[:8000]
+                    break
+        origin = {
+            "source": source,
+            "goal": latest_goal,
+            "chat_session_id": metadata.get("chat_session_id"),
+            "chat_message_id": metadata.get("chat_message_id"),
+            "opportunity_id": metadata.get("opportunity_id"),
+            "event_id": metadata.get("event_id"),
+            "scheduled_task_id": metadata.get("scheduled_task_id"),
+            "interaction_run_id": metadata.get("interaction_run_id"),
+            "activity_run_id": metadata.get("activity_run_id"),
+        }
+        parent_delegation_id = str(metadata.get("delegation_id") or "").strip() or None
+        return origin_kind, origin, parent_delegation_id
+
+    def _create_local_control_approval(
+        self,
+        *,
+        capability: str,
+        tool_name: str,
+        approval_kind: str,
+        task: str,
+        reason: str,
+        expected_result: str,
+        continuation_instruction: str,
+    ) -> tuple[ApprovalGrant, DelegatedTask]:
+        arguments = {
+            "task": task.strip(),
+            "reason": reason.strip(),
+            "expected_result": expected_result.strip(),
+            "continuation_instruction": continuation_instruction.strip()
+            or "Use the delegated result to complete and report the original goal.",
+        }
+        fingerprint = self.capability_policy.action_fingerprint(tool_name, arguments)
+        now = datetime.now(timezone.utc)
+        delegation_id = uuid.uuid4().hex
+        origin_kind, origin, parent_delegation_id = self._delegation_origin()
+        if (
+            parent_delegation_id
+            and hasattr(self.capability_policy.store, "delegated_chain_depth")
+            and self.capability_policy.store.delegated_chain_depth(parent_delegation_id) >= 5
+        ):
+            raise RuntimeError(
+                "Delegated workflow reached the five-approval continuation limit; return control to the user."
+            )
+        approval = ApprovalGrant(
+            approval_id=uuid.uuid4().hex,
+            capability=capability,
+            action_fingerprint=fingerprint,
+            constraints_json=json.dumps(
+                {
+                    "tool_name": tool_name,
+                    "arguments": arguments,
+                    "approval_kind": approval_kind,
+                    "delegation_id": delegation_id,
+                    "origin_kind": origin_kind,
+                    "origin": origin,
+                },
+                ensure_ascii=False,
+            ),
+            status="pending",
+            created_at=now.isoformat(),
+            expires_at=(now + timedelta(minutes=self.local_control_approval_ttl_minutes)).isoformat(),
+            approver="pending",
+        )
+        delegated_task = DelegatedTask(
+            delegation_id=delegation_id,
+            approval_id=approval.approval_id,
+            capability=capability,
+            task=arguments["task"],
+            reason=arguments["reason"],
+            expected_result=arguments["expected_result"],
+            continuation_instruction=arguments["continuation_instruction"],
+            origin_kind=origin_kind,
+            origin_json=json.dumps(origin, ensure_ascii=False),
+            parent_model=str(self.llm.get_current_model() or self._frame.model or ""),
+            parent_delegation_id=parent_delegation_id,
+            status="awaiting_approval",
+            created_at=now.isoformat(),
+            updated_at=now.isoformat(),
+        )
+        return approval, delegated_task
+
+    def _request_browser_use(
+        self,
+        *,
+        task: str,
+        reason: str,
+        expected_result: str = "",
+        continuation_instruction: str = "",
+        agent_depth: int,
+    ) -> str:
         if agent_depth != 0:
             raise RuntimeError("use_browser can only be called by the root agent.")
         if not task.strip():
@@ -594,41 +757,18 @@ class LLMInteractionService:
         if self.capability_policy is None or not hasattr(self.capability_policy.store, "create_approval"):
             raise RuntimeError("Browser-use approvals require the autonomy approval store.")
 
-        arguments = {"task": task.strip(), "reason": reason.strip()}
-        fingerprint = self.capability_policy.action_fingerprint("use_browser", arguments)
-        now = datetime.now(timezone.utc)
-        approval = ApprovalGrant(
-            approval_id=uuid.uuid4().hex,
+        approval, delegated_task = self._create_local_control_approval(
             capability="browser.use",
-            action_fingerprint=fingerprint,
-            constraints_json=json.dumps(
-                {
-                    "tool_name": "use_browser",
-                    "arguments": arguments,
-                    "approval_kind": "browser_use_deployment",
-                },
-                ensure_ascii=False,
-            ),
-            status="pending",
-            created_at=now.isoformat(),
-            expires_at=(now + timedelta(minutes=10)).isoformat(),
-            approver="pending",
+            tool_name="use_browser",
+            approval_kind="browser_use_deployment",
+            task=task,
+            reason=reason,
+            expected_result=expected_result,
+            continuation_instruction=continuation_instruction,
         )
-        self.capability_policy.store.create_approval(approval)
-        if hasattr(self.capability_policy.store, "audit"):
-            self.capability_policy.store.audit(
-                "ambient_agent",
-                "browser_use.requested",
-                approval.approval_id,
-                arguments,
-            )
-        return json.dumps(
-            {
-                "status": "awaiting_user_approval",
-                "approval_id": approval.approval_id,
-                "message": "Browser-use agent will deploy only after the local user allows it in the Ambient AI web UI.",
-            },
-            ensure_ascii=False,
+        raise InteractionSuspended(
+            approval=approval,
+            delegated_task=delegated_task,
         )
 
     async def deploy_browser_agent(
@@ -638,7 +778,35 @@ class LLMInteractionService:
         approval_id: str = "",
         event_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> str:
-        result = await self._run_browser_agent(task=task, agent_depth=0)
+        scoped_approval_id = ""
+        if approval_id:
+            if self.capability_policy is None:
+                scoped_approval_id = approval_id
+            else:
+                store = self.capability_policy.store
+                approval = (
+                    store.get_approval(approval_id)
+                    if hasattr(store, "get_approval")
+                    else None
+                )
+                if (
+                    approval is not None
+                    and approval.capability == "browser.use"
+                    and approval.status in {"approved", "used"}
+                ):
+                    scoped_approval_id = approval_id
+                else:
+                    self.logger.warning(
+                        "Browser delegation %s has no approved browser.use grant; "
+                        "individual tool policy remains active.",
+                        approval_id,
+                    )
+        result = await self._run_browser_agent(
+            task=task,
+            agent_depth=0,
+            approval_id=scoped_approval_id,
+            event_callback=event_callback,
+        )
         if self.capability_policy is not None and hasattr(self.capability_policy.store, "audit"):
             self.capability_policy.store.audit(
                 "ambient_agent",
@@ -735,7 +903,15 @@ class LLMInteractionService:
                     raise primary_error
             return fs_result
 
-    def _request_computer_use(self, *, task: str, reason: str, agent_depth: int) -> str:
+    def _request_computer_use(
+        self,
+        *,
+        task: str,
+        reason: str,
+        expected_result: str = "",
+        continuation_instruction: str = "",
+        agent_depth: int,
+    ) -> str:
         if agent_depth != 0:
             raise RuntimeError("request_computer_use can only be called by the root agent.")
         if not self.computer_enabled:
@@ -749,41 +925,18 @@ class LLMInteractionService:
         if self.capability_policy is None or not hasattr(self.capability_policy.store, "create_approval"):
             raise RuntimeError("Computer-use approvals require the autonomy approval store.")
 
-        arguments = {"task": task.strip(), "reason": reason.strip()}
-        fingerprint = self.capability_policy.action_fingerprint("request_computer_use", arguments)
-        now = datetime.now(timezone.utc)
-        approval = ApprovalGrant(
-            approval_id=uuid.uuid4().hex,
+        approval, delegated_task = self._create_local_control_approval(
             capability="computer.use",
-            action_fingerprint=fingerprint,
-            constraints_json=json.dumps(
-                {
-                    "tool_name": "request_computer_use",
-                    "arguments": arguments,
-                    "approval_kind": "computer_use_deployment",
-                },
-                ensure_ascii=False,
-            ),
-            status="pending",
-            created_at=now.isoformat(),
-            expires_at=(now + timedelta(minutes=10)).isoformat(),
-            approver="pending",
+            tool_name="request_computer_use",
+            approval_kind="computer_use_deployment",
+            task=task,
+            reason=reason,
+            expected_result=expected_result,
+            continuation_instruction=continuation_instruction,
         )
-        self.capability_policy.store.create_approval(approval)
-        if hasattr(self.capability_policy.store, "audit"):
-            self.capability_policy.store.audit(
-                "ambient_agent",
-                "computer_use.requested",
-                approval.approval_id,
-                arguments,
-            )
-        return json.dumps(
-            {
-                "status": "awaiting_user_approval",
-                "approval_id": approval.approval_id,
-                "message": "Computer-use agent will deploy only after the local user allows it in the Ambient AI web UI.",
-            },
-            ensure_ascii=False,
+        raise InteractionSuspended(
+            approval=approval,
+            delegated_task=delegated_task,
         )
 
     async def deploy_computer_agent(
@@ -943,93 +1096,246 @@ class LLMInteractionService:
                     {"role": "system", "content": self._build_system_prompt(system_prompt)}
                 )
             self._frame.messages.append({"role": "user", "content": user_input})
-
-            iteration = 0
-            assistant_text = ""
-
-            while iteration < self.MAX_ITERATIONS:
-                iteration += 1
-                self.logger.info(
-                    "--- Iteration %s (agent depth %s/%s) ---",
-                    iteration,
-                    agent_depth,
-                    self.MAX_AGENT_DEPTH,
-                )
-
-                completion = await self.llm.chat_completion_stream(
-                    model=model,
-                    messages=self._frame.messages,
-                    tools=self._tools_for_agent_depth(
-                        agent_depth, allowed_tool_names=allowed_tool_names
-                    ),
-                    image=image_path if iteration == 1 else "",
-                )
-
-                assistant_text, tool_calls = await self._consume_stream(
-                    completion,
-                    event_callback=event_callback,
-                )
-
-                if not tool_calls:
-                    self._frame.messages.append({"role": "assistant", "content": assistant_text})
-                    self.logger.info("Model finished (no more tool calls)")
-                    await self._attach_user_report(
-                        report_policy=report_policy,
-                        interaction_run_id=interaction_run_id,
-                        model=model,
-                        user_input=user_input,
-                        final_response=assistant_text,
-                        tools_used=tools_used,
-                        source_name=source_name,
-                    )
-                    return assistant_text
-
-                self._frame.messages.append(
-                    {
-                        "role": "assistant",
-                        "content": assistant_text if assistant_text else None,
-                        "tool_calls": tool_calls,
-                    }
-                )
-
-                tool_results = await self._execute_tool_calls(
-                    tool_calls,
-                    agent_depth=agent_depth,
-                    allowed_tool_names=allowed_tool_names,
-                    event_callback=event_callback,
-                )
-                tools_used.extend(name for name, _ in tool_results)
-                if any(
-                    name in self.TERMINAL_TOOL_NAMES and not result.startswith("Error:")
-                    for name, result in tool_results
-                ):
-                    self.logger.info("Terminal tool executed; ending interaction loop.")
-                    terminal_result = "\n".join(result for _, result in tool_results)
-                    await self._attach_user_report(
-                        report_policy=report_policy,
-                        interaction_run_id=interaction_run_id,
-                        model=model,
-                        user_input=user_input,
-                        final_response=terminal_result,
-                        tools_used=tools_used,
-                        source_name=source_name,
-                    )
-                    return terminal_result
-
-            self.logger.warning(
-                "Reached maximum iterations: (%s). Stopping.",
-                self.MAX_ITERATIONS,
-            )
-            await self._attach_user_report(
-                report_policy=report_policy,
-                interaction_run_id=interaction_run_id,
+            return await self._run_interaction_loop(
                 model=model,
                 user_input=user_input,
-                final_response=assistant_text,
-                tools_used=tools_used,
+                image_path=image_path,
+                agent_depth=agent_depth,
+                allowed_tool_names=allowed_tool_names,
+                report_policy=report_policy,
+                event_callback=event_callback,
                 source_name=source_name,
+                trace_metadata=trace_metadata,
+                interaction_run_id=interaction_run_id,
+                tools_used=tools_used,
+                iteration=0,
             )
-            return assistant_text
+
+    async def resume_interaction(
+        self,
+        *,
+        checkpoint: dict[str, Any],
+        tool_result: dict[str, Any] | str,
+        delegation_id: str,
+        event_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> str:
+        """Resume the original model loop by satisfying its suspended tool call."""
+        messages = checkpoint.get("messages")
+        tool_call_id = str(checkpoint.get("suspended_tool_call_id") or "")
+        model = str(checkpoint.get("model") or "")
+        if not isinstance(messages, list) or not messages or not tool_call_id or not model:
+            raise ValueError("Delegated task checkpoint is incomplete and cannot be resumed.")
+        assistant_index = -1
+        suspended_call_index = -1
+        for message_index, message in enumerate(messages):
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            for call_index, call in enumerate(message.get("tool_calls") or []):
+                if isinstance(call, dict) and str(call.get("id") or "") == tool_call_id:
+                    assistant_index = message_index
+                    suspended_call_index = call_index
+                    break
+        if assistant_index < 0:
+            raise ValueError("Suspended tool call is not present in the delegated checkpoint.")
+
+        self._frame.model = model
+        self._frame.depth = int(checkpoint.get("agent_depth") or 0)
+        self._frame.messages = copy.deepcopy(messages)
+        serialized_result = (
+            tool_result
+            if isinstance(tool_result, str)
+            else json.dumps(tool_result, ensure_ascii=False)
+        )
+        suspended_tool_message = {
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "name": str(checkpoint.get("suspended_tool_name") or "delegated_control"),
+            "content": serialized_result,
+        }
+        prior_call_ids = {
+            str(call.get("id") or "")
+            for call in self._frame.messages[assistant_index].get("tool_calls", [])[:suspended_call_index]
+        }
+        insert_at = assistant_index + 1
+        while (
+            insert_at < len(self._frame.messages)
+            and self._frame.messages[insert_at].get("role") == "tool"
+            and str(self._frame.messages[insert_at].get("tool_call_id") or "") in prior_call_ids
+        ):
+            insert_at += 1
+        self._frame.messages.insert(insert_at, suspended_tool_message)
+        source_name = str(checkpoint.get("source_name") or "delegated_task_continuation")
+        trace_metadata = checkpoint.get("trace_metadata")
+        trace_metadata = dict(trace_metadata) if isinstance(trace_metadata, dict) else {}
+        trace_metadata["delegation_id"] = delegation_id
+        interaction_run_id = str(
+            checkpoint.get("interaction_run_id")
+            or trace_metadata.get("interaction_run_id")
+            or uuid.uuid4().hex
+        )
+        trace_metadata["interaction_run_id"] = interaction_run_id
+        allowed = checkpoint.get("allowed_tool_names")
+        allowed_tool_names = set(allowed) if isinstance(allowed, list) else None
+        tools_used = [str(item) for item in checkpoint.get("tools_used", [])]
+        tools_used.append(str(checkpoint.get("suspended_tool_name") or "delegated_control"))
+        with interaction_trace(source_name, trace_metadata):
+            return await self._run_interaction_loop(
+                model=model,
+                user_input=str(checkpoint.get("user_input") or ""),
+                image_path="",
+                agent_depth=int(checkpoint.get("agent_depth") or 0),
+                allowed_tool_names=allowed_tool_names,
+                report_policy=str(checkpoint.get("report_policy") or "silent"),
+                event_callback=event_callback,
+                source_name=source_name,
+                trace_metadata=trace_metadata,
+                interaction_run_id=interaction_run_id,
+                tools_used=tools_used,
+                iteration=int(checkpoint.get("iteration") or 0),
+            )
+
+    async def _run_interaction_loop(
+        self,
+        *,
+        model: str,
+        user_input: str,
+        image_path: str,
+        agent_depth: int,
+        allowed_tool_names: Optional[set[str]],
+        report_policy: str,
+        event_callback: Optional[Callable[[Dict[str, Any]], None]],
+        source_name: str,
+        trace_metadata: dict[str, Any],
+        interaction_run_id: str,
+        tools_used: List[str],
+        iteration: int,
+    ) -> str:
+        assistant_text = ""
+        while iteration < self.MAX_ITERATIONS:
+            iteration += 1
+            self.logger.info(
+                "--- Iteration %s (agent depth %s/%s) ---",
+                iteration, agent_depth, self.MAX_AGENT_DEPTH,
+            )
+            completion = await self.llm.chat_completion_stream(
+                model=model,
+                messages=self._frame.messages,
+                tools=self._tools_for_agent_depth(agent_depth, allowed_tool_names=allowed_tool_names),
+                image=image_path if iteration == 1 else "",
+            )
+            assistant_text, tool_calls = await self._consume_stream(
+                completion, event_callback=event_callback,
+            )
+            if not tool_calls:
+                self._frame.messages.append({"role": "assistant", "content": assistant_text})
+                self.logger.info("Model finished (no more tool calls)")
+                await self._attach_user_report(
+                    report_policy=report_policy, interaction_run_id=interaction_run_id,
+                    model=model, user_input=user_input, final_response=assistant_text,
+                    tools_used=tools_used, source_name=source_name,
+                )
+                return assistant_text
+
+            self._frame.messages.append(
+                {"role": "assistant", "content": assistant_text or None, "tool_calls": tool_calls}
+            )
+            try:
+                tool_results = await self._execute_tool_calls(
+                    tool_calls, agent_depth=agent_depth,
+                    allowed_tool_names=allowed_tool_names, event_callback=event_callback,
+                )
+            except InteractionSuspended as suspended:
+                self._append_deferred_sibling_tool_results(tool_calls, suspended.tool_call_id)
+                checkpoint = {
+                    "version": 1,
+                    "messages": copy.deepcopy(self._frame.messages),
+                    "model": model,
+                    "source_name": source_name,
+                    "trace_metadata": dict(trace_metadata),
+                    "interaction_run_id": interaction_run_id,
+                    "user_input": user_input,
+                    "agent_depth": agent_depth,
+                    "allowed_tool_names": sorted(allowed_tool_names) if allowed_tool_names is not None else None,
+                    "report_policy": report_policy,
+                    "iteration": iteration,
+                    "tools_used": list(tools_used),
+                    "suspended_tool_call_id": suspended.tool_call_id,
+                    "suspended_tool_name": next(
+                        (str(call.get("function", {}).get("name") or "") for call in tool_calls
+                         if str(call.get("id") or "") == suspended.tool_call_id),
+                        "delegated_control",
+                    ),
+                }
+                self._persist_suspended_interaction(suspended, checkpoint)
+                raise
+            tools_used.extend(name for name, _ in tool_results)
+            if any(
+                name in self.TERMINAL_TOOL_NAMES and not result.startswith("Error:")
+                for name, result in tool_results
+            ):
+                terminal_result = "\n".join(result for _, result in tool_results)
+                await self._attach_user_report(
+                    report_policy=report_policy, interaction_run_id=interaction_run_id,
+                    model=model, user_input=user_input, final_response=terminal_result,
+                    tools_used=tools_used, source_name=source_name,
+                )
+                return terminal_result
+
+        self.logger.warning("Reached maximum iterations: (%s). Stopping.", self.MAX_ITERATIONS)
+        await self._attach_user_report(
+            report_policy=report_policy, interaction_run_id=interaction_run_id,
+            model=model, user_input=user_input, final_response=assistant_text,
+            tools_used=tools_used, source_name=source_name,
+        )
+        return assistant_text
+
+    def _append_deferred_sibling_tool_results(
+        self, tool_calls: List[Dict[str, Any]], suspended_tool_call_id: str
+    ) -> None:
+        existing = {
+            str(message.get("tool_call_id") or "")
+            for message in self._frame.messages
+            if message.get("role") == "tool"
+        }
+        for call in tool_calls:
+            call_id = str(call.get("id") or "")
+            if not call_id or call_id == suspended_tool_call_id or call_id in existing:
+                continue
+            self._frame.messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "name": str(call.get("function", {}).get("name") or "unknown"),
+                    "content": "Error: not executed because this turn is awaiting local approval.",
+                }
+            )
+
+    def _persist_suspended_interaction(
+        self, suspended: InteractionSuspended, checkpoint: dict[str, Any]
+    ) -> None:
+        if self.capability_policy is None:
+            raise RuntimeError("Cannot persist suspended interaction without an approval store.")
+        store = self.capability_policy.store
+        checkpoint_json = json.dumps(checkpoint, ensure_ascii=False)
+        if not hasattr(store, "create_suspended_delegation"):
+            raise RuntimeError("Approval store does not support durable interaction checkpoints.")
+        store.create_suspended_delegation(
+            approval=suspended.approval,
+            task=suspended.delegated_task,
+            checkpoint_json=checkpoint_json,
+            tool_call_id=suspended.tool_call_id,
+        )
+        if hasattr(store, "audit"):
+            store.audit(
+                "ambient_agent",
+                f"{suspended.delegated_task.capability}.requested",
+                suspended.approval_id,
+                {
+                    "delegation_id": suspended.delegation_id,
+                    "tool_call_id": suspended.tool_call_id,
+                    "origin_kind": suspended.delegated_task.origin_kind,
+                },
+            )
 
     async def _consume_stream(
         self,
@@ -1148,6 +1454,10 @@ class LLMInteractionService:
                     self.capability_policy is not None
                     and tool_name not in self.TERMINAL_TOOL_NAMES
                     and tool_name not in self.LOCAL_CONTROL_REQUEST_TOOLS
+                    and not (
+                        self._frame.delegated_approval_id
+                        and tool_name in self._frame.preauthorized_tool_names
+                    )
                 ):
                     metadata = current_interaction_metadata()
                     source = current_interaction_source()
@@ -1184,11 +1494,25 @@ class LLMInteractionService:
                             {"role": "tool", "tool_call_id": tool_id, "name": tool_name, "content": response_content}
                         )
                         continue
+                elif (
+                    self.capability_policy is not None
+                    and self._frame.delegated_approval_id
+                    and tool_name in self._frame.preauthorized_tool_names
+                    and hasattr(self.capability_policy.store, "audit")
+                ):
+                    self.capability_policy.store.audit(
+                        "ambient_agent",
+                        "browser_use.scoped_tool_authorized",
+                        self._frame.delegated_approval_id,
+                        {"tool_name": tool_name, "tool_call_id": tool_id},
+                    )
                 if tool_name == "use_browser":
                     task = tool_args.get("task", "")
                     response_content = self._request_browser_use(
                         task=str(task),
                         reason=str(tool_args.get("reason", "")),
+                        expected_result=str(tool_args.get("expected_result", "")),
+                        continuation_instruction=str(tool_args.get("continuation_instruction", "")),
                         agent_depth=agent_depth,
                     )
                 elif tool_name == "use_filesystem":
@@ -1204,6 +1528,8 @@ class LLMInteractionService:
                     response_content = self._request_computer_use(
                         task=str(tool_args.get("task", "")),
                         reason=str(tool_args.get("reason", "")),
+                        expected_result=str(tool_args.get("expected_result", "")),
+                        continuation_instruction=str(tool_args.get("continuation_instruction", "")),
                         agent_depth=agent_depth,
                     )
                 elif tool_name == "finish_browser_task":
@@ -1223,9 +1549,12 @@ class LLMInteractionService:
                     self._frame.browser_exit_requested = exit_browser
                     response_content = json.dumps(
                         {
-                            "status": status.strip(),
-                            "summary": summary.strip(),
+                            "status": status.strip(), "summary": summary.strip(),
                             "browser_exited": exit_browser,
+                            "details": str(tool_args.get("details") or "").strip(),
+                            "actions_performed": tool_args.get("actions_performed") or [],
+                            "sources": tool_args.get("sources") or [],
+                            "blockers": tool_args.get("blockers") or [],
                         },
                         ensure_ascii=False,
                     )
@@ -1241,7 +1570,13 @@ class LLMInteractionService:
                     if not isinstance(summary, str) or not summary.strip():
                         raise ValueError("finish_filesystem_task summary must be a non-empty string.")
                     response_content = json.dumps(
-                        {"status": status.strip(), "summary": summary.strip()},
+                        {
+                            "status": status.strip(), "summary": summary.strip(),
+                            "details": str(tool_args.get("details") or "").strip(),
+                            "actions_performed": tool_args.get("actions_performed") or [],
+                            "sources": tool_args.get("sources") or [],
+                            "blockers": tool_args.get("blockers") or [],
+                        },
                         ensure_ascii=False,
                     )
                 elif tool_name == "finish_computer_task":
@@ -1256,7 +1591,13 @@ class LLMInteractionService:
                     if not isinstance(summary, str) or not summary.strip():
                         raise ValueError("finish_computer_task summary must be a non-empty string.")
                     response_content = json.dumps(
-                        {"status": status.strip(), "summary": summary.strip()},
+                        {
+                            "status": status.strip(), "summary": summary.strip(),
+                            "details": str(tool_args.get("details") or "").strip(),
+                            "actions_performed": tool_args.get("actions_performed") or [],
+                            "sources": tool_args.get("sources") or [],
+                            "blockers": tool_args.get("blockers") or [],
+                        },
                         ensure_ascii=False,
                     )
                 elif tool_name == "schedule_task_at":
@@ -1388,6 +1729,19 @@ class LLMInteractionService:
                         response_content,
                         succeeded=not response_content.startswith("Error:"),
                     )
+            except InteractionSuspended as suspended:
+                suspended.tool_call_id = tool_id
+                self._emit_event(
+                    event_callback,
+                    {
+                        "type": "approval_required",
+                        "tool_name": tool_name,
+                        "tool_call_id": tool_id,
+                        "approval_id": suspended.approval_id,
+                        "delegation_id": suspended.delegation_id,
+                    },
+                )
+                raise
             except Exception as e:
                 response_content = f"Error: {str(e)}"
                 if self.capability_policy is not None:

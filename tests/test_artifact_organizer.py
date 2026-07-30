@@ -52,9 +52,14 @@ class _NoTools:
 class _FakeSemanticBackingStore:
     def __init__(self):
         self.upserts = []
+        self.deleted = []
 
     def upsert_semantic_chunk(self, **kwargs):
         self.upserts.append(kwargs)
+
+    def delete_semantic_chunk(self, chunk_id):
+        self.deleted.append(chunk_id)
+        return True
 
 
 class _FakeSemanticMemory:
@@ -227,6 +232,46 @@ def test_artifact_organizer_backfills_existing_markdown(tmp_path):
 
     assert candidates
     assert candidates[0].title == "Existing Notes"
+
+
+def test_artifact_organizer_consolidates_cluster_and_archives_duplicates(tmp_path):
+    semantic_memory = _FakeSemanticMemory()
+    organizer = ArtifactOrganizer(tmp_path, semantic_memory=semantic_memory)
+    first = organizer.save_new(
+        title="Distributed Systems Lecture",
+        summary="Lecture notes about consensus.",
+        detailed_report="The lecturer introduced consensus and leader election.",
+        source_ref="screen/one",
+    )
+    second = organizer.save_new(
+        title="Distributed Systems Lecture Part 2",
+        summary="More notes about the same consensus lecture.",
+        detailed_report="The lecturer continued with quorum behavior.",
+        source_ref="screen/two",
+    )
+    run_id = organizer.start_maintenance_run("test")
+
+    result = organizer.consolidate_cluster(
+        run_id=run_id,
+        canonical_artifact_id=first["artifact_id"],
+        artifact_ids=[first["artifact_id"], second["artifact_id"]],
+        final_title="Distributed Systems Lecture",
+        short_summary="Consensus, leader election, and quorum notes from one lecture.",
+        detailed_summary="Combined notes from the continuing distributed systems lecture.",
+        merged_content="Consensus selects a leader. Quorums preserve agreement during failures.",
+        confidence=0.97,
+        rationale="Both notes continue the same lecture.",
+    )
+
+    assert result["archived_count"] == 1
+    assert Path(first["artifact_path"]).exists()
+    assert not Path(second["artifact_path"]).exists()
+    archived = organizer.list_artifacts(status="archived")
+    assert len(archived) == 1
+    assert Path(archived[0]["artifact_path"]).parent.name == "archived"
+    assert archived[0]["canonical_artifact_id"] == first["artifact_id"]
+    assert f"artifact:{second['artifact_id']}" in semantic_memory.memory.deleted
+    assert "Quorums preserve agreement" in Path(first["artifact_path"]).read_text(encoding="utf-8")
 
 
 def test_llm_interaction_service_merges_same_topic_artifact(tmp_path):

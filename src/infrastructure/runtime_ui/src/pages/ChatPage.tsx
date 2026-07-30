@@ -24,6 +24,7 @@ function messageText(message: ChatMessage): string {
   if (message.content) return message.content;
   if (message.status === "queued") return "Queued…";
   if (message.status === "running") return "Thinking…";
+  if (message.status === "awaiting_approval") return "Waiting for your approval in the Inbox.";
   return message.error_text || "No response returned.";
 }
 
@@ -90,8 +91,14 @@ export function ChatPage() {
           buffer = buffer.slice(separator + 2);
           if (event?.type === "tool_started") setActivity(`Using ${event.data.tool_name || "a tool"}…`);
           if (event?.type === "tool_finished") setActivity(`${event.data.tool_name || "Tool"} ${event.data.ok ? "finished" : "failed"}.`);
-          if (event?.type === "status") setActivity(event.data.status === "running" ? "Ambient AI is thinking…" : event.data.status);
-          if (["snapshot", "delta", "done", "error"].includes(event?.type || "")) {
+          if (event?.type === "status") setActivity(
+            event.data.status === "running"
+              ? "Ambient AI is thinking…"
+              : event.data.status === "awaiting_approval"
+                ? "Approval required. Review it in the Inbox; this conversation will resume afterward."
+                : event.data.status
+          );
+          if (["snapshot", "delta", "status", "done", "error"].includes(event?.type || "")) {
             await queryClient.invalidateQueries({ queryKey: ["chat-messages", sessionId] });
           }
           if (event?.type === "done") setActivity("");
@@ -113,7 +120,7 @@ export function ChatPage() {
 
   useEffect(() => {
     messages.data?.messages.forEach((message) => {
-      if (message.role === "assistant" && ["queued", "running"].includes(message.status) && !activeStreams.current.has(message.id)) {
+      if (message.role === "assistant" && ["queued", "running", "awaiting_approval"].includes(message.status) && !activeStreams.current.has(message.id)) {
         void streamMessage(message.id, selectedId);
       }
     });
@@ -142,7 +149,7 @@ export function ChatPage() {
       setActivity(error instanceof Error ? error.message : "Could not send the message.");
     }
   };
-  const active = messages.data?.messages.some((message) => message.role === "assistant" && ["queued", "running"].includes(message.status)) || streamingIds.size > 0;
+  const active = messages.data?.messages.some((message) => message.role === "assistant" && ["queued", "running", "awaiting_approval"].includes(message.status)) || streamingIds.size > 0;
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void submit(); }
   };

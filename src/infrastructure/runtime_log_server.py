@@ -8,7 +8,8 @@ import threading
 import uuid
 from collections import deque
 from contextlib import asynccontextmanager
-from datetime import date, datetime
+from dataclasses import replace
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, Optional
 
@@ -311,6 +312,23 @@ def create_runtime_log_app(
     @app.get("/healthz")
     def healthz() -> dict[str, Any]:
         return {"status": "ok", "latest_id": log_buffer.latest_id(), "real_world_lab": real_world_lab is not None}
+
+    @app.get("/api/home")
+    def home_dashboard(
+        date_value: date | None = Query(default=None, alias="date"),
+        since: str | None = Query(default=None),
+    ) -> dict[str, Any]:
+        if runtime_control is None or not hasattr(runtime_control, "home_snapshot"):
+            raise HTTPException(status_code=503, detail="daily_briefing_unavailable")
+        try:
+            return runtime_control.home_snapshot(
+                date_value=date_value.isoformat() if date_value else None,
+                since=since,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="invalid_date_or_since") from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     @app.get("/api/real-world/suites")
     def get_real_world_suites() -> dict[str, Any]:
@@ -1051,12 +1069,112 @@ def create_runtime_log_app(
         rows = autonomy_store.list_approvals(status=status, limit=limit) if autonomy_store is not None else []
         return {"approvals": [_as_dict(row) for row in rows], "count": len(rows)}
 
+    @app.get("/api/autonomy/delegations")
+    def list_autonomy_delegations(
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> dict[str, Any]:
+        rows = (
+            autonomy_store.list_delegated_tasks(limit=limit)
+            if autonomy_store is not None and hasattr(autonomy_store, "list_delegated_tasks")
+            else []
+        )
+        return {"delegations": [_as_dict(row) for row in rows], "count": len(rows)}
+
+    @app.get("/api/autonomy/delegations/{delegation_id}")
+    def get_autonomy_delegation(delegation_id: str) -> dict[str, Any]:
+        row = (
+            autonomy_store.get_delegated_task(delegation_id)
+            if autonomy_store is not None and hasattr(autonomy_store, "get_delegated_task")
+            else None
+        )
+        if row is None:
+            raise HTTPException(status_code=404, detail="delegation_not_found")
+        return {"delegation": _as_dict(row)}
+
     @app.post("/api/autonomy/approvals/{approval_id}/decision")
     async def decide_autonomy_approval(approval_id: str, request: Request) -> dict[str, Any]:
         if autonomy_store is None:
             raise HTTPException(status_code=503, detail="autonomy_store_unavailable")
         body = await request.json()
         approved = bool(body.get("approved"))
+        existing = (
+            autonomy_store.get_approval(approval_id)
+            if hasattr(autonomy_store, "get_approval")
+            else next(
+                (item for item in autonomy_store.list_approvals(limit=500) if item.approval_id == approval_id),
+                None,
+            )
+        )
+        if existing is None:
+            raise HTTPException(status_code=404, detail="approval_not_found")
+        if existing.status != "pending":
+            raise HTTPException(status_code=409, detail=f"approval_is_{existing.status}")
+
+        def finalize_waiting_origin(delegated, content: str) -> None:
+            origin = _safe_json(delegated.origin_json, {})
+            origin_kind = str(delegated.origin_kind or "")
+            if origin_kind == "direct_chat" and chat_store is not None:
+                message_id = str(origin.get("chat_message_id") or "")
+                if message_id and chat_store.get_message(message_id):
+                    chat_store.complete_message(
+                        message_id, content, message_kind="delegated_result"
+                    )
+                    if chat_event_broker is not None:
+                        chat_event_broker.publish(
+                            message_id,
+                            {"type": "done", "message": chat_store.get_message(message_id)},
+                        )
+                    return
+            if origin_kind == "scheduled_task" and chat_store is not None:
+                task_id = origin.get("scheduled_task_id")
+                if task_id is not None and chat_store.complete_scheduled_pending(
+                    int(task_id), content
+                ):
+                    if task_store is not None:
+                        task_store.mark_task_complete(int(task_id), status="cancelled")
+                    return
+            opportunity_id = str(origin.get("opportunity_id") or "")
+            inbox = (
+                autonomy_store.get_inbox_for_opportunity(opportunity_id)
+                if opportunity_id and hasattr(autonomy_store, "get_inbox_for_opportunity")
+                else None
+            )
+            if inbox is not None:
+                autonomy_store.add_inbox_item(
+                    replace(
+                        inbox,
+                        summary=content[:280],
+                        detailed_report=inbox.detailed_report.rstrip() + "\n\n" + content,
+                        status="completed_with_blocker",
+                        updated_at=datetime.now().astimezone().isoformat(),
+                    )
+                )
+                activity_run_id = str(origin.get("activity_run_id") or "")
+                if activity_run_id and hasattr(autonomy_store, "complete_run"):
+                    autonomy_store.complete_run(
+                        activity_run_id,
+                        summary=content[:280],
+                        output_text=content,
+                        status="completed_with_blocker",
+                    )
+        try:
+            expired = datetime.fromisoformat(existing.expires_at) <= datetime.now().astimezone()
+        except (TypeError, ValueError):
+            expired = True
+        if expired:
+            if hasattr(autonomy_store, "expire_approval"):
+                autonomy_store.expire_approval(approval_id)
+            delegated = (
+                autonomy_store.get_delegated_task_by_approval(approval_id)
+                if hasattr(autonomy_store, "get_delegated_task_by_approval") else None
+            )
+            if delegated is not None:
+                autonomy_store.update_delegated_task(delegated.delegation_id, status="expired")
+                finalize_waiting_origin(
+                    delegated,
+                    f"The requested {delegated.capability} approval expired before execution.",
+                )
+            raise HTTPException(status_code=409, detail="approval_expired")
         changed = autonomy_store.decide_approval(
             approval_id, approved=approved, approver="local_user"
         )
@@ -1067,7 +1185,14 @@ def create_runtime_log_app(
             )
             if approval is not None:
                 details = _safe_json(approval.constraints_json, {})
-                now = datetime.now().astimezone().isoformat()
+                delegated = (
+                    autonomy_store.get_delegated_task_by_approval(approval_id)
+                    if hasattr(autonomy_store, "get_delegated_task_by_approval") else None
+                )
+                if delegated is not None:
+                    autonomy_store.update_delegated_task(delegated.delegation_id, status="approved")
+                    details["delegation_id"] = delegated.delegation_id
+                now = datetime.now(timezone.utc).isoformat()
                 autonomy_store.enqueue_event(
                     AmbientEvent(
                         event_id=uuid.uuid4().hex,
@@ -1082,6 +1207,17 @@ def create_runtime_log_app(
                         priority=1.0,
                         available_at=now,
                     )
+                )
+        elif changed:
+            delegated = (
+                autonomy_store.get_delegated_task_by_approval(approval_id)
+                if hasattr(autonomy_store, "get_delegated_task_by_approval") else None
+            )
+            if delegated is not None:
+                autonomy_store.update_delegated_task(delegated.delegation_id, status="denied")
+                finalize_waiting_origin(
+                    delegated,
+                    f"The requested {delegated.capability} task was denied and was not executed.",
                 )
         return {"ok": changed, "approved": approved}
 
@@ -1132,6 +1268,55 @@ def create_runtime_log_app(
             raise HTTPException(status_code=503, detail="runtime_control_unavailable")
         return runtime_control.request_reflection()
 
+    @app.get("/api/runtime/biodata/status")
+    def manual_biodata_status() -> dict[str, Any]:
+        if runtime_control is None or not hasattr(runtime_control, "manual_biodata_status"):
+            raise HTTPException(status_code=503, detail="runtime_control_unavailable")
+        return {"ok": True, "status": runtime_control.manual_biodata_status()}
+
+    @app.post("/api/runtime/biodata/run")
+    def manual_biodata_run() -> dict[str, Any]:
+        if runtime_control is None or not hasattr(runtime_control, "request_biodata_update"):
+            raise HTTPException(status_code=503, detail="runtime_control_unavailable")
+        return runtime_control.request_biodata_update()
+
+    @app.get("/api/artifacts/maintenance/status")
+    def artifact_maintenance_status() -> dict[str, Any]:
+        if runtime_control is None or not hasattr(runtime_control, "artifact_maintenance_status"):
+            raise HTTPException(status_code=503, detail="artifact_maintenance_unavailable")
+        return {"ok": True, "status": runtime_control.artifact_maintenance_status()}
+
+    @app.get("/api/artifacts/maintenance/history")
+    def artifact_maintenance_history(limit: int = Query(default=50, ge=1, le=200)) -> dict[str, Any]:
+        if runtime_control is None or not hasattr(runtime_control, "artifact_maintenance_history"):
+            raise HTTPException(status_code=503, detail="artifact_maintenance_unavailable")
+        return {"ok": True, **runtime_control.artifact_maintenance_history(limit=limit)}
+
+    @app.post("/api/artifacts/maintenance/run")
+    def artifact_maintenance_run() -> dict[str, Any]:
+        if runtime_control is None or not hasattr(runtime_control, "request_artifact_maintenance"):
+            raise HTTPException(status_code=503, detail="artifact_maintenance_unavailable")
+        return runtime_control.request_artifact_maintenance()
+
+    @app.get("/api/artifacts")
+    def list_artifacts(
+        status: str = Query(default="active", pattern="^(active|archived)$"),
+        limit: int = Query(default=500, ge=1, le=1000),
+    ) -> dict[str, Any]:
+        if runtime_control is None or not hasattr(runtime_control, "list_artifacts"):
+            raise HTTPException(status_code=503, detail="artifact_library_unavailable")
+        items = runtime_control.list_artifacts(status=status, limit=limit)
+        return {"ok": True, "status": status, "count": len(items), "items": items}
+
+    @app.get("/api/artifacts/{artifact_id}")
+    def get_artifact(artifact_id: str) -> dict[str, Any]:
+        if runtime_control is None or not hasattr(runtime_control, "get_artifact"):
+            raise HTTPException(status_code=503, detail="artifact_library_unavailable")
+        item = runtime_control.get_artifact(artifact_id)
+        if item is None:
+            raise HTTPException(status_code=404, detail="artifact_not_found")
+        return {"ok": True, "artifact": item}
+
     @app.post("/api/privacy/capture/{action}")
     def privacy_capture_action(action: str, request: Request) -> dict[str, Any]:
         if capture_control is None:
@@ -1157,7 +1342,12 @@ def create_runtime_log_app(
             raise HTTPException(status_code=400, detail="apps_must_be_a_list")
         if domains is not None and not isinstance(domains, list):
             raise HTTPException(status_code=400, detail="domains_must_be_a_list")
-        capture_control.set_exclusions(apps=apps, domains=domains)
+        try:
+            capture_control.set_exclusions(apps=apps, domains=domains)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail="capture_exclusions_persistence_failed") from exc
         if autonomy_store is not None:
             autonomy_store.audit(
                 "local_user",
@@ -1166,6 +1356,15 @@ def create_runtime_log_app(
                 capture_control.status(),
             )
         return {"ok": True, **capture_control.status()}
+
+    @app.post("/api/privacy/capture/exclusions/check")
+    def privacy_capture_exclusions_check() -> dict[str, Any]:
+        if runtime_control is None or not hasattr(runtime_control, "check_capture_exclusions"):
+            raise HTTPException(status_code=503, detail="foreground_check_unavailable")
+        result = runtime_control.check_capture_exclusions()
+        if not result.get("ok"):
+            raise HTTPException(status_code=503, detail=result.get("error", "foreground_check_failed"))
+        return result
 
     @app.get("/api/privacy/captures")
     def read_capture_file(request: Request, uri: str = Query(..., min_length=10)) -> Response:
@@ -1200,6 +1399,119 @@ def create_runtime_log_app(
             headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )
 
+    @app.get("/api/processing-queue")
+    def list_processing_queue(
+        limit: int = Query(default=500, ge=1, le=2000),
+    ) -> dict[str, Any]:
+        if autonomy_store is None or not hasattr(autonomy_store, "list_pending_media_events"):
+            raise HTTPException(status_code=503, detail="processing_queue_unavailable")
+        events = autonomy_store.list_pending_media_events(limit=limit)
+        items: list[dict[str, Any]] = []
+        for event in events:
+            payload = _safe_json(event.payload_json, {})
+            capture_uri = str(
+                payload.get("screenshot_ref")
+                or payload.get("audio_ref")
+                or event.source_ref
+                or ""
+            )
+            metadata: dict[str, Any] = {}
+            if capture_store is not None and capture_uri.startswith("capture://"):
+                try:
+                    metadata = capture_store.metadata(capture_uri)
+                except (OSError, ValueError):
+                    metadata = {}
+            modality = "image" if event.event_type == "lightweight_visual_capture" else "audio"
+            items.append(
+                {
+                    "event_id": event.event_id,
+                    "modality": modality,
+                    "event_type": event.event_type,
+                    "status": event.status,
+                    "deletable": event.status in {"pending", "resource_deferred"},
+                    "capture_uri": capture_uri if capture_uri.startswith("capture://") else None,
+                    "original_name": (
+                        metadata.get("original_name")
+                        or payload.get("original_name")
+                        or Path(event.source_ref).name
+                        or f"{modality}-{event.event_id[:8]}"
+                    ),
+                    "mime_type": metadata.get("mime_type") or (
+                        "image/png" if modality == "image" else "audio/wav"
+                    ),
+                    "size_bytes": metadata.get("size"),
+                    "duration_seconds": payload.get("duration_seconds"),
+                    "occurred_at": event.occurred_at,
+                    "available_at": event.available_at,
+                    "attempt_count": event.attempt_count,
+                    "error_text": event.error_text,
+                    "preview_url": f"/api/processing-queue/{event.event_id}/media",
+                }
+            )
+        return {
+            "items": items,
+            "count": len(items),
+            "image_count": sum(item["modality"] == "image" for item in items),
+            "audio_count": sum(item["modality"] == "audio" for item in items),
+            "processing_count": sum(item["status"] == "leased" for item in items),
+        }
+
+    @app.get("/api/processing-queue/{event_id}/media")
+    def get_processing_queue_media(event_id: str) -> Response:
+        if autonomy_store is None or not hasattr(autonomy_store, "get_media_event"):
+            raise HTTPException(status_code=503, detail="processing_queue_unavailable")
+        event = autonomy_store.get_media_event(event_id)
+        if event is None:
+            raise HTTPException(status_code=404, detail="queue_item_not_found")
+        payload = _safe_json(event.payload_json, {})
+        capture_uri = str(
+            payload.get("screenshot_ref") or payload.get("audio_ref") or event.source_ref or ""
+        )
+        if capture_store is None or not capture_uri.startswith("capture://"):
+            raise HTTPException(status_code=404, detail="queue_media_not_available")
+        try:
+            data, metadata = capture_store.read_bytes(capture_uri)
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=404, detail="queue_media_not_found") from exc
+        return Response(
+            content=data,
+            media_type=metadata.get("mime_type") or "application/octet-stream",
+            headers={"Content-Disposition": "inline"},
+        )
+
+    @app.delete("/api/processing-queue/{event_id}")
+    def delete_processing_queue_item(event_id: str) -> dict[str, Any]:
+        if autonomy_store is None or not hasattr(autonomy_store, "cancel_pending_media_event"):
+            raise HTTPException(status_code=503, detail="processing_queue_unavailable")
+        current = autonomy_store.get_media_event(event_id)
+        if current is None:
+            raise HTTPException(status_code=404, detail="queue_item_not_found")
+        if current.status not in {"pending", "resource_deferred"}:
+            raise HTTPException(status_code=409, detail=f"queue_item_is_{current.status}")
+        event = autonomy_store.cancel_pending_media_event(event_id)
+        if event is None:
+            raise HTTPException(status_code=404, detail="queue_item_not_found")
+        if event.status != "ignored":
+            raise HTTPException(
+                status_code=409,
+                detail="queue_item_is_already_processing" if event.status == "leased" else f"queue_item_is_{event.status}",
+            )
+        payload = _safe_json(event.payload_json, {})
+        capture_uri = str(
+            payload.get("screenshot_ref") or payload.get("audio_ref") or event.source_ref or ""
+        )
+        file_deleted = False
+        if capture_store is not None and capture_uri.startswith("capture://"):
+            file_deleted = bool(capture_store.delete(capture_uri))
+        if hasattr(autonomy_store, "audit"):
+            autonomy_store.audit(
+                "local_user",
+                "processing_queue.removed",
+                event_id,
+                {"event_type": event.event_type, "capture_deleted": file_deleted},
+            )
+        return {"ok": True, "event_id": event_id, "file_deleted": file_deleted}
+
     @app.delete("/api/privacy/captures")
     def delete_capture_file(request: Request, uri: str = Query(..., min_length=10)) -> dict[str, Any]:
         if capture_store is None:
@@ -1209,7 +1521,9 @@ def create_runtime_log_app(
             autonomy_store.audit("local_user", "capture.deleted", uri, {"deleted": deleted})
         return {"ok": deleted}
 
+    @app.get("/home", response_class=HTMLResponse)
     @app.get("/reports", response_class=HTMLResponse)
+    @app.get("/artifacts", response_class=HTMLResponse)
     @app.get("/inbox", response_class=HTMLResponse)
     @app.get("/chat", response_class=HTMLResponse)
     @app.get("/interactions", response_class=HTMLResponse)
@@ -1217,6 +1531,7 @@ def create_runtime_log_app(
     @app.get("/logs", response_class=HTMLResponse)
     @app.get("/benchmarks", response_class=HTMLResponse)
     @app.get("/real-world-tests", response_class=HTMLResponse)
+    @app.get("/processing-queue", response_class=HTMLResponse)
     @app.get("/training", response_class=HTMLResponse)
     def view_logs() -> str:
         return _load_dashboard_html()

@@ -144,6 +144,16 @@ class SQLiteChatAdapter:
         user_id = uuid.uuid4().hex
         assistant_id = uuid.uuid4().hex
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            active = conn.execute(
+                "SELECT 1 FROM chat_messages WHERE session_id=? AND role='assistant' "
+                "AND status IN ('queued', 'running', 'awaiting_approval') LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            if active is not None:
+                raise ValueError(
+                    "This conversation already has a response in progress or awaiting approval."
+                )
             conn.execute(
                 "INSERT INTO chat_messages "
                 "(id, session_id, role, content, status, created_at, updated_at) "
@@ -236,22 +246,47 @@ class SQLiteChatAdapter:
                 (content, _utc_now(), message_id),
             )
 
-    def complete_message(self, message_id: str, content: str) -> None:
+    def complete_message(
+        self, message_id: str, content: str, *, message_kind: Optional[str] = None
+    ) -> None:
         now = _utc_now()
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT session_id FROM chat_messages WHERE id=?", (message_id,)
             ).fetchone()
-            conn.execute(
-                "UPDATE chat_messages SET content=?, status='completed', updated_at=?, error_text=NULL "
-                "WHERE id=?",
-                (content, now, message_id),
-            )
+            if message_kind is None:
+                conn.execute(
+                    "UPDATE chat_messages SET content=?, status='completed', updated_at=?, error_text=NULL "
+                    "WHERE id=?", (content, now, message_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE chat_messages SET content=?, status='completed', message_kind=?, "
+                    "updated_at=?, error_text=NULL WHERE id=?",
+                    (content, message_kind, now, message_id),
+                )
             if row:
                 conn.execute(
                     "UPDATE chat_sessions SET updated_at=? WHERE id=?",
                     (now, row["session_id"]),
                 )
+
+    def mark_awaiting_approval(self, message_id: str, content: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE chat_messages SET content=?, status='awaiting_approval', "
+                "message_kind='delegated_pending', updated_at=?, error_text=NULL "
+                "WHERE id=? AND status='running'",
+                (content, _utc_now(), message_id),
+            )
+
+    def mark_resuming(self, message_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE chat_messages SET content='', status='running', updated_at=?, error_text=NULL "
+                "WHERE id=? AND status='awaiting_approval'",
+                (_utc_now(), message_id),
+            )
 
     def fail_message(self, message_id: str, error_text: str) -> None:
         with self._connect() as conn:
@@ -297,6 +332,62 @@ class SQLiteChatAdapter:
             conn.execute(
                 "UPDATE chat_sessions SET updated_at=? WHERE id=?",
                 (now, session_id),
+            )
+        return self.get_message(message_id)
+
+    def mark_scheduled_awaiting_approval(self, message_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE chat_messages SET status='awaiting_approval', "
+                "message_kind='scheduled_pending', updated_at=? WHERE id=?",
+                (_utc_now(), message_id),
+            )
+
+    def complete_scheduled_pending(self, task_id: int, content: str) -> bool:
+        now = _utc_now()
+        with self._connect() as conn:
+            result = conn.execute(
+                "UPDATE chat_messages SET content=?, status='completed', "
+                "message_kind='scheduled_result', updated_at=?, error_text=NULL "
+                "WHERE task_id=? AND status='awaiting_approval'",
+                (content, now, task_id),
+            )
+            if result.rowcount:
+                row = conn.execute(
+                    "SELECT session_id FROM chat_messages WHERE task_id=? ORDER BY rowid DESC LIMIT 1",
+                    (task_id,),
+                ).fetchone()
+                if row:
+                    conn.execute(
+                        "UPDATE chat_sessions SET updated_at=? WHERE id=?",
+                        (now, row["session_id"]),
+                    )
+        return result.rowcount > 0
+
+    def append_delegated_result(
+        self,
+        *,
+        session_id: str,
+        content: str,
+        failed: bool = False,
+    ) -> dict[str, Any]:
+        if self.get_session(session_id) is None:
+            raise KeyError(session_id)
+        now = _utc_now()
+        message_id = uuid.uuid4().hex
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO chat_messages "
+                "(id, session_id, role, content, status, message_kind, created_at, updated_at, error_text) "
+                "VALUES (?, ?, 'assistant', ?, ?, 'delegated_result', ?, ?, ?)",
+                (
+                    message_id, session_id, content,
+                    "failed" if failed else "completed", now, now,
+                    content[:2000] if failed else None,
+                ),
+            )
+            conn.execute(
+                "UPDATE chat_sessions SET updated_at=? WHERE id=?", (now, session_id)
             )
         return self.get_message(message_id)
 

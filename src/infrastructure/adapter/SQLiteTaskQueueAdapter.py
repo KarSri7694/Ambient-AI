@@ -50,6 +50,9 @@ class SQLiteTaskQueueAdapter(TaskQueuePort):
     def mark_task_complete(self, task_id: int, status: str = "completed") -> None:
         night_mode.mark_task_complete(task_id, status)
 
+    def mark_task_waiting_for_approval(self, task_id: int) -> None:
+        night_mode.mark_task_waiting_for_approval(task_id)
+
     def claim_task(self, task_id: int) -> bool:
         return night_mode.claim_task(task_id)
 
