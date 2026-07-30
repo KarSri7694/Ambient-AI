@@ -18,6 +18,7 @@ import night_mode
 from utils.threading_util import run_async
 import yt_dlp
 from application.services.semantic_deduplication_service import SemanticDeduplicationService
+from application.services.ddgs_search_service import DdgsSearchService
 from config import CONFIG
 from infrastructure.adapter.LoggingLLMProvider import LoggingLLMProvider
 from infrastructure.adapter.llamaCppAdapter import LlamaCppAdapter
@@ -31,6 +32,8 @@ mcp = FastMCP("My MCP Server")
 TODOIST_API_TOKEN = os.environ.get("TODOIST_API_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 SERPAPI_API_KEY = os.environ.get("SERPAPI_API_KEY")
+DDGS_PROXY = os.environ.get("DDGS_PROXY")
+DDGS_TIMEOUT_SECONDS = CONFIG.get_float("web_search", "ddgs_timeout_seconds", 10.0)
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 SCOPES = ['https://www.googleapis.com/auth/calendar.events']
@@ -362,6 +365,36 @@ def google_search(query: Annotated[str, "The google search query"],
     
     organic_results = search['organic_results']
     return organic_results
+
+
+@mcp.tool
+def search_web_ddgs(
+    query: Annotated[str, "Web search query"],
+    max_results: Annotated[int, "Number of results to return, from 1 to 20"] = 5,
+    region: Annotated[str, "DDGS region such as us-en, in-en, or wt-wt"] = "us-en",
+    safesearch: Annotated[str, "Safe-search setting: on, moderate, or off"] = "moderate",
+    timelimit: Annotated[str, "Optional recency: d, w, m, y, or empty for any time"] = "",
+    page: Annotated[int, "Results page from 1 to 10"] = 1,
+    backend: Annotated[str, "DDGS backend or comma-delimited backends; auto is recommended"] = "auto",
+) -> dict:
+    """
+    Search the public web with DDGS metasearch without requiring an API key.
+
+    Returns structured title, URL, snippet, and source records. Use timelimit for
+    recent information and retain the returned URLs as citations/evidence.
+    """
+    return DdgsSearchService(
+        timeout_seconds=DDGS_TIMEOUT_SECONDS,
+        proxy=DDGS_PROXY,
+    ).search_text(
+        query=query,
+        max_results=max_results,
+        region=region,
+        safesearch=safesearch,
+        timelimit=timelimit,
+        page=page,
+        backend=backend,
+    )
 
 @mcp.tool()
 def queue_night_task(

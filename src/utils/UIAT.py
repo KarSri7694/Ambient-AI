@@ -173,7 +173,8 @@ def _browser_address_bar_url(window, *, max_controls: int = 300) -> str | None:
         value = ""
         if is_edit:
             try:
-                value = str(control.GetValuePattern().Value or "").strip()
+                pattern = control.GetPattern(auto.PatternId.ValuePattern)
+                value = str(pattern.Value or "").strip() if pattern is not None else ""
             except Exception:
                 value = ""
             candidate = _url_from_candidate(value) or _url_from_candidate(name)
@@ -189,6 +190,23 @@ def _browser_address_bar_url(window, *, max_controls: int = 300) -> str | None:
         except Exception:
             continue
     return fallback
+
+
+def _browser_toolbar_url_from_items(items: list[dict]) -> str | None:
+    """Recover a browser URL only when it appears beside address-bar chrome."""
+    toolbar_markers = (
+        "address", "enter address", "search with", "omnibox", "location",
+        "view site information", "site information", "navigation",
+    )
+    names = [str(item.get("name") or "").strip() for item in items[:50]]
+    for index, name in enumerate(names):
+        candidate = _url_from_candidate(name)
+        if candidate is None:
+            continue
+        nearby = " ".join(names[max(0, index - 6):index + 2]).lower()
+        if any(marker in nearby for marker in toolbar_markers):
+            return candidate
+    return None
 
 
 def _virtual_screen_bounds() -> tuple[int, int, int, int]:
@@ -598,7 +616,11 @@ def inspect_foreground_window(mode: str = "interactive_only") -> dict:
 
     chromium = is_chromium_window(window)
     browser_processes = {"chrome", "msedge", "firefox", "brave", "opera", "vivaldi"}
-    is_browser = chromium or Path(str(process_name or "")).stem.lower() in browser_processes
+    process_stem = Path(str(process_name or "")).stem.lower()
+    # Electron apps share Chrome_WidgetWin_1 with browsers. When the process
+    # identity is available it is authoritative; class-name fallback is only
+    # for protected processes whose executable could not be resolved.
+    is_browser = process_stem in browser_processes if process_stem else chromium
     accessibility_activated = False
     if chromium:
         original_state = _get_screen_reader_state()
@@ -629,7 +651,9 @@ def inspect_foreground_window(mode: str = "interactive_only") -> dict:
         for row in rows
     ]
     visible_text_summary = "\n".join(item["name"] for item in items[:80])
-    foreground_url = address_bar_url
+    foreground_url = address_bar_url or (
+        _browser_toolbar_url_from_items(items) if is_browser else None
+    )
     if foreground_url is None and not is_browser:
         for item in items:
             foreground_url = _url_from_candidate(str(item.get("name") or ""))

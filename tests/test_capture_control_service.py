@@ -84,6 +84,44 @@ def test_queued_capture_policy_is_not_reapplied_after_the_policy_changes(tmp_pat
     assert queued_route == "full_vlm"
 
 
+def test_firefox_accessibility_toolbar_url_reaches_domain_policy(tmp_path):
+    control = CaptureControlService(excluded_domains=["127.0.0.1", "netflix.com"])
+    observer = PassiveObserverService(
+        memory=SimpleNamespace(),
+        llm_provider=SimpleNamespace(),
+        screen_capture=SimpleNamespace(),
+        screenshot_root=str(tmp_path / "screens"),
+        capture_control=control,
+    )
+    payload = {
+        "process_name": "firefox.exe",
+        "window_class": "MozillaWindowClass",
+        "window_title": "Ambient Agent Runtime — Mozilla Firefox",
+        "visible_text_summary": (
+            "Navigation\nView site information\n"
+            "Search with DuckDuckGo or enter address\n"
+            "http://127.0.0.1:8765/inbox\nBookmark this page"
+        ),
+    }
+    domain = observer._infer_domain_hint(payload)
+    assert domain == "127.0.0.1"
+    assert control.is_excluded(
+        process_name=payload["process_name"],
+        window_class=payload["window_class"],
+        window_title=payload["window_title"],
+        domain=domain,
+    )
+
+    # A filename in a non-browser window must not be mistaken for a website.
+    assert observer._infer_domain_hint(
+        {
+            "process_name": "code.exe",
+            "window_class": "Chrome_WidgetWin_1",
+            "window_title": "config.example.ini - Visual Studio Code",
+        }
+    ) is None
+
+
 def test_foreground_check_api_uses_runtime_detector_without_capturing():
     control = CaptureControlService(excluded_domains=["bank.example"])
 

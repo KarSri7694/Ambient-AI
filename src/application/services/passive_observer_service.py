@@ -369,10 +369,37 @@ Rules:
             "chrome", "msedge", "firefox", "brave", "opera", "vivaldi",
             "chromium", "waterfox", "librewolf", "zen",
         }
-        if process_name not in browser_processes and not any(
-            marker in window_class for marker in ("mozilla", "chrome_widget")
-        ):
+        is_browser = (
+            process_name in browser_processes
+            if process_name
+            else any(marker in window_class for marker in ("mozilla", "chrome_widget"))
+        )
+        if not is_browser:
             return None
+        visible_lines = [
+            line.strip()
+            for line in str(uiat_context.get("visible_text_summary") or "").splitlines()
+            if line.strip()
+        ]
+        address_markers = (
+            "enter address", "address bar", "search with", "omnibox",
+            "view site information", "site information",
+        )
+        for index, line in enumerate(visible_lines[:50]):
+            if not any(marker in line.lower() for marker in address_markers):
+                continue
+            for candidate_line in visible_lines[index + 1:index + 4]:
+                candidate = candidate_line if "://" in candidate_line else f"//{candidate_line}"
+                try:
+                    hostname = (urlsplit(candidate).hostname or "").lower().rstrip(".")
+                except ValueError:
+                    hostname = ""
+                if hostname and (
+                    hostname == "localhost"
+                    or "." in hostname
+                    or ":" in hostname
+                ):
+                    return hostname
         fallback_text = str(uiat_context.get("window_title") or "").lower()
         pattern = re.compile(
             r"(?<![a-z0-9-])((?:localhost|(?:\d{1,3}\.){3}\d{1,3}|[a-z0-9-]+(?:\.[a-z0-9-]+)+)(?::\d{1,5})?)(?![a-z0-9-])"
