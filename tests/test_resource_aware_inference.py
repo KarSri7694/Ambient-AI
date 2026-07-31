@@ -320,6 +320,63 @@ def test_resident_model_is_reused_and_uses_post_load_floor():
     ).allowed is False
 
 
+def test_blank_lightweight_model_keeps_healthy_active_model_resident():
+    monitor = _MutableMonitor(available_ram_mb=4_000, free_vram_mb=5_000)
+    provider = _ModelProvider()
+    provider.current = "gemma-26b"
+    governor = ResourceGovernorService(monitor=monitor)
+    manager = ModelResidencyManager(
+        provider=provider,
+        governor=governor,
+        lightweight_chat_model="",
+        keep_active_model_resident=True,
+    )
+
+    resident = asyncio.run(manager.settle_to_lightweight(user_active=False))
+
+    assert resident is True
+    assert provider.current == "gemma-26b"
+    assert provider.unloads == []
+
+
+def test_blank_lightweight_model_can_still_use_on_demand_eviction():
+    monitor = _MutableMonitor(available_ram_mb=4_000, free_vram_mb=5_000)
+    provider = _ModelProvider()
+    provider.current = "gemma-26b"
+    governor = ResourceGovernorService(monitor=monitor)
+    manager = ModelResidencyManager(
+        provider=provider,
+        governor=governor,
+        lightweight_chat_model="",
+        keep_active_model_resident=False,
+    )
+
+    resident = asyncio.run(manager.settle_to_lightweight(user_active=False))
+
+    assert resident is False
+    assert provider.current is None
+    assert provider.unloads == ["gemma-26b"]
+
+
+def test_resident_same_model_is_not_unloaded_when_headroom_is_low():
+    monitor = _MutableMonitor(available_ram_mb=4_000, free_vram_mb=300)
+    provider = _ModelProvider()
+    provider.current = "gemma-26b"
+    governor = ResourceGovernorService(monitor=monitor, critical_vram_mb=512)
+    manager = ModelResidencyManager(provider=provider, governor=governor)
+    governor.set_residency_status_provider(manager.status)
+
+    decision = asyncio.run(
+        manager.load_model("gemma-26b", role="browser_agent", background=False, user_active=True)
+    )
+
+    assert decision.allowed is False
+    assert "VRAM" in decision.reason
+    assert provider.current == "gemma-26b"
+    assert provider.loads == []
+    assert provider.unloads == []
+
+
 def test_saved_model_restore_is_resource_gated():
     monitor = _MutableMonitor(available_ram_mb=14_000, free_vram_mb=5_000)
     provider = _ModelProvider()

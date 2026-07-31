@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import ipaddress
 import json
 import logging
 import re
@@ -9,7 +8,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
-from urllib.parse import quote_plus, urlsplit
+from urllib.parse import quote_plus
 
 from application.ports.LLMProvider import LLMProvider
 from application.ports.tool_bridge_port import (
@@ -21,113 +20,35 @@ from local_control.safety import ComputerControlTerminated
 
 
 class BrowserPolicyError(RuntimeError):
-    """Raised when a visual browser action violates the read-only policy."""
+    """Raised when a visual browser action violates the host browser safety policy."""
 
 
 class BrowserSafetyPolicy:
-    """Deterministic host-side policy for an unsandboxed research browser."""
+    """Deterministic host-side policy for an unsandboxed research browser.
 
-    BLOCKED_SCHEMES = {
-        "file",
-        "ftp",
-        "javascript",
-        "chrome",
-        "chrome-extension",
-        "edge",
-        "data",
-    }
-    BLOCKED_HOSTS = {"localhost", "localhost.localdomain", "host.docker.internal"}
-    BLOCKED_PATH_MARKERS = {
-        "account",
-        "signin",
-        "sign-in",
-        "login",
-        "logout",
-        "register",
-        "wishlist",
-        "favorites",
-        "favourites",
-        "cart",
-        "basket",
-        "checkout",
-        "payment",
-        "billing",
-        "place-order",
-        "submit-order",
-        "delete",
-    }
-    SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
-
+    The browser agent is allowed to interact with normal sites, including POST
+    requests and account-like pages. Downloads are disabled at the Playwright
+    context and cancelled by the download event handler.
+    """
     def __init__(
         self,
         *,
         blocked_domains: Optional[List[str]] = None,
         blocked_path_markers: Optional[List[str]] = None,
     ) -> None:
-        self.blocked_domains = {
-            value.strip().lower().lstrip(".")
-            for value in (blocked_domains or [])
-            if value.strip()
-        }
-        self.blocked_path_markers = set(self.BLOCKED_PATH_MARKERS)
-        self.blocked_path_markers.update(
-            value.strip().lower().strip("/")
-            for value in (blocked_path_markers or [])
-            if value.strip()
-        )
-
-    @staticmethod
-    def _is_private_host(hostname: str) -> bool:
-        host = hostname.strip().lower().strip("[]")
-        if not host:
-            return True
-        try:
-            address = ipaddress.ip_address(host)
-        except ValueError:
-            return False
-        return bool(
-            address.is_private
-            or address.is_loopback
-            or address.is_link_local
-            or address.is_multicast
-            or address.is_reserved
-            or address.is_unspecified
-        )
+        # Deprecated compatibility knobs. Browser mutation/domain/path filtering is
+        # no longer enforced here; downloads remain disabled at the browser context.
+        self.blocked_domains = set()
+        self.blocked_path_markers = set()
 
     def validate_navigation(self, url: str) -> str:
         value = str(url or "").strip()
-        parsed = urlsplit(value)
-        scheme = parsed.scheme.lower()
-        if scheme not in {"http", "https"}:
-            raise BrowserPolicyError(f"Navigation scheme is not allowed: {scheme or 'missing'}")
-        hostname = (parsed.hostname or "").lower()
-        if hostname in self.BLOCKED_HOSTS or self._is_private_host(hostname):
-            raise BrowserPolicyError(f"Navigation to local/private hosts is blocked: {hostname}")
-        if any(hostname == domain or hostname.endswith(f".{domain}") for domain in self.blocked_domains):
-            raise BrowserPolicyError(f"Navigation domain is blocked: {hostname}")
-        path_parts = {
-            part.lower()
-            for part in re.split(r"[\s/_.-]+", f"{parsed.path} {parsed.query}")
-            if part
-        }
-        marker = next((item for item in self.blocked_path_markers if item in path_parts), None)
-        if marker:
-            raise BrowserPolicyError(
-                f"Account-changing or transactional URL is blocked by marker '{marker}'."
-            )
+        if not value:
+            raise BrowserPolicyError("Navigation URL is empty.")
         return value
 
     def request_allowed(self, *, url: str, method: str) -> tuple[bool, str]:
-        if str(method or "GET").upper() not in self.SAFE_METHODS:
-            return False, f"read-only browser blocked HTTP {method.upper()}"
-        parsed = urlsplit(str(url or ""))
-        if parsed.scheme in {"about", "blob", "data"}:
-            return True, "browser-local resource"
-        try:
-            self.validate_navigation(url)
-        except BrowserPolicyError as exc:
-            return False, str(exc)
-        return True, "read-only public request"
+        return True, "public browser request"
 
 
 class FaraVisualBrowserSession(BrowserToolSessionPort):
@@ -228,6 +149,7 @@ Only stop at a critical point if (1) required information is missing, (2) the ta
         policy: BrowserSafetyPolicy,
         screenshot_retention: bool,
         logger: logging.Logger,
+        interrupt_checker: Optional[Callable[[], None]] = None,
     ) -> None:
         self.llm = llm_provider
         self.profile_dir = profile_dir
@@ -243,6 +165,7 @@ Only stop at a critical point if (1) required information is missing, (2) the ta
         self.policy = policy
         self.screenshot_retention = screenshot_retention
         self.logger = logger
+        self.interrupt_checker = interrupt_checker
         self._playwright: Any = None
         self._context: Any = None
         self._page: Any = None
@@ -267,20 +190,7 @@ Only stop at a critical point if (1) required information is missing, (2) the ta
         self.profile_dir.mkdir(parents=True, exist_ok=True)
         self.screenshot_dir.mkdir(parents=True, exist_ok=True)
         self._playwright = await async_playwright().start()
-        launch_kwargs: dict[str, Any] = {
-            "user_data_dir": str(self.profile_dir.resolve()),
-            "headless": self.headless,
-            "viewport": {"width": self.viewport_width, "height": self.viewport_height},
-            "accept_downloads": False,
-            "service_workers": "block",
-            "args": [
-                "--disable-extensions",
-                "--disable-features=AutofillServerCommunication,PasswordManagerOnboarding",
-                "--disable-notifications",
-                "--no-first-run",
-                "--no-default-browser-check",
-            ],
-        }
+        launch_kwargs = self._launch_kwargs()
         if self.browser_channel:
             launch_kwargs["channel"] = self.browser_channel
         if self.browser_executable_path:
@@ -300,6 +210,25 @@ Only stop at a critical point if (1) required information is missing, (2) the ta
         except BaseException:
             await self.cleanup()
             raise
+
+    def _launch_kwargs(self) -> dict[str, Any]:
+        launch_kwargs: dict[str, Any] = {
+            "user_data_dir": str(self.profile_dir.resolve()),
+            "headless": self.headless,
+            "viewport": {"width": self.viewport_width, "height": self.viewport_height},
+            "accept_downloads": False,
+            "service_workers": "block",
+            "args": [
+                "--disable-extensions",
+                "--disable-features=AutofillServerCommunication,PasswordManagerOnboarding",
+                "--disable-notifications",
+                f"--window-size={self.viewport_width},{self.viewport_height}",
+                "--start-maximized",
+                "--no-first-run",
+                "--no-default-browser-check",
+            ],
+        }
+        return launch_kwargs
 
     async def _route_request(self, route: Any, request: Any) -> None:
         allowed, reason = self.policy.request_allowed(url=request.url, method=request.method)
@@ -333,6 +262,7 @@ Only stop at a critical point if (1) required information is missing, (2) the ta
         terminal_answer = "The visual browser reached its action limit before completing the task."
 
         for step in range(1, self.max_steps + 1):
+            self._check_interrupted()
             self._stop.check()
             self._page = await self._active_page()
             screenshot_path = await self._capture(step)
@@ -345,6 +275,7 @@ Only stop at a critical point if (1) required information is missing, (2) the ta
                 step=step,
             )
             signature = json.dumps(action, sort_keys=True, ensure_ascii=False)
+            self._check_interrupted()
             if signature == self._last_action_signature:
                 self._repeat_count += 1
             else:
@@ -365,7 +296,7 @@ Only stop at a critical point if (1) required information is missing, (2) the ta
                     "reason": str(exc),
                 }
                 self._blocked_actions.append(blocked)
-                outcome = f"Blocked by the read-only browser policy: {exc}"
+                outcome = f"Blocked by browser safety policy: {exc}"
             self._history.append(
                 f"Step {step}: {json.dumps(action, ensure_ascii=False)} -> {outcome}"
             )
@@ -445,6 +376,7 @@ Only stop at a critical point if (1) required information is missing, (2) the ta
         reasoning_parts: list[str] = []
         tool_calls: dict[int, dict[str, str]] = {}
         async for chunk in completion:
+            self._check_interrupted()
             if not getattr(chunk, "choices", None):
                 continue
             delta = chunk.choices[0].delta
@@ -604,6 +536,7 @@ Only stop at a critical point if (1) required information is missing, (2) the ta
         return normalized
 
     async def _execute_action(self, action: dict[str, Any]) -> str:
+        self._check_interrupted()
         self._stop.check()
         action_name = str(action["action"])
         page = await self._active_page()
@@ -693,6 +626,10 @@ Only stop at a critical point if (1) required information is missing, (2) the ta
             raise
         return f"Executed {action_name}; current URL is {self._page.url}"
 
+    def _check_interrupted(self) -> None:
+        if self.interrupt_checker is not None:
+            self.interrupt_checker()
+
     async def _active_page(self) -> Any:
         if self._context is None:
             raise RuntimeError("Visual browser context is not running.")
@@ -767,6 +704,7 @@ class FaraVisualBrowserAdapter(BrowserToolBridgePort):
         blocked_domains: Optional[List[str]] = None,
         blocked_path_markers: Optional[List[str]] = None,
         screenshot_retention: bool = True,
+        interrupt_checker: Optional[Callable[[], None]] = None,
     ) -> None:
         self.llm = llm_provider
         self.profile_dir = Path(profile_dir)
@@ -783,6 +721,7 @@ class FaraVisualBrowserAdapter(BrowserToolBridgePort):
             blocked_path_markers=blocked_path_markers,
         )
         self.screenshot_retention = screenshot_retention
+        self.interrupt_checker = interrupt_checker
         self.logger = logging.getLogger(self.__class__.__name__)
 
     async def open_session(self, *, headless: bool) -> FaraVisualBrowserSession:
@@ -801,6 +740,7 @@ class FaraVisualBrowserAdapter(BrowserToolBridgePort):
             policy=self.policy,
             screenshot_retention=self.screenshot_retention,
             logger=self.logger,
+            interrupt_checker=self.interrupt_checker,
         )
         await session.start()
         return session

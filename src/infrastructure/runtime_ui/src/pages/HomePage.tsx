@@ -37,22 +37,38 @@ function dateHeading(value: string, today: string): string {
 
 export function HomePage({ onNavigate }: { onNavigate: (path: string) => void }) {
   const client = useQueryClient();
-  const today = localDate();
-  const [selectedDate, setSelectedDate] = useState(today);
-  const [since, setSince] = useState<string | null>(() => localStorage.getItem(visitKey(today)));
+  const clientToday = localDate();
+  const [manualDate, setManualDate] = useState<string | null>(null);
+  const [selectedDate, setSelectedDate] = useState(clientToday);
+  const [since, setSince] = useState<string | null>(() => localStorage.getItem(visitKey(clientToday)));
   const recordedVisits = useRef(new Set<string>());
-  useEffect(() => setSince(localStorage.getItem(visitKey(selectedDate))), [selectedDate]);
+  const queryDate = manualDate;
 
   const query = useQuery({
-    queryKey: ["home", selectedDate, since],
-    queryFn: () => getJson<any>(`/api/home?date=${selectedDate}${since ? `&since=${encodeURIComponent(since)}` : ""}`),
+    queryKey: ["home", queryDate, since],
+    queryFn: () => {
+      const params = new URLSearchParams();
+      if (queryDate) params.set("date", queryDate);
+      if (since) params.set("since", since);
+      const queryString = params.toString();
+      return getJson<any>(`/api/home${queryString ? `?${queryString}` : ""}`);
+    },
     refetchInterval: 15_000,
   });
   useEffect(() => {
-    if (!query.data?.server_time || recordedVisits.current.has(selectedDate)) return;
-    recordedVisits.current.add(selectedDate);
-    localStorage.setItem(visitKey(selectedDate), query.data.server_time);
-  }, [query.data?.server_time, selectedDate]);
+    if (!query.data?.date || manualDate) return;
+    setSelectedDate(query.data.date);
+  }, [query.data?.date, manualDate]);
+  useEffect(() => {
+    if (!manualDate) return;
+    setSelectedDate(manualDate);
+  }, [manualDate]);
+  useEffect(() => {
+    const visitDate = query.data?.date || selectedDate;
+    if (!query.data?.server_time || recordedVisits.current.has(visitDate)) return;
+    recordedVisits.current.add(visitDate);
+    localStorage.setItem(visitKey(visitDate), query.data.server_time);
+  }, [query.data?.date, query.data?.server_time, selectedDate]);
 
   const approval = useMutation({
     mutationFn: ({ id, approved }: { id: string; approved: boolean }) =>
@@ -63,6 +79,17 @@ export function HomePage({ onNavigate }: { onNavigate: (path: string) => void })
     },
   });
   const data = query.data;
+  const today = data?.today || clientToday;
+  const selectDate = (value: string) => {
+    setManualDate(value);
+    setSelectedDate(value);
+    setSince(localStorage.getItem(visitKey(value)));
+  };
+  const selectToday = () => {
+    setManualDate(null);
+    setSelectedDate(today);
+    setSince(localStorage.getItem(visitKey(today)));
+  };
   const counts = data?.counts || {};
   const timeline = data?.timeline || [];
   const attention = data?.attention || [];
@@ -86,10 +113,10 @@ export function HomePage({ onNavigate }: { onNavigate: (path: string) => void })
         </div>
       </div>
       <div className="home-date-nav">
-        <Button variant="secondary" onClick={() => setSelectedDate(moveDate(selectedDate, -1))} aria-label="Previous day"><ArrowLeft size={16} /></Button>
+        <Button variant="secondary" onClick={() => selectDate(moveDate(selectedDate, -1))} aria-label="Previous day"><ArrowLeft size={16} /></Button>
         <span>{new Date(`${selectedDate}T12:00:00`).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}</span>
-        <Button variant="secondary" disabled={selectedDate >= today} onClick={() => setSelectedDate(moveDate(selectedDate, 1))} aria-label="Next day"><ArrowRight size={16} /></Button>
-        {selectedDate !== today && <Button variant="ghost" onClick={() => setSelectedDate(today)}>Today</Button>}
+        <Button variant="secondary" disabled={selectedDate >= today} onClick={() => selectDate(moveDate(selectedDate, 1))} aria-label="Next day"><ArrowRight size={16} /></Button>
+        {(manualDate || selectedDate !== today) && <Button variant="ghost" onClick={selectToday}>Today</Button>}
         <Button variant="ghost" onClick={() => query.refetch()} disabled={query.isFetching} aria-label="Refresh Home"><RefreshCw className={query.isFetching ? "animate-spin" : ""} size={16} /></Button>
       </div>
     </section>

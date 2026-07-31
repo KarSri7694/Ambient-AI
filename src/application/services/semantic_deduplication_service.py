@@ -20,6 +20,7 @@ class SemanticDeduplicationService:
         "do_now_action",
         "reflection_task",
         "calendar_event",
+        "proactive_finding",
     )
     DEFAULT_PROMPT = """You decide whether a candidate ambient assistant item should be created or skipped as a duplicate.
 

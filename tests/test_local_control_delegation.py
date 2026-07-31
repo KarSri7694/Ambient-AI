@@ -17,8 +17,9 @@ from application.services.llm_interaction_service import InteractionSuspended, L
 from application.services.interaction_trace import interaction_trace
 from infrastructure.adapter.SQLiteAutonomyAdapter import SQLiteAutonomyAdapter
 from infrastructure.adapter.SQLiteChatAdapter import SQLiteChatAdapter
+from local_control.computer import ComputerControlSession
 from local_control.filesystem import FilesystemControlSession
-from local_control.safety import PathGrantError
+from local_control.safety import PathGrantError, UnsafeComputerAction
 from core.models import AmbientEvent
 
 
@@ -86,6 +87,34 @@ class _Provider:
 
         async def stream():
             yield _Chunk(tool_calls=[tool_call])
+
+        return stream()
+
+
+class _ComputerToolProvider(_Provider):
+    async def chat_completion_stream(self, *, model, messages, tools, image="", **kwargs):
+        self.calls.append({"model": model, "messages": json.loads(json.dumps(messages)), "tools": tools, "image": image})
+        tool_messages = [message for message in messages if message.get("role") == "tool"]
+        if not tool_messages:
+            call = SimpleNamespace(
+                index=0,
+                id="inspect-1",
+                function=SimpleNamespace(name="computer_inspect", arguments="{}"),
+            )
+        else:
+            last = tool_messages[-1]["content"]
+            assert "Permission denied" not in last
+            call = SimpleNamespace(
+                index=0,
+                id="finish-1",
+                function=SimpleNamespace(
+                    name="finish_computer_task",
+                    arguments=json.dumps({"status": "completed", "summary": "screen inspected"}),
+                ),
+            )
+
+        async def stream():
+            yield _Chunk(tool_calls=[call])
 
         return stream()
 
@@ -195,6 +224,47 @@ def test_filesystem_session_rejects_ungranted_paths(tmp_path):
         asyncio.run(session.execute_tool("fs_read_text", {"path": str(outside / "secret.txt")}))
 
 
+def test_computer_session_allows_single_win_key_but_blocks_dangerous_chords(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "local_control.computer.ComputerControlSession._pyautogui_call",
+        lambda _self, method, *args: calls.append((method, args)) or "ok",
+    )
+    session = ComputerControlSession(max_actions=3)
+    try:
+        assert asyncio.run(session.execute_tool("computer_press_key", {"key": "win"})) == "ok"
+        assert calls == [("press", ("win",))]
+        with pytest.raises(UnsafeComputerAction):
+            asyncio.run(session.execute_tool("computer_press_key", {"key": "win+r"}))
+    finally:
+        asyncio.run(session.cleanup())
+
+
+def test_computer_mouse_coordinates_are_scaled_from_gemma_1000_grid(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "local_control.computer.ComputerControlSession._screen_size",
+        staticmethod(lambda: (2560, 1440)),
+    )
+    monkeypatch.setattr(
+        "local_control.computer.ComputerControlSession._pyautogui_call",
+        lambda _self, method, *args: calls.append((method, args)) or "ok",
+    )
+    session = ComputerControlSession(max_actions=3)
+    try:
+        assert asyncio.run(session.execute_tool("computer_move_mouse", {"x": 500, "y": 500})) == "ok"
+        assert asyncio.run(session.execute_tool("computer_click", {"x": 1000, "y": 1000})) == "ok"
+        assert asyncio.run(session.execute_tool("computer_click", {"x": 1200, "y": -100})) == "ok"
+    finally:
+        asyncio.run(session.cleanup())
+
+    assert calls == [
+        ("moveTo", (1280, 720)),
+        ("click", (2559, 1439)),
+        ("click", (2559, 0)),
+    ]
+
+
 def test_request_computer_use_creates_pending_approval(tmp_path):
     store = SQLiteAutonomyAdapter(str(tmp_path / "autonomy.db"))
     service = LLMInteractionService(
@@ -264,6 +334,62 @@ def test_approval_event_deploys_computer_agent_once(tmp_path):
     assert result["outcome"] == "computer_use_completed"
     assert provider.events == ["save", "load:computer-model", "unload:computer-model", "restore"]
     assert [call["model"] for call in provider.calls] == ["computer-model"]
+
+
+def test_approved_computer_agent_can_use_internal_tools_without_reapproval(tmp_path, monkeypatch):
+    store = SQLiteAutonomyAdapter(str(tmp_path / "autonomy.db"))
+    provider = _ComputerToolProvider()
+    service = LLMInteractionService(
+        llm_provider=provider,
+        tool_bridge=_Bridge(),
+        capability_policy=CapabilityPolicyService(store=store),
+        computer_agent_model="computer-model",
+        computer_enabled=True,
+    )
+    monkeypatch.setattr(
+        "local_control.computer.ComputerControlSession._inspect",
+        lambda _self: "Foreground window: test app",
+    )
+    screenshots = [str(tmp_path / "screen-1.png"), str(tmp_path / "screen-2.png")]
+    for path in screenshots:
+        Path(path).write_bytes(b"fake")
+    monkeypatch.setattr(
+        "local_control.computer.ComputerControlSession.capture_screenshot_for_model",
+        lambda _self: screenshots.pop(0) if screenshots else str(tmp_path / "screen-last.png"),
+    )
+
+    result = asyncio.run(service.deploy_computer_agent(task="Inspect the screen", approval_id="approved-1"))
+
+    assert "screen inspected" in result
+    assert len(provider.calls) == 2
+    assert provider.calls[0]["image"].endswith("screen-1.png")
+    assert provider.calls[1]["image"].endswith("screen-2.png")
+    assert provider.calls[1]["messages"][-1]["role"] == "user"
+    assert "Fresh screenshot" in provider.calls[1]["messages"][-1]["content"]
+    assert store.list_approvals(status="pending") == []
+
+
+def test_computer_agent_reuses_same_resident_model_without_swapping(tmp_path, monkeypatch):
+    provider = _ComputerToolProvider()
+    service = LLMInteractionService(
+        llm_provider=provider,
+        tool_bridge=_Bridge(),
+        computer_agent_model="main-model",
+        computer_enabled=True,
+    )
+    screenshots = [str(tmp_path / "same-model-1.png"), str(tmp_path / "same-model-2.png")]
+    for path in screenshots:
+        Path(path).write_bytes(b"fake")
+    monkeypatch.setattr(
+        "local_control.computer.ComputerControlSession.capture_screenshot_for_model",
+        lambda _self: screenshots.pop(0) if screenshots else str(tmp_path / "same-model-last.png"),
+    )
+
+    result = asyncio.run(service.deploy_computer_agent(task="Inspect the screen"))
+
+    assert "screen inspected" in result
+    assert provider.current_model == "main-model"
+    assert provider.events == []
 
 
 def test_delegated_result_resumes_originating_chat(tmp_path):

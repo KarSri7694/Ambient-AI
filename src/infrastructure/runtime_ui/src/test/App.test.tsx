@@ -14,6 +14,7 @@ function renderApp() {
 describe("runtime shell", () => {
   beforeEach(() => {
     window.history.replaceState({}, "", "/chat");
+    localStorage.clear();
     vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
       const path = String(input);
       if (path.includes("/api/privacy/status")) return json({ capture: { paused: false }, capture_size_bytes: 0 });
@@ -40,8 +41,9 @@ describe("runtime shell", () => {
     window.history.replaceState({}, "", "/");
     renderApp();
     expect(await screen.findByText("Your ambient day")).toBeInTheDocument();
-    expect(await screen.findByRole("heading", { name: "Nothing important changed yet" })).toBeInTheDocument();
+    expect(await screen.findByText("Nothing important changed yet")).toBeInTheDocument();
     expect(await screen.findByText("I have not completed any meaningful work yet.")).toBeInTheDocument();
+    expect(fetch).toHaveBeenCalledWith("/api/home", expect.objectContaining({ cache: "no-store" }));
     expect(screen.getAllByRole("button", { name: "Home" })[0]).toHaveAttribute("aria-current", "page");
   });
 

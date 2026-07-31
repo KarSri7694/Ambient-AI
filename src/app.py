@@ -30,6 +30,7 @@ from application.services.user_context_service import UserContextService
 from application.services.autonomy_coordinator_service import AutonomyCoordinatorService
 from application.services.artifact_maintenance_service import ArtifactMaintenanceService
 from application.services.daily_briefing_service import DailyBriefingService
+from application.services.proactive_sweep_service import ProactiveSweepService
 from application.services.capability_policy_service import AutonomyBudget, CapabilityPolicyService
 from application.services.opportunity_judgment_service import OpportunityJudgmentService
 from application.services.capture_control_service import CaptureControlService
@@ -38,6 +39,7 @@ from application.services.resource_governor_service import (
     ResourceGovernorService,
     ResourceUnavailableError,
 )
+from application.services.runtime_interrupt_service import RuntimeInterruptController, WorkInterrupted
 from core.models import InferenceRequest
 from audio_agent import AudioAgentService
 from infrastructure.adapter.LlamaCppSemanticAdapter import LlamaCppSemanticAdapter
@@ -79,6 +81,7 @@ logger = logging.getLogger(__name__)
 API_BASE_URL = CONFIG.get_str("runtime", "api_base_url", "http://localhost:8080")
 API_KEY = CONFIG.get_str("runtime", "api_key", "testkey")
 MODEL_LOAD_TIMEOUT_SECONDS = CONFIG.get_float("runtime", "model_load_timeout_seconds", 600.0)
+MAX_GENERATION_TOKENS = CONFIG.get_int("runtime", "max_generation_tokens", 60000)
 VISION_API_BASE_URL = CONFIG.get_str("vision_runtime", "api_base_url", "").strip()
 VISION_API_KEY = CONFIG.get_str("vision_runtime", "api_key", "").strip() or API_KEY
 VISION_PRELOAD = CONFIG.get_bool("vision_runtime", "preload", True)
@@ -212,6 +215,9 @@ FILESYSTEM_MAX_LIST_ENTRIES = CONFIG.get_int("filesystem", "max_list_entries", 2
 COMPUTER_ENABLED = CONFIG.get_bool("computer", "enabled", False)
 COMPUTER_TASK_TIMEOUT_SECONDS = CONFIG.get_float("computer", "task_timeout_seconds", 180.0)
 COMPUTER_MAX_ACTIONS_PER_TASK = CONFIG.get_int("computer", "max_actions_per_task", 40)
+COMPUTER_SCREENSHOT_DIR = CONFIG.get_str(
+    "computer", "screenshot_dir", str(USER_DATA_DIR / "computer" / "screenshots")
+)
 from infrastructure.plain_capture_store import PlainCaptureStore
 CHAT_HISTORY_MESSAGE_LIMIT = CONFIG.get_int("chat", "history_message_limit", 40)
 CHAT_STREAM_CHECKPOINT_SECONDS = CONFIG.get_float("chat", "stream_checkpoint_seconds", 0.25)
@@ -288,6 +294,14 @@ AUTONOMY_MAX_TOOL_CALLS_PER_HOUR = CONFIG.get_int("autonomy", "max_tool_calls_pe
 AUTONOMY_MAX_WEB_QUERIES_PER_DAY = CONFIG.get_int("autonomy", "max_web_queries_per_day", 60)
 AUTONOMY_MAX_INBOX_ITEMS_PER_DAY = CONFIG.get_int("autonomy", "max_inbox_items_per_day", 30)
 AUTONOMY_APPROVAL_TTL_MINUTES = CONFIG.get_int("autonomy", "approval_ttl_minutes", 30)
+PROACTIVE_AUTONOMY_ENABLED = CONFIG.get_bool("proactive_autonomy", "enabled", False)
+PROACTIVE_AUTONOMY_GLOBAL_GRANT = CONFIG.get_bool("proactive_autonomy", "global_grant", False)
+PROACTIVE_AUTONOMY_MODEL = CONFIG.get_model("model", FOLLOWUP_EXECUTION_MODEL, section="proactive_autonomy")
+PROACTIVE_AUTONOMY_CADENCE_MINUTES = CONFIG.get_int("proactive_autonomy", "cadence_minutes", 60)
+PROACTIVE_AUTONOMY_MAX_SWEEPS_PER_DAY = CONFIG.get_int("proactive_autonomy", "max_sweeps_per_day", 8)
+PROACTIVE_AUTONOMY_MAX_FINDINGS = CONFIG.get_int("proactive_autonomy", "max_findings_per_sweep", 10)
+PROACTIVE_AUTONOMY_MINIMUM_IMPORTANCE = CONFIG.get_str("proactive_autonomy", "minimum_importance", "medium")
+PROACTIVE_AUTONOMY_MAX_SOURCE_SECONDS = CONFIG.get_float("proactive_autonomy", "max_source_seconds", 180.0)
 CAPTURE_STORAGE_ROOT = Path(
     CONFIG.get_str("privacy", "capture_root", str(USER_DATA_DIR / "captures"))
 )
@@ -297,6 +311,9 @@ RESOURCE_CRITICAL_RAM_PERCENT = CONFIG.get_float("resource_governor", "critical_
 RESOURCE_CRITICAL_VRAM_MB = CONFIG.get_int("resource_governor", "critical_vram_mb", 512)
 RESOURCE_RECOVERY_STABLE_SECONDS = CONFIG.get_float("resource_governor", "recovery_stable_seconds", 30.0)
 RESOURCE_TRANSITION_COOLDOWN_SECONDS = CONFIG.get_float("resource_governor", "transition_cooldown_seconds", 60.0)
+RESOURCE_KEEP_ACTIVE_MODEL_RESIDENT = CONFIG.get_bool(
+    "resource_governor", "keep_active_model_resident", True
+)
 RESOURCE_BATCH_MAX_EVENTS = CONFIG.get_int("resource_governor", "batch_max_events", 8)
 RESOURCE_BATCH_MAX_SECONDS = CONFIG.get_float("resource_governor", "batch_max_seconds", 90.0)
 RESOURCE_DEFER_SECONDS = CONFIG.get_int("resource_governor", "defer_seconds", 30)
@@ -340,6 +357,16 @@ BROWSER_DENIED_TOOL_NAMES = set(
 )
 BROWSER_BLOCKED_DOMAINS = _parse_json_list("browser", "blocked_domains_json")
 BROWSER_BLOCKED_PATH_MARKERS = _parse_json_list("browser", "blocked_path_markers_json")
+PROACTIVE_AUTONOMY_SOURCES = _parse_json_list("proactive_autonomy", "enabled_sources_json") or [
+    item.strip()
+    for item in CONFIG.get_str(
+        "proactive_autonomy",
+        "enabled_sources",
+        "gmail,calendar,browser_research,whatsapp,filesystem",
+    ).split(",")
+    if item.strip()
+]
+PROACTIVE_AUTONOMY_FILESYSTEM_PATHS = _parse_json_list("proactive_autonomy", "filesystem_paths_json")
 
 configure_runtime_log_streaming(max_entries=LOG_API_BUFFER_SIZE, debug_enabled=DEBUG_MODE)
 
@@ -464,6 +491,7 @@ class AmbientRuntime:
         }
         self._artifact_maintenance_retry_after = 0.0
         self._daily_briefing_service: DailyBriefingService | None = None
+        self.interrupt_controller = RuntimeInterruptController()
         if self.chat_event_broker is not None:
             self.chat_event_broker.set_turn_enqueued_callback(self._notify_chat_queued)
 
@@ -480,6 +508,14 @@ class AmbientRuntime:
         self.stop_event.set()
         self._screenshot_capture_stop_event.set()
         self._notify_chat_queued()
+
+    def request_interrupt(self, reason: str = "Interrupted by local user") -> dict:
+        status = self.interrupt_controller.request_interrupt(reason)
+        self._notify_chat_queued()
+        return {"ok": True, "accepted": True, "status": status}
+
+    def interrupt_status(self) -> dict:
+        return self.interrupt_controller.status()
 
     def request_reflection(self) -> dict:
         now = datetime.now(timezone.utc).isoformat()
@@ -640,7 +676,7 @@ class AmbientRuntime:
         services_initialized: bool,
         reason: str,
     ) -> bool:
-        """Restore only the configured tiny chat model when memory is healthy."""
+        """Settle residency after work without reloading an already useful model."""
         try:
             # Keep the legacy model-manager port usable for focused unit tests and
             # external adapters. Production always supplies ModelResidencyManager.
@@ -649,9 +685,19 @@ class AmbientRuntime:
                 services_initialized = True
                 self.llm_active_event.set()
             elif not LIGHTWEIGHT_CHAT_MODEL:
-                if services_initialized and hasattr(llm_adapter, "ensure_lightweight_resident"):
+                if (
+                    services_initialized
+                    and not getattr(llm_adapter, "keep_active_model_resident", False)
+                    and hasattr(llm_adapter, "ensure_lightweight_resident")
+                ):
                     await self._release_llm(llm_adapter)
                     services_initialized = False
+                elif getattr(llm_adapter, "keep_active_model_resident", False):
+                    services_initialized = bool(llm_adapter.status().get("loaded_model"))
+                    if services_initialized:
+                        self.llm_active_event.set()
+                    else:
+                        self.llm_active_event.clear()
             else:
                 services_initialized = await llm_adapter.ensure_lightweight_resident(
                     user_active=True,
@@ -794,6 +840,7 @@ class AmbientRuntime:
             api_key=API_KEY,
             model_load_timeout_seconds=MODEL_LOAD_TIMEOUT_SECONDS,
             isolated_model_tracking=True,
+            default_max_tokens=MAX_GENERATION_TOKENS,
         )
         autonomy_store = SQLiteAutonomyAdapter(str(AUTONOMY_DB_PATH))
         if self.resource_governor.audit is None:
@@ -802,6 +849,7 @@ class AmbientRuntime:
             provider=raw_llm_adapter,
             governor=self.resource_governor,
             lightweight_chat_model=LIGHTWEIGHT_CHAT_MODEL,
+            keep_active_model_resident=RESOURCE_KEEP_ACTIVE_MODEL_RESIDENT,
             recovery_stable_seconds=RESOURCE_RECOVERY_STABLE_SECONDS,
             transition_cooldown_seconds=RESOURCE_TRANSITION_COOLDOWN_SECONDS,
         )
@@ -826,6 +874,7 @@ class AmbientRuntime:
                 api_key=VISION_API_KEY,
                 model_load_timeout_seconds=VISION_MODEL_LOAD_TIMEOUT_SECONDS,
                 isolated_model_tracking=True,
+                default_max_tokens=MAX_GENERATION_TOKENS,
             )
             vision_llm = LoggingLLMProvider(
                 provider=vision_raw_llm,
@@ -859,6 +908,7 @@ class AmbientRuntime:
                 blocked_domains=BROWSER_BLOCKED_DOMAINS,
                 blocked_path_markers=BROWSER_BLOCKED_PATH_MARKERS,
                 screenshot_retention=BROWSER_SCREENSHOT_RETENTION,
+                interrupt_checker=self.interrupt_controller.check,
             )
         elif BROWSER_BACKEND == "playwright_mcp":
             browser_tool_bridge = BrowserMCPToolAdapter(
@@ -924,6 +974,7 @@ class AmbientRuntime:
             computer_agent_model=COMPUTER_AGENT_MODEL,
             computer_task_timeout_seconds=COMPUTER_TASK_TIMEOUT_SECONDS,
             computer_max_actions_per_task=COMPUTER_MAX_ACTIONS_PER_TASK,
+            computer_screenshot_dir=COMPUTER_SCREENSHOT_DIR,
             computer_enabled=COMPUTER_ENABLED,
             local_control_approval_ttl_minutes=AUTONOMY_APPROVAL_TTL_MINUTES,
             scheduled_task_service=scheduled_task_service,
@@ -936,6 +987,7 @@ class AmbientRuntime:
             artifact_full_candidate_limit=ARTIFACT_FULL_CANDIDATE_LIMIT,
             artifact_max_existing_chars=ARTIFACT_MAX_EXISTING_CHARS,
             semantic_memory=semantic_memory,
+            interrupt_checker=self.interrupt_controller.check,
         )
         self._artifact_maintenance_service = (
             ArtifactMaintenanceService(
@@ -948,6 +1000,7 @@ class AmbientRuntime:
                 candidate_neighbors=ARTIFACT_MAINTENANCE_CANDIDATE_NEIGHBORS,
                 confidence_threshold=ARTIFACT_MAINTENANCE_CONFIDENCE,
                 archive_dir=ARTIFACT_ARCHIVE_DIR,
+                interrupt_checker=self.interrupt_controller.check,
             )
             if ARTIFACT_MAINTENANCE_ENABLED and llm_service.artifact_organizer is not None
             else None
@@ -986,6 +1039,7 @@ class AmbientRuntime:
                 cadence_mode=REFLECTION_CADENCE_MODE,
                 interval_hours=REFLECTION_INTERVAL_HOURS,
                 max_generated_tasks=REFLECTION_MAX_GENERATED_TASKS,
+                interrupt_checker=self.interrupt_controller.check,
             )
             if REFLECTION_ENABLED
             else None
@@ -1016,6 +1070,7 @@ class AmbientRuntime:
                 memory=memory_store,
                 llm_provider=logged_llm,
                 semantic_memory=semantic_memory,
+                interrupt_checker=self.interrupt_controller.check,
             )
             if PASSIVE_OBSERVER_ENABLED
             else None
@@ -1065,6 +1120,7 @@ class AmbientRuntime:
                 capture_store=self.capture_store,
                 persist_payloads=AUTONOMY_COORDINATOR_ENABLED,
                 capture_control=self.capture_control,
+                interrupt_checker=self.interrupt_controller.check,
             )
             if PASSIVE_OBSERVER_ENABLED
             else None
@@ -1089,6 +1145,7 @@ class AmbientRuntime:
                 capture_store=self.capture_store,
                 persist_payloads=AUTONOMY_COORDINATOR_ENABLED,
                 capture_control=self.capture_control,
+                interrupt_checker=self.interrupt_controller.check,
             )
             if PASSIVE_OBSERVER_ENABLED and PASSIVE_OBSERVER_DEEP_ENRICHMENT_ENABLED
             else None
@@ -1114,6 +1171,23 @@ class AmbientRuntime:
             if AUTONOMY_COORDINATOR_ENABLED
             else None
         )
+        proactive_sweep_service = ProactiveSweepService(
+            autonomy_store=autonomy_store,
+            llm_service=llm_service,
+            capability_policy=capability_policy,
+            semantic_dedupe_service=semantic_dedupe,
+            user_context_service=user_context_service,
+            model=PROACTIVE_AUTONOMY_MODEL,
+            enabled=PROACTIVE_AUTONOMY_ENABLED,
+            global_grant=PROACTIVE_AUTONOMY_GLOBAL_GRANT,
+            enabled_sources=PROACTIVE_AUTONOMY_SOURCES,
+            cadence_minutes=PROACTIVE_AUTONOMY_CADENCE_MINUTES,
+            max_sweeps_per_day=PROACTIVE_AUTONOMY_MAX_SWEEPS_PER_DAY,
+            max_findings_per_sweep=PROACTIVE_AUTONOMY_MAX_FINDINGS,
+            minimum_importance=PROACTIVE_AUTONOMY_MINIMUM_IMPORTANCE,
+            max_source_seconds=PROACTIVE_AUTONOMY_MAX_SOURCE_SECONDS,
+            filesystem_paths=PROACTIVE_AUTONOMY_FILESYSTEM_PATHS,
+        )
         self._passive_observer = passive_observer
         return (
             residency_manager,
@@ -1132,6 +1206,7 @@ class AmbientRuntime:
             autonomy_store,
             autonomy_coordinator,
             user_context_service,
+            proactive_sweep_service,
         )
 
     def _start_screenshot_capture_loop(
@@ -1275,36 +1350,43 @@ class AmbientRuntime:
             self._publish_chat_event(message_id, event)
 
         try:
-            services_initialized = await self._ensure_runtime(
-                llm_adapter=llm_adapter,
-                services_initialized=services_initialized,
-                reason="answering direct chat message",
-                model_name=chat_model,
+            active_work = self.interrupt_controller.active(
+                kind="direct_chat",
+                chat_session_id=session_id,
+                chat_message_id=message_id,
+                model=chat_model,
             )
-            history = self.chat_store.conversation_history(
-                session_id,
-                before_message_id=user_message["id"],
-                limit=CHAT_HISTORY_MESSAGE_LIMIT,
-            )
-            llm_service.restore_conversation(
-                system_prompt=self.CHAT_SYSTEM_PROMPT,
-                messages=history,
-            )
-            with interaction_trace(
-                "direct_chat",
-                {
-                    "chat_session_id": session_id,
-                    "chat_message_id": message_id,
-                },
-            ):
-                with self.gpu_lock:
-                    result = await llm_service.run_interaction(
-                        user_input=user_message["content"],
-                        system_prompt=self.CHAT_SYSTEM_PROMPT,
-                        model=chat_model,
-                        report_policy="silent",
-                        event_callback=on_event,
-                    )
+            with active_work:
+                services_initialized = await self._ensure_runtime(
+                    llm_adapter=llm_adapter,
+                    services_initialized=services_initialized,
+                    reason="answering direct chat message",
+                    model_name=chat_model,
+                )
+                history = self.chat_store.conversation_history(
+                    session_id,
+                    before_message_id=user_message["id"],
+                    limit=CHAT_HISTORY_MESSAGE_LIMIT,
+                )
+                llm_service.restore_conversation(
+                    system_prompt=self.CHAT_SYSTEM_PROMPT,
+                    messages=history,
+                )
+                with interaction_trace(
+                    "direct_chat",
+                    {
+                        "chat_session_id": session_id,
+                        "chat_message_id": message_id,
+                    },
+                ):
+                    with self.gpu_lock:
+                        result = await llm_service.run_interaction(
+                            user_input=user_message["content"],
+                            system_prompt=self.CHAT_SYSTEM_PROMPT,
+                            model=chat_model,
+                            report_policy="silent",
+                            event_callback=on_event,
+                        )
             self.chat_store.complete_message(message_id, result)
             self._chat_resource_backoff_until = 0.0
             self._publish_chat_event(
@@ -1330,6 +1412,11 @@ class AmbientRuntime:
                     "delegation_id": suspended.delegation_id,
                 },
             )
+        except WorkInterrupted as exc:
+            reason = exc.reason or str(exc) or "Interrupted by local user"
+            self._chat_resource_backoff_until = 0.0
+            self.chat_store.fail_message(message_id, reason)
+            self._publish_chat_event(message_id, {"type": "error", "error": reason})
         except ResourceUnavailableError as exc:
             self._chat_resource_backoff_until = time.monotonic() + RESOURCE_DEFER_SECONDS
             self.chat_store.defer_message(message_id, f"Queued until resources are available: {exc}")
@@ -1522,14 +1609,15 @@ class AmbientRuntime:
             )
         logger.info("Manual reflection run requested from runtime UI.")
         try:
-            services_initialized = await self._ensure_runtime(
-                llm_adapter=llm_adapter,
-                services_initialized=services_initialized,
-                reason="running manually requested reflection service",
-                model_name=REFLECTION_MODEL,
-            )
-            with self.gpu_lock:
-                result = await reflection_service.run(model=REFLECTION_MODEL)
+            with self.interrupt_controller.active(kind="manual_reflection", model=REFLECTION_MODEL):
+                services_initialized = await self._ensure_runtime(
+                    llm_adapter=llm_adapter,
+                    services_initialized=services_initialized,
+                    reason="running manually requested reflection service",
+                    model_name=REFLECTION_MODEL,
+                )
+                with self.gpu_lock:
+                    result = await reflection_service.run(model=REFLECTION_MODEL)
             logger.info(
                 "Manual reflection completed: generated=%s queued=%s skipped=%s.",
                 len(result.get("generated_tasks", [])),
@@ -1550,6 +1638,18 @@ class AmbientRuntime:
                             "skipped_count": len(result.get("skipped_tasks", [])),
                         },
                         "last_error": None,
+                    }
+                )
+        except WorkInterrupted as exc:
+            reason = exc.reason or str(exc) or "Interrupted by local user"
+            logger.info("Manual reflection run interrupted: %s", reason)
+            with self._manual_reflection_lock:
+                self._manual_reflection_status.update(
+                    {
+                        "running": False,
+                        "last_finished_at": datetime.now(timezone.utc).isoformat(),
+                        "last_result": {"reason": "interrupted"},
+                        "last_error": reason,
                     }
                 )
         except Exception as exc:
@@ -1599,24 +1699,25 @@ class AmbientRuntime:
             )
         logger.info("Manual User BioData update requested from runtime UI.")
         try:
-            if not user_biodata_service.has_pending_biodata_observations():
-                result = {
-                    "processed_observation_ids": [],
-                    "entries": [],
-                    "reason": "no biodata-pending observations",
-                }
-            else:
-                services_initialized = await self._ensure_runtime(
-                    llm_adapter=llm_adapter,
-                    services_initialized=services_initialized,
-                    reason="running manually requested User BioData update",
-                    model_name=USER_BIODATA_MODEL,
-                    role="manual_biodata_update",
-                    background=False,
-                    user_active=True,
-                )
-                with self.gpu_lock:
-                    result = await user_biodata_service.update_biodata(model=USER_BIODATA_MODEL)
+            with self.interrupt_controller.active(kind="manual_biodata_update", model=USER_BIODATA_MODEL):
+                if not user_biodata_service.has_pending_biodata_observations():
+                    result = {
+                        "processed_observation_ids": [],
+                        "entries": [],
+                        "reason": "no biodata-pending observations",
+                    }
+                else:
+                    services_initialized = await self._ensure_runtime(
+                        llm_adapter=llm_adapter,
+                        services_initialized=services_initialized,
+                        reason="running manually requested User BioData update",
+                        model_name=USER_BIODATA_MODEL,
+                        role="manual_biodata_update",
+                        background=False,
+                        user_active=True,
+                    )
+                    with self.gpu_lock:
+                        result = await user_biodata_service.update_biodata(model=USER_BIODATA_MODEL)
             processed_count = len(result.get("processed_observation_ids", []))
             entry_count = len(result.get("entries", []))
             logger.info(
@@ -1636,6 +1737,18 @@ class AmbientRuntime:
                             "reason": result.get("reason"),
                         },
                         "last_error": None,
+                    }
+                )
+        except WorkInterrupted as exc:
+            reason = exc.reason or str(exc) or "Interrupted by local user"
+            logger.info("Manual User BioData update interrupted: %s", reason)
+            with self._manual_biodata_lock:
+                self._manual_biodata_status.update(
+                    {
+                        "running": False,
+                        "last_finished_at": datetime.now(timezone.utc).isoformat(),
+                        "last_result": {"reason": "interrupted"},
+                        "last_error": reason,
                     }
                 )
         except Exception as exc:
@@ -1690,17 +1803,22 @@ class AmbientRuntime:
             )
         logger.info("Starting %s artifact-library maintenance.", trigger_kind)
         try:
-            services_initialized = await self._ensure_runtime(
-                llm_adapter=llm_adapter,
-                services_initialized=services_initialized,
-                reason=f"running {trigger_kind} artifact-library maintenance",
-                model_name=ARTIFACT_MAINTENANCE_MODEL,
-                role="artifact_maintenance",
-                background=not manual,
-                user_active=user_active,
-            )
-            with self.gpu_lock:
-                result = await service.run(trigger_kind=trigger_kind)
+            with self.interrupt_controller.active(
+                kind="artifact_maintenance",
+                trigger_kind=trigger_kind,
+                model=ARTIFACT_MAINTENANCE_MODEL,
+            ):
+                services_initialized = await self._ensure_runtime(
+                    llm_adapter=llm_adapter,
+                    services_initialized=services_initialized,
+                    reason=f"running {trigger_kind} artifact-library maintenance",
+                    model_name=ARTIFACT_MAINTENANCE_MODEL,
+                    role="artifact_maintenance",
+                    background=not manual,
+                    user_active=user_active,
+                )
+                with self.gpu_lock:
+                    result = await service.run(trigger_kind=trigger_kind)
             self._artifact_maintenance_retry_after = 0.0
             with self._artifact_maintenance_lock:
                 self._artifact_maintenance_status.update(
@@ -1717,6 +1835,19 @@ class AmbientRuntime:
                 result.get("archived_count", 0),
                 result.get("candidate_pair_count", 0),
             )
+        except WorkInterrupted as exc:
+            reason = exc.reason or str(exc) or "Interrupted by local user"
+            self._artifact_maintenance_retry_after = 0.0
+            logger.info("Artifact-library maintenance interrupted: %s", reason)
+            with self._artifact_maintenance_lock:
+                self._artifact_maintenance_status.update(
+                    {
+                        "running": False,
+                        "last_finished_at": datetime.now(timezone.utc).isoformat(),
+                        "last_result": {"reason": "interrupted"},
+                        "last_error": reason,
+                    }
+                )
         except Exception as exc:
             self._artifact_maintenance_retry_after = time.monotonic() + 60.0
             logger.exception("Artifact-library maintenance failed.")
@@ -1743,19 +1874,24 @@ class AmbientRuntime:
         if not user_biodata_service.has_pending_biodata_observations():
             return False, services_initialized
 
-        services_initialized = await self._ensure_runtime(
-            llm_adapter=llm_adapter,
-            services_initialized=services_initialized,
-            reason="updating user biodata from passive observations",
-            model_name=USER_BIODATA_MODEL,
-            role="ambient_biodata_update",
-            background=True,
-            user_active=user_active,
-        )
-        with self.gpu_lock:
-            biodata_result = await user_biodata_service.update_biodata(
-                model=USER_BIODATA_MODEL
-            )
+        try:
+            with self.interrupt_controller.active(kind="ambient_biodata_update", model=USER_BIODATA_MODEL):
+                services_initialized = await self._ensure_runtime(
+                    llm_adapter=llm_adapter,
+                    services_initialized=services_initialized,
+                    reason="updating user biodata from passive observations",
+                    model_name=USER_BIODATA_MODEL,
+                    role="ambient_biodata_update",
+                    background=True,
+                    user_active=user_active,
+                )
+                with self.gpu_lock:
+                    biodata_result = await user_biodata_service.update_biodata(
+                        model=USER_BIODATA_MODEL
+                    )
+        except WorkInterrupted as exc:
+            logger.info("User BioData update interrupted: %s", exc.reason)
+            return True, services_initialized
         processed_count = len(biodata_result.get("processed_observation_ids", []))
         entry_count = len(biodata_result.get("entries", []))
         if processed_count or entry_count:
@@ -1788,17 +1924,18 @@ class AmbientRuntime:
             return False, services_initialized
 
         try:
-            services_initialized = await self._ensure_runtime(
-                llm_adapter=llm_adapter,
-                services_initialized=services_initialized,
-                reason="running automatic reflection service",
-                model_name=REFLECTION_MODEL,
-                role="automatic_reflection",
-                background=True,
-                user_active=False,
-            )
-            with self.gpu_lock:
-                reflection_result = await reflection_service.run_if_due(model=REFLECTION_MODEL)
+            with self.interrupt_controller.active(kind="automatic_reflection", model=REFLECTION_MODEL):
+                services_initialized = await self._ensure_runtime(
+                    llm_adapter=llm_adapter,
+                    services_initialized=services_initialized,
+                    reason="running automatic reflection service",
+                    model_name=REFLECTION_MODEL,
+                    role="automatic_reflection",
+                    background=True,
+                    user_active=False,
+                )
+                with self.gpu_lock:
+                    reflection_result = await reflection_service.run_if_due(model=REFLECTION_MODEL)
             self._automatic_reflection_retry_after = 0.0
             ran = bool(reflection_result.get("ran"))
             if ran:
@@ -1814,6 +1951,10 @@ class AmbientRuntime:
         except ResourceUnavailableError as exc:
             self._automatic_reflection_retry_after = time.monotonic() + RESOURCE_DEFER_SECONDS
             logger.info("Automatic reflection deferred by resource governor: %s", exc.decision.reason)
+            return True, services_initialized
+        except WorkInterrupted as exc:
+            self._automatic_reflection_retry_after = 0.0
+            logger.info("Automatic reflection interrupted: %s", exc.reason)
             return True, services_initialized
         except Exception:
             self._automatic_reflection_retry_after = time.monotonic() + 60.0
@@ -1851,6 +1992,7 @@ class AmbientRuntime:
             autonomy_store,
             autonomy_coordinator,
             user_context_service,
+            proactive_sweep_service,
         ) = self._build_services()
         idle_cycle_interval = 30
         passive_observer_interval = PASSIVE_OBSERVER_CAPTURE_INTERVAL_SECONDS
@@ -2244,7 +2386,8 @@ class AmbientRuntime:
                             continue
                     try:
                         with self.gpu_lock:
-                            visual_result = await autonomy_coordinator.process_next_visual()
+                            with self.interrupt_controller.active(kind="visual_perception", model=PASSIVE_OBSERVER_MODEL):
+                                visual_result = await autonomy_coordinator.process_next_visual()
                         if visual_result.get("processed"):
                             biodata_context_events_since_update += 1
                             logger.info(
@@ -2321,17 +2464,21 @@ class AmbientRuntime:
                                                 "resource_deferred": True,
                                             }
                                         else:
-                                            autonomy_result = await autonomy_coordinator.process_batch(
+                                            with self.interrupt_controller.active(
+                                                kind="autonomy_backlog",
                                                 model=FOLLOWUP_EXECUTION_MODEL,
-                                                llm_service=llm_service,
-                                                personalization_context=user_context_service.build_prompt_context(
-                                                    include_semantic=True,
-                                                    max_chars=PERSONALIZATION_PROMPT_CONTEXT_CHARS,
-                                                ),
-                                                max_events=RESOURCE_BATCH_MAX_EVENTS,
-                                                max_seconds=RESOURCE_BATCH_MAX_SECONDS,
-                                                should_preempt=self._chat_turn_ready,
-                                            )
+                                            ):
+                                                autonomy_result = await autonomy_coordinator.process_batch(
+                                                    model=FOLLOWUP_EXECUTION_MODEL,
+                                                    llm_service=llm_service,
+                                                    personalization_context=user_context_service.build_prompt_context(
+                                                        include_semantic=True,
+                                                        max_chars=PERSONALIZATION_PROMPT_CONTEXT_CHARS,
+                                                    ),
+                                                    max_events=RESOURCE_BATCH_MAX_EVENTS,
+                                                    max_seconds=RESOURCE_BATCH_MAX_SECONDS,
+                                                    should_preempt=self._chat_turn_ready,
+                                                )
                             if autonomy_result.get("processed"):
                                 context_event_count = sum(
                                     1
@@ -2366,14 +2513,9 @@ class AmbientRuntime:
                                         autonomy_coordinator.event_counts(),
                                     )
                             else:
-                                services_initialized = await self._release_runtime(
-                                    llm_adapter=llm_adapter,
-                                    services_initialized=bool(llm_adapter.status().get("loaded_model")),
-                                    reason="ambient backlog drained or chat preempted",
-                                )
                                 services_initialized = await self._restore_chat_residency(
                                     llm_adapter=llm_adapter,
-                                    services_initialized=services_initialized,
+                                    services_initialized=bool(llm_adapter.status().get("loaded_model")),
                                     reason="ambient backlog drained or chat preempted",
                                 )
                         if autonomy_result.get("processed"):
@@ -2477,6 +2619,44 @@ class AmbientRuntime:
                         if await self._sleep_or_stop(0.1):
                             break
                         continue
+
+                if (
+                    user_idle_now
+                    and autonomy_coordinator is not None
+                    and not autonomy_coordinator.has_ready_work()
+                    and proactive_sweep_service is not None
+                    and proactive_sweep_service.is_due()
+                    and not self._chat_turn_ready()
+                ):
+                    try:
+                        services_initialized = await self._ensure_runtime(
+                            llm_adapter=llm_adapter,
+                            services_initialized=services_initialized,
+                            reason="running idle proactive personal-source sweep",
+                            model_name=PROACTIVE_AUTONOMY_MODEL,
+                            role="proactive_sweep",
+                            background=True,
+                            user_active=False,
+                        )
+                        with self.gpu_lock:
+                            sweep_result = await proactive_sweep_service.run_if_due()
+                        if sweep_result.get("ran"):
+                            logger.info("Idle proactive sweep result: %s", sweep_result)
+                    except ResourceUnavailableError as exc:
+                        logger.info(
+                            "Idle proactive sweep deferred by resource governor: %s",
+                            exc.decision.reason,
+                        )
+                    except Exception:
+                        logger.exception("Idle proactive sweep failed.")
+                    services_initialized = await self._restore_chat_residency(
+                        llm_adapter=llm_adapter,
+                        services_initialized=services_initialized,
+                        reason="idle proactive sweep finished",
+                    )
+                    if await self._sleep_or_stop(0.1):
+                        break
+                    continue
 
                 if autonomy_coordinator is None and runtime_active_now and now - last_idle_cycle_at >= idle_cycle_interval:
                     idle_unit_attempted = False

@@ -1245,6 +1245,29 @@ def create_runtime_log_app(
             payload["event_counts"] = autonomy_store.event_counts()
         return payload
 
+    @app.get("/api/runtime/interrupt/status")
+    def runtime_interrupt_status() -> dict[str, Any]:
+        if runtime_control is None or not hasattr(runtime_control, "interrupt_status"):
+            raise HTTPException(status_code=503, detail="runtime_control_unavailable")
+        return {"ok": True, "status": runtime_control.interrupt_status()}
+
+    @app.post("/api/runtime/interrupt")
+    async def request_runtime_interrupt(request: Request) -> dict[str, Any]:
+        if runtime_control is None or not hasattr(runtime_control, "request_interrupt"):
+            raise HTTPException(status_code=503, detail="runtime_control_unavailable")
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        reason = str(body.get("reason") or "Interrupted from runtime UI").strip()
+        result = runtime_control.request_interrupt(reason=reason)
+        if autonomy_store is not None and hasattr(autonomy_store, "audit"):
+            try:
+                autonomy_store.audit("runtime_ui", "runtime_interrupt_requested", None, {"reason": reason})
+            except Exception:
+                pass
+        return result
+
     @app.put("/api/runtime/resource-policy")
     async def update_runtime_resource_policy(request: Request) -> dict[str, Any]:
         if resource_governor is None:

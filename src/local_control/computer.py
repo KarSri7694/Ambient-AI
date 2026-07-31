@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import ctypes
+import json
 import threading
 import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from local_control.safety import ComputerControlTerminated, UnsafeComputerAction
@@ -60,11 +64,21 @@ class ComputerControlSession:
     SAFE_KEYS = {
         "enter", "tab", "esc", "escape", "backspace", "delete", "space",
         "left", "right", "up", "down", "home", "end", "pageup", "pagedown",
+        "win", "command", "ctrl", "control", "alt", "shift",
     }
 
-    def __init__(self, *, max_actions: int = 40):
+    def __init__(
+        self,
+        *,
+        max_actions: int = 40,
+        screenshot_dir: str | Path = ".ambient_data/computer/screenshots",
+        read_only: bool = False,
+    ):
         self.max_actions = max(1, int(max_actions))
         self.actions = 0
+        self.screenshot_dir = Path(screenshot_dir)
+        self.last_screenshot_path = ""
+        self.read_only = bool(read_only)
         self.stop = EmergencyStopController()
         self.stop.start()
         self._allowed_tool_names = {
@@ -72,19 +86,40 @@ class ComputerControlSession:
             "computer_move_mouse",
             "computer_click",
             "computer_scroll",
-            "computer_type_text",
-            "computer_press_key",
         }
+        if not self.read_only:
+            self._allowed_tool_names.update({"computer_type_text", "computer_press_key"})
 
     async def get_all_tools(self) -> list[dict[str, Any]]:
-        return [
-            self._tool("computer_inspect", "Inspect the active foreground window using UI Automation.", {}, []),
-            self._tool("computer_move_mouse", "Move the mouse to absolute screen coordinates.", {"x": {"type": "integer"}, "y": {"type": "integer"}}, ["x", "y"]),
-            self._tool("computer_click", "Click at absolute screen coordinates.", {"x": {"type": "integer"}, "y": {"type": "integer"}}, ["x", "y"]),
+        tools = [
+            self._tool(
+                "computer_inspect",
+                "Return current visual-observation metadata. A fresh screenshot is automatically attached to every computer-use model turn; use that screenshot for inspection instead of UI Automation.",
+                {},
+                [],
+            ),
+            self._tool(
+                "computer_move_mouse",
+                "Move the mouse using Gemma-normalized screen coordinates. x and y are integers from 0 to 1000, where (0,0) is top-left and (1000,1000) is bottom-right.",
+                {"x": {"type": "integer"}, "y": {"type": "integer"}},
+                ["x", "y"],
+            ),
+            self._tool(
+                "computer_click",
+                "Click using Gemma-normalized screen coordinates. x and y are integers from 0 to 1000, where (0,0) is top-left and (1000,1000) is bottom-right.",
+                {"x": {"type": "integer"}, "y": {"type": "integer"}},
+                ["x", "y"],
+            ),
             self._tool("computer_scroll", "Scroll the active view by a bounded amount.", {"amount": {"type": "integer"}}, ["amount"]),
-            self._tool("computer_type_text", "Type text into the currently focused field.", {"text": {"type": "string"}}, ["text"]),
-            self._tool("computer_press_key", "Press a single safe key.", {"key": {"type": "string"}}, ["key"]),
         ]
+        if not self.read_only:
+            tools.extend(
+                [
+                    self._tool("computer_type_text", "Type text into the currently focused field.", {"text": {"type": "string"}}, ["text"]),
+                    self._tool("computer_press_key", "Press a single safe key.", {"key": {"type": "string"}}, ["key"]),
+                ]
+            )
+        return tools
 
     async def execute_tool(self, tool_name: str, tool_args: dict[str, Any]) -> str:
         self._before_action(tool_name)
@@ -92,9 +127,11 @@ class ComputerControlSession:
             if tool_name == "computer_inspect":
                 result = self._inspect()
             elif tool_name == "computer_move_mouse":
-                result = self._pyautogui_call("moveTo", int(tool_args.get("x")), int(tool_args.get("y")))
+                x, y = self._scale_normalized_coordinate(tool_args.get("x"), tool_args.get("y"))
+                result = self._pyautogui_call("moveTo", x, y)
             elif tool_name == "computer_click":
-                result = self._pyautogui_call("click", int(tool_args.get("x")), int(tool_args.get("y")))
+                x, y = self._scale_normalized_coordinate(tool_args.get("x"), tool_args.get("y"))
+                result = self._pyautogui_call("click", x, y)
             elif tool_name == "computer_scroll":
                 amount = max(-10, min(10, int(tool_args.get("amount"))))
                 result = self._pyautogui_call("scroll", amount)
@@ -141,13 +178,64 @@ class ComputerControlSession:
             raise UnsafeComputerAction("Computer-use action limit reached.")
         self.actions += 1
 
-    def _inspect(self) -> str:
-        try:
-            from infrastructure.adapter.UIATAdapter import UIATAdapter
+    def _scale_normalized_coordinate(self, x_value: Any, y_value: Any) -> tuple[int, int]:
+        width, height = self._screen_size()
+        x_norm = max(0, min(1000, int(x_value)))
+        y_norm = max(0, min(1000, int(y_value)))
+        x = round(x_norm / 1000 * max(0, width - 1))
+        y = round(y_norm / 1000 * max(0, height - 1))
+        return x, y
 
-            return UIATAdapter(mode="screen_content").inspect_foreground_window().__repr__()
+    @staticmethod
+    def _screen_size() -> tuple[int, int]:
+        try:
+            import pyautogui
+            size = pyautogui.size()
         except Exception as exc:
-            return f"Error: foreground inspection failed: {exc}"
+            raise UnsafeComputerAction(f"Cannot resolve screen size for normalized coordinates: {exc}") from exc
+        width = getattr(size, "width", None)
+        height = getattr(size, "height", None)
+        if width is None or height is None:
+            width, height = size
+        width = int(width)
+        height = int(height)
+        if width <= 0 or height <= 0:
+            raise UnsafeComputerAction(f"Invalid screen size reported by pyautogui: {width}x{height}")
+        return width, height
+
+    def _inspect(self) -> str:
+        width = height = None
+        try:
+            width, height = self._screen_size()
+        except Exception:
+            pass
+        return json.dumps(
+            {
+                "status": "ok",
+                "observation": "fresh_screenshot_attached_each_model_turn",
+                "latest_screenshot_path": self.last_screenshot_path,
+                "coordinate_system": "Use normalized 0..1000 x/y coordinates for all mouse actions.",
+                "screen_size": {"width": width, "height": height},
+            },
+            ensure_ascii=False,
+        )
+
+    def capture_screenshot_for_model(self) -> str:
+        self.stop.check()
+        try:
+            import pyautogui
+        except Exception as exc:
+            return f""
+        try:
+            self.screenshot_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+            path = self.screenshot_dir / f"computer-{timestamp}-{uuid.uuid4().hex[:8]}.png"
+            image = pyautogui.screenshot()
+            image.save(path)
+            self.last_screenshot_path = str(path)
+            return str(path)
+        except Exception:
+            return ""
 
     @staticmethod
     def _pyautogui_call(method_name: str, *args: Any) -> str:

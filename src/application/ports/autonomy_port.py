@@ -22,6 +22,7 @@ class AutonomyStorePort(ABC):
 
     @abstractmethod
     def complete_event(self, event_id: str, *, status: str = "processed", error_text: str | None = None) -> None:
+        """Mark an event terminal. Status may include processed, ignored, dead_letter, or interrupted."""
         pass
 
     @abstractmethod

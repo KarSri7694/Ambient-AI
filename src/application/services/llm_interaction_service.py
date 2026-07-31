@@ -27,6 +27,7 @@ from application.services.capability_policy_service import (
     PolicyDeniedError,
 )
 from application.services.artifact_organizer_service import ArtifactOrganizer
+from application.services.runtime_interrupt_service import WorkInterrupted
 from core.models import ApprovalGrant, DelegatedTask
 from local_control.computer import ComputerControlSession
 from local_control.filesystem import FilesystemControlSession
@@ -234,7 +235,10 @@ class LLMInteractionService:
         "\n"
         "Rules:\n"
         "- Perform only the approved task supplied by Ambient AI.\n"
-        "- Inspect the foreground window before interacting and after meaningful actions.\n"
+        "- You receive a fresh full-screen screenshot before every model turn. Treat that screenshot as the current desktop state.\n"
+        "- After each action, wait for the next turn's screenshot before deciding the next action.\n"
+        "- Mouse coordinates must use Gemma-style normalized 0..1000 coordinates, where (0,0) is top-left and (1000,1000) is bottom-right.\n"
+        "- computer_inspect only reports observation metadata; do not rely on UI Automation or accessibility trees.\n"
         "- Do not use shell commands, system shutdown/logout/lock, credential entry, payment, checkout, "
         "or destructive file-manager actions.\n"
         "- Do not bypass authentication, CAPTCHA, two-factor authentication, security warnings, or confirmation screens.\n"
@@ -280,6 +284,7 @@ class LLMInteractionService:
         computer_agent_model: Optional[str] = None,
         computer_task_timeout_seconds: float = 180.0,
         computer_max_actions_per_task: int = 40,
+        computer_screenshot_dir: str = ".ambient_data/computer/screenshots",
         computer_enabled: bool = False,
         local_control_approval_ttl_minutes: int = 30,
         scheduled_task_service: Optional[ScheduledTaskService] = None,
@@ -292,6 +297,7 @@ class LLMInteractionService:
         artifact_full_candidate_limit: int = 3,
         artifact_max_existing_chars: int = 50_000,
         semantic_memory: Optional[Any] = None,
+        interrupt_checker: Optional[Callable[[], None]] = None,
     ):
         self.llm = llm_provider
         self.tool_bridge = tool_bridge
@@ -306,6 +312,7 @@ class LLMInteractionService:
         self.computer_agent_model = computer_agent_model
         self.computer_task_timeout_seconds = computer_task_timeout_seconds
         self.computer_max_actions_per_task = computer_max_actions_per_task
+        self.computer_screenshot_dir = computer_screenshot_dir
         self.computer_enabled = computer_enabled
         self.local_control_approval_ttl_minutes = max(1, int(local_control_approval_ttl_minutes))
         self.scheduled_task_service = scheduled_task_service
@@ -319,6 +326,7 @@ class LLMInteractionService:
         self.reporter_model = reporter_model
         self.capability_policy = capability_policy
         self.semantic_memory = semantic_memory
+        self.interrupt_checker = interrupt_checker
         self.artifact_root = Path(artifact_root) if artifact_root else (self.PARENT_DIR / "artifacts")
         self.artifact_root.mkdir(parents=True, exist_ok=True)
         self.artifact_organizer = (
@@ -337,6 +345,10 @@ class LLMInteractionService:
     @property
     def _frame(self) -> AgentFrame:
         return self._frame_stack[-1]
+
+    def _check_interrupted(self) -> None:
+        if self.interrupt_checker is not None:
+            self.interrupt_checker()
 
     def _push_frame(
         self,
@@ -527,13 +539,22 @@ class LLMInteractionService:
             raise RuntimeError("No browser model is configured.")
 
         async with self._browser_lock:
-            parent_model_name = self.llm.get_current_model() or self._frame.model
+            resident_model_name = self.llm.get_current_model()
+            parent_model_name = resident_model_name or self._frame.model
             if not parent_model_name:
                 raise RuntimeError("Cannot determine the parent model before browser delegation.")
 
-            saved_parent_state = await self.llm.save_and_unload(self._frame.messages)
-            if saved_parent_state is None:
-                raise RuntimeError("Could not save the parent model state; browser task was not started.")
+            model_swapped = resident_model_name != self.browser_agent_model
+            saved_parent_state = None
+            if model_swapped:
+                saved_parent_state = await self.llm.save_and_unload(self._frame.messages)
+                if saved_parent_state is None:
+                    raise RuntimeError("Could not save the parent model state; browser task was not started.")
+            else:
+                self.logger.info(
+                    "Browser agent reusing resident model %s without a model transition.",
+                    self.browser_agent_model,
+                )
 
             browser_session: Optional[BrowserToolSessionPort] = None
             child_frame_pushed = False
@@ -541,6 +562,7 @@ class LLMInteractionService:
             browser_result = ""
             primary_error: Optional[BaseException] = None
             try:
+                self._check_interrupted()
                 if self._retained_browser_sessions:
                     browser_session = self._retained_browser_sessions.pop()
                     self.logger.info("Reusing retained browser session.")
@@ -549,7 +571,9 @@ class LLMInteractionService:
                         headless=self.browser_headless
                     )
                 visual_runner = getattr(browser_session, "run_task", None)
-                await self.llm.load_model(self.browser_agent_model)
+                if model_swapped:
+                    await self.llm.load_model(self.browser_agent_model)
+                self._check_interrupted()
                 if callable(visual_runner):
                     self.logger.info(
                         "Starting Fara visual browser task with model %s.",
@@ -626,14 +650,15 @@ class LLMInteractionService:
                             self.logger.exception("Failed to close browser session.")
 
                 restore_error: Optional[BaseException] = None
-                try:
-                    current_model_name = self.llm.get_current_model()
-                    if current_model_name and current_model_name != parent_model_name:
-                        await self.llm.unload_model()
-                    await self.llm.load_and_restore()
-                except BaseException as exc:
-                    restore_error = exc
-                    self.logger.exception("Failed to restore parent model after browser delegation.")
+                if model_swapped:
+                    try:
+                        current_model_name = self.llm.get_current_model()
+                        if current_model_name and current_model_name != parent_model_name:
+                            await self.llm.unload_model()
+                        await self.llm.load_and_restore()
+                    except BaseException as exc:
+                        restore_error = exc
+                        self.logger.exception("Failed to restore parent model after browser delegation.")
 
                 if restore_error is not None:
                     if primary_error is not None:
@@ -846,13 +871,22 @@ class LLMInteractionService:
             raise RuntimeError("No filesystem model is configured.")
 
         async with self._filesystem_lock:
-            parent_model_name = self.llm.get_current_model() or self._frame.model
+            resident_model_name = self.llm.get_current_model()
+            parent_model_name = resident_model_name or self._frame.model
             if not parent_model_name:
                 raise RuntimeError("Cannot determine the parent model before filesystem delegation.")
 
-            saved_parent_state = await self.llm.save_and_unload(self._frame.messages)
-            if saved_parent_state is None:
-                raise RuntimeError("Could not save the parent model state; filesystem task was not started.")
+            model_swapped = resident_model_name != self.filesystem_agent_model
+            saved_parent_state = None
+            if model_swapped:
+                saved_parent_state = await self.llm.save_and_unload(self._frame.messages)
+                if saved_parent_state is None:
+                    raise RuntimeError("Could not save the parent model state; filesystem task was not started.")
+            else:
+                self.logger.info(
+                    "Filesystem agent reusing resident model %s without a model transition.",
+                    self.filesystem_agent_model,
+                )
 
             session = FilesystemControlSession(
                 granted_paths=granted_paths,
@@ -867,7 +901,8 @@ class LLMInteractionService:
                     *await session.get_all_tools(),
                     copy.deepcopy(self.FINISH_FILESYSTEM_TASK_TOOL),
                 ]
-                await self.llm.load_model(self.filesystem_agent_model)
+                if model_swapped:
+                    await self.llm.load_model(self.filesystem_agent_model)
                 self._push_frame(
                     model=self.filesystem_agent_model,
                     depth=agent_depth + 1,
@@ -898,14 +933,15 @@ class LLMInteractionService:
                     self._pop_frame()
                 await session.cleanup()
                 restore_error: Optional[BaseException] = None
-                try:
-                    current_model_name = self.llm.get_current_model()
-                    if current_model_name and current_model_name != parent_model_name:
-                        await self.llm.unload_model()
-                    await self.llm.load_and_restore()
-                except BaseException as exc:
-                    restore_error = exc
-                    self.logger.exception("Failed to restore parent model after filesystem delegation.")
+                if model_swapped:
+                    try:
+                        current_model_name = self.llm.get_current_model()
+                        if current_model_name and current_model_name != parent_model_name:
+                            await self.llm.unload_model()
+                        await self.llm.load_and_restore()
+                    except BaseException as exc:
+                        restore_error = exc
+                        self.logger.exception("Failed to restore parent model after filesystem delegation.")
                 if restore_error is not None:
                     if primary_error is not None:
                         raise RuntimeError(
@@ -959,6 +995,7 @@ class LLMInteractionService:
         *,
         task: str,
         approval_id: str = "",
+        read_only: bool = False,
         event_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> str:
         if not self.computer_enabled:
@@ -971,15 +1008,28 @@ class LLMInteractionService:
             raise RuntimeError("Computer-use deployment was denied because the task appears destructive or high-risk.")
 
         async with self._computer_lock:
-            parent_model_name = self.llm.get_current_model() or self._frame.model
+            resident_model_name = self.llm.get_current_model()
+            parent_model_name = resident_model_name or self._frame.model
             if not parent_model_name:
                 raise RuntimeError("Cannot determine the parent model before computer-use deployment.")
 
-            saved_parent_state = await self.llm.save_and_unload(self._frame.messages)
-            if saved_parent_state is None:
-                raise RuntimeError("Could not save the parent model state; computer-use task was not started.")
+            model_swapped = resident_model_name != self.computer_agent_model
+            saved_parent_state = None
+            if model_swapped:
+                saved_parent_state = await self.llm.save_and_unload(self._frame.messages)
+                if saved_parent_state is None:
+                    raise RuntimeError("Could not save the parent model state; computer-use task was not started.")
+            else:
+                self.logger.info(
+                    "Computer agent reusing resident model %s without a model transition.",
+                    self.computer_agent_model,
+                )
 
-            session = ComputerControlSession(max_actions=self.computer_max_actions_per_task)
+            session = ComputerControlSession(
+                max_actions=self.computer_max_actions_per_task,
+                screenshot_dir=self.computer_screenshot_dir,
+                read_only=read_only,
+            )
             child_frame_pushed = False
             computer_result = ""
             primary_error: Optional[BaseException] = None
@@ -988,12 +1038,21 @@ class LLMInteractionService:
                     *await session.get_all_tools(),
                     copy.deepcopy(self.FINISH_COMPUTER_TASK_TOOL),
                 ]
-                await self.llm.load_model(self.computer_agent_model)
+                delegated_tool_names = {
+                    tool.get("function", {}).get("name")
+                    for tool in computer_tools
+                    if tool.get("function", {}).get("name")
+                    and tool.get("function", {}).get("name") not in self.TERMINAL_TOOL_NAMES
+                }
+                if model_swapped:
+                    await self.llm.load_model(self.computer_agent_model)
                 self._push_frame(
                     model=self.computer_agent_model,
                     depth=1,
                     tools=computer_tools,
                     tool_bridge=session,
+                    delegated_approval_id=approval_id,
+                    preauthorized_tool_names=(delegated_tool_names if approval_id else set()),
                 )
                 child_frame_pushed = True
                 allowed_tool_names = {
@@ -1010,6 +1069,7 @@ class LLMInteractionService:
                         allowed_tool_names=allowed_tool_names,
                         report_policy="silent",
                         event_callback=event_callback,
+                        iteration_image_provider=session.capture_screenshot_for_model,
                     ),
                     timeout=self.computer_task_timeout_seconds,
                 )
@@ -1020,14 +1080,15 @@ class LLMInteractionService:
                     self._pop_frame()
                 await session.cleanup()
                 restore_error: Optional[BaseException] = None
-                try:
-                    current_model_name = self.llm.get_current_model()
-                    if current_model_name and current_model_name != parent_model_name:
-                        await self.llm.unload_model()
-                    await self.llm.load_and_restore()
-                except BaseException as exc:
-                    restore_error = exc
-                    self.logger.exception("Failed to restore parent model after computer-use deployment.")
+                if model_swapped:
+                    try:
+                        current_model_name = self.llm.get_current_model()
+                        if current_model_name and current_model_name != parent_model_name:
+                            await self.llm.unload_model()
+                        await self.llm.load_and_restore()
+                    except BaseException as exc:
+                        restore_error = exc
+                        self.logger.exception("Failed to restore parent model after computer-use deployment.")
                 if restore_error is not None:
                     if primary_error is not None:
                         raise RuntimeError(
@@ -1088,6 +1149,7 @@ class LLMInteractionService:
         allowed_tool_names: Optional[set[str]] = None,
         report_policy: str = "silent",
         event_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        iteration_image_provider: Optional[Callable[[], str]] = None,
     ) -> str:
         """
         Run a full LLM interaction: send user input, stream response,
@@ -1124,6 +1186,7 @@ class LLMInteractionService:
                 interaction_run_id=interaction_run_id,
                 tools_used=tools_used,
                 iteration=0,
+                iteration_image_provider=iteration_image_provider,
             )
 
     async def resume_interaction(
@@ -1207,7 +1270,44 @@ class LLMInteractionService:
                 interaction_run_id=interaction_run_id,
                 tools_used=tools_used,
                 iteration=int(checkpoint.get("iteration") or 0),
+                iteration_image_provider=None,
             )
+
+    def _image_for_iteration(
+        self,
+        *,
+        image_path: str,
+        iteration: int,
+        iteration_image_provider: Optional[Callable[[], str]],
+    ) -> str:
+        if iteration_image_provider is None:
+            return image_path if iteration == 1 else ""
+        try:
+            return str(iteration_image_provider() or "")
+        except Exception:
+            self.logger.exception("Failed to capture per-iteration image for model turn.")
+            return ""
+
+    def _messages_for_iteration_image(
+        self,
+        *,
+        request_image_path: str,
+        iteration: int,
+        iteration_image_provider: Optional[Callable[[], str]],
+    ) -> List[Dict[str, Any]]:
+        if not request_image_path or iteration_image_provider is None or iteration <= 1:
+            return self._frame.messages
+        messages = copy.deepcopy(self._frame.messages)
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "Fresh screenshot after the latest computer action. "
+                    "Use the attached image as the current desktop state before choosing the next tool call."
+                ),
+            }
+        )
+        return messages
 
     async def _run_interaction_loop(
         self,
@@ -1224,23 +1324,36 @@ class LLMInteractionService:
         interaction_run_id: str,
         tools_used: List[str],
         iteration: int,
+        iteration_image_provider: Optional[Callable[[], str]],
     ) -> str:
         assistant_text = ""
         while iteration < self.MAX_ITERATIONS:
+            self._check_interrupted()
             iteration += 1
             self.logger.info(
                 "--- Iteration %s (agent depth %s/%s) ---",
                 iteration, agent_depth, self.MAX_AGENT_DEPTH,
             )
+            request_image_path = self._image_for_iteration(
+                image_path=image_path,
+                iteration=iteration,
+                iteration_image_provider=iteration_image_provider,
+            )
+            request_messages = self._messages_for_iteration_image(
+                request_image_path=request_image_path,
+                iteration=iteration,
+                iteration_image_provider=iteration_image_provider,
+            )
             completion = await self.llm.chat_completion_stream(
                 model=model,
-                messages=self._frame.messages,
+                messages=request_messages,
                 tools=self._tools_for_agent_depth(agent_depth, allowed_tool_names=allowed_tool_names),
-                image=image_path if iteration == 1 else "",
+                image=request_image_path,
             )
             assistant_text, tool_calls = await self._consume_stream(
                 completion, event_callback=event_callback,
             )
+            self._check_interrupted()
             if not tool_calls:
                 self._frame.messages.append({"role": "assistant", "content": assistant_text})
                 self.logger.info("Model finished (no more tool calls)")
@@ -1255,6 +1368,7 @@ class LLMInteractionService:
                 {"role": "assistant", "content": assistant_text or None, "tool_calls": tool_calls}
             )
             try:
+                self._check_interrupted()
                 tool_results = await self._execute_tool_calls(
                     tool_calls, agent_depth=agent_depth,
                     allowed_tool_names=allowed_tool_names, event_callback=event_callback,
@@ -1367,6 +1481,7 @@ class LLMInteractionService:
         tool_calls: List[Dict] = []
 
         async for chunk in completion:
+            self._check_interrupted()
             if not getattr(chunk, "choices", None):
                 continue
             delta = chunk.choices[0].delta
@@ -1647,7 +1762,8 @@ class LLMInteractionService:
                             }
                         )
                         continue
-                    parent_model_name = self.llm.get_current_model() or self._frame.model
+                    resident_model_name = self.llm.get_current_model()
+                    parent_model_name = resident_model_name or self._frame.model
                     model_name = tool_args.get("model_name")
                     available_model_names = self._get_available_model_names()
                     if not model_name:
@@ -1683,8 +1799,20 @@ class LLMInteractionService:
                             }
                         )
                         continue
-                    saved_parent_kv_state = await self.llm.save_and_unload(self._frame.messages)
-                    await self.llm.load_model(model_name)
+                    model_swapped = resident_model_name != model_name
+                    saved_parent_kv_state = None
+                    if model_swapped:
+                        saved_parent_kv_state = await self.llm.save_and_unload(self._frame.messages)
+                        if saved_parent_kv_state is None:
+                            raise RuntimeError(
+                                "Could not save the parent model state; sub-agent was not started."
+                            )
+                        await self.llm.load_model(model_name)
+                    else:
+                        self.logger.info(
+                            "Sub-agent reusing resident model %s without a model transition.",
+                            model_name,
+                        )
                     self._push_frame(model=model_name, depth=agent_depth + 1)
                     try:
                         child_result = await self.run_interaction(
@@ -1699,7 +1827,7 @@ class LLMInteractionService:
                         self._pop_frame()
 
                     current_model_name = self.llm.get_current_model()
-                    if parent_model_name and current_model_name != parent_model_name:
+                    if model_swapped and parent_model_name and current_model_name != parent_model_name:
                         self.logger.info(
                             "Sub-agent returned without restoring parent state; recovering parent model %s.",
                             parent_model_name,

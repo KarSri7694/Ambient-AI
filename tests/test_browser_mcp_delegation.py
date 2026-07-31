@@ -285,6 +285,29 @@ def test_browser_agent_isolates_tools_and_restores_parent_after_approval():
         "unload:browser-model",
         "restore_parent",
     ]
+
+
+def test_browser_agent_reuses_same_resident_model_without_swapping():
+    provider = _BrowserFlowProvider()
+    browser_bridge = _BrowserBridge()
+    service = LLMInteractionService(
+        llm_provider=provider,
+        tool_bridge=_MainToolBridge(),
+        browser_tool_bridge=browser_bridge,
+        browser_agent_model="main-model",
+        browser_headless=True,
+    )
+
+    result = asyncio.run(
+        service.deploy_browser_agent(
+            task="Open example.com and report its title",
+            approval_id="approval-1",
+        )
+    )
+
+    assert json.loads(result)["status"] == "completed"
+    assert provider.current_model == "main-model"
+    assert provider.events == []
     assert all(
         [tool["function"]["name"] for tool in call["tools"]]
         == ["browser_navigate", "browser_click", "finish_browser_task"]

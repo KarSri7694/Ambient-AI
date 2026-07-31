@@ -41,15 +41,15 @@ def _session(tmp_path: Path) -> FaraVisualBrowserSession:
     )
 
 
-def test_browser_policy_allows_public_reads_and_blocks_mutation():
+def test_browser_policy_allows_public_requests_including_post():
     policy = BrowserSafetyPolicy()
     assert policy.validate_navigation("https://example.com/products/running-shoe")
     assert policy.request_allowed(url="https://example.com/products/1", method="GET")[0]
     allowed, reason = policy.request_allowed(
         url="https://example.com/api/wishlist", method="POST"
     )
-    assert not allowed
-    assert "read-only" in reason
+    assert allowed
+    assert "public browser request" in reason
 
 
 @pytest.mark.parametrize(
@@ -59,14 +59,32 @@ def test_browser_policy_allows_public_reads_and_blocks_mutation():
         "http://127.0.0.1/private",
         "http://169.254.169.254/latest/meta-data",
         "file:///C:/Users/user/.ssh/id_rsa",
+    ],
+)
+def test_browser_policy_allows_non_download_navigation(url):
+    assert BrowserSafetyPolicy().validate_navigation(url) == url
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
         "https://shop.example/cart",
         "https://shop.example/account/login",
         "https://shop.example/checkout/payment",
     ],
 )
-def test_browser_policy_blocks_private_and_transactional_navigation(url):
-    with pytest.raises(BrowserPolicyError):
-        BrowserSafetyPolicy().validate_navigation(url)
+def test_browser_policy_allows_transactional_public_navigation(url):
+    assert BrowserSafetyPolicy().validate_navigation(url) == url
+
+
+def test_fara_launch_args_start_maximized_with_configured_window_size(tmp_path):
+    session = _session(tmp_path)
+
+    kwargs = session._launch_kwargs()
+
+    assert kwargs["viewport"] == {"width": 1440, "height": 900}
+    assert "--start-maximized" in kwargs["args"]
+    assert "--window-size=1440,900" in kwargs["args"]
 
 
 def test_fara_action_parser_accepts_official_xml_shape(tmp_path):

@@ -419,10 +419,12 @@ class ProductionScenarioExecutor:
         model_load_timeout_seconds = parser.getfloat(
             "runtime", "model_load_timeout_seconds", fallback=600.0
         )
+        max_generation_tokens = parser.getint("runtime", "max_generation_tokens", fallback=60000)
         raw = LlamaCppAdapter(
             base_url=api_url,
             api_key=api_key,
             model_load_timeout_seconds=model_load_timeout_seconds,
+            default_max_tokens=max_generation_tokens,
         )
         llm = RealWorldTracingLLMProvider(raw, self.emit)
         autonomy_store = SQLiteAutonomyAdapter(str(self.workspace / "autonomy.db"))

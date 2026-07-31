@@ -24,6 +24,7 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         api_key: str = "testkey",
         model_load_timeout_seconds: float = 600.0,
         isolated_model_tracking: bool = False,
+        default_max_tokens: Optional[int] = None,
     ):
         """Create an adapter for a llama.cpp-compatible OpenAI API server."""
         self.logger = logging.getLogger(self.__class__.__name__)
@@ -37,6 +38,7 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         )
         self.model_load_timeout_seconds = max(1.0, float(model_load_timeout_seconds))
         self.isolated_model_tracking = bool(isolated_model_tracking)
+        self.default_max_tokens = max(1, int(default_max_tokens)) if default_max_tokens is not None else None
         self.currently_loaded_model: Optional[str] = None
         self._ready_model: Optional[str] = None
         self.kv_state = KVStateControl(self)
@@ -672,8 +674,9 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
             kwargs["temperature"] = temperature
         if top_p is not None:
             kwargs["top_p"] = top_p
-        if max_tokens is not None:
-            kwargs["max_tokens"] = max(1, int(max_tokens))
+        effective_max_tokens = max_tokens if max_tokens is not None else self.default_max_tokens
+        if effective_max_tokens is not None:
+            kwargs["max_tokens"] = max(1, int(effective_max_tokens))
         if response_format is not None:
             kwargs["response_format"] = response_format
         if request_timeout_seconds is not None:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from typing import Any, Callable
 
 from application.services.artifact_organizer_service import ArtifactOrganizer
 
@@ -45,6 +45,7 @@ Return JSON only with exactly these keys:
         confidence_threshold: float = 0.85,
         archive_dir: str = "archived",
         logger: logging.Logger | None = None,
+        interrupt_checker: Callable[[], None] | None = None,
     ) -> None:
         self.organizer = organizer
         self.llm_provider = llm_provider
@@ -56,6 +57,11 @@ Return JSON only with exactly these keys:
         self.confidence_threshold = max(0.0, min(1.0, float(confidence_threshold)))
         self.archive_dir = str(archive_dir or "archived").strip() or "archived"
         self.logger = logger or logging.getLogger(self.__class__.__name__)
+        self.interrupt_checker = interrupt_checker
+
+    def _check_interrupted(self) -> None:
+        if self.interrupt_checker is not None:
+            self.interrupt_checker()
 
     def status(self) -> dict[str, Any]:
         return self.organizer.maintenance_status(
@@ -67,6 +73,7 @@ Return JSON only with exactly these keys:
         return bool(self.status().get("due"))
 
     async def run(self, *, trigger_kind: str = "idle") -> dict[str, Any]:
+        self._check_interrupted()
         if not self.model:
             raise RuntimeError("Artifact maintenance model is not configured.")
         run_id = self.organizer.start_maintenance_run(trigger_kind)
@@ -85,12 +92,14 @@ Return JSON only with exactly these keys:
             pairs = self._candidate_pairs(artifacts)
             metrics["candidate_pair_count"] = len(pairs)
             approved_edges = await self._validate_pairs(pairs)
+            self._check_interrupted()
             clusters = self._clusters_from_edges(approved_edges)
             metrics["cluster_count"] = len(clusters)
             selected = clusters[: self.max_clusters_per_run]
             metrics["continuation_required"] = len(clusters) > len(selected)
             errors: list[str] = []
             for cluster in selected:
+                self._check_interrupted()
                 members = set(cluster)
                 evidence = [
                     edge for edge in approved_edges
@@ -257,6 +266,7 @@ Return JSON only with exactly these keys:
         )
 
     async def _json_completion(self, system_prompt: str, payload: dict[str, Any]) -> str:
+        self._check_interrupted()
         completion = await self.llm_provider.chat_completion_stream(
             model=self.model,
             messages=[
@@ -268,6 +278,7 @@ Return JSON only with exactly these keys:
         )
         parts: list[str] = []
         async for chunk in completion:
+            self._check_interrupted()
             if not getattr(chunk, "choices", None):
                 continue
             content = getattr(chunk.choices[0].delta, "content", None)

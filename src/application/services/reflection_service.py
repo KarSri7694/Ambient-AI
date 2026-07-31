@@ -4,7 +4,7 @@ import logging
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from application.ports.LLMProvider import LLMProvider
 from application.ports.memory_port import MemoryPort
@@ -80,6 +80,7 @@ Rules:
         interval_hours: int = 24,
         max_generated_tasks: int = 8,
         max_task_generation_runs: int = 3,
+        interrupt_checker: Optional[Callable[[], None]] = None,
         logger: Optional[logging.Logger] = None,
     ):
         self.memory = memory
@@ -92,8 +93,13 @@ Rules:
         self.interval_hours = max(1, int(interval_hours))
         self.max_generated_tasks = int(max_generated_tasks)
         self.max_task_generation_runs = max(0, int(max_task_generation_runs))
+        self.interrupt_checker = interrupt_checker
         self.logger = logger or logging.getLogger(self.__class__.__name__)
         self.history_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _check_interrupted(self) -> None:
+        if self.interrupt_checker is not None:
+            self.interrupt_checker()
 
     def _build_system_prompt(self, prompt: str) -> str:
         now = datetime.now()
@@ -136,6 +142,7 @@ Rules:
         return self._is_due(history, now)
 
     async def run(self, *, model: str, now: Optional[datetime] = None, history: Optional[dict] = None) -> dict:
+        self._check_interrupted()
         now = now or datetime.now()
         history = history or self._load_history()
         original_user_info = self.memory.get_user_info().strip()
@@ -495,6 +502,7 @@ Rules:
     async def _consume_stream_text(self, completion) -> str:
         parts: List[str] = []
         async for chunk in completion:
+            self._check_interrupted()
             if not getattr(chunk, "choices", None):
                 continue
             delta = chunk.choices[0].delta

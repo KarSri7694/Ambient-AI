@@ -439,7 +439,7 @@ class SQLiteAutonomyAdapter(AutonomyStorePort):
         return self._event_from_row(claimed) if claimed else None
 
     def complete_event(self, event_id: str, *, status: str = "processed", error_text: str | None = None) -> None:
-        if status not in {"processed", "ignored", "dead_letter"}:
+        if status not in {"processed", "ignored", "dead_letter", "interrupted"}:
             raise ValueError("invalid terminal event status")
         with self._lock, self._connect() as conn:
             conn.execute(
@@ -628,6 +628,30 @@ class SQLiteAutonomyAdapter(AutonomyStorePort):
             ).fetchone()
             conn.commit()
         return self._event_from_row(cancelled) if cancelled else None
+
+    def interrupt_leased_event(self, event_id: str, *, reason: str = "Interrupted by local user") -> Optional[AmbientEvent]:
+        now = _utciso()
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM ambient_events WHERE event_id=? AND status='leased'",
+                (event_id,),
+            ).fetchone()
+            if row is None:
+                conn.commit()
+                return None
+            conn.execute(
+                """UPDATE ambient_events
+                   SET status='interrupted', processed_at=?, error_text=?,
+                       leased_at=NULL, lease_expires_at=NULL
+                   WHERE event_id=? AND status='leased'""",
+                (now, str(reason or "Interrupted by local user")[:4000], event_id),
+            )
+            interrupted = conn.execute(
+                "SELECT * FROM ambient_events WHERE event_id=?", (event_id,)
+            ).fetchone()
+            conn.commit()
+        return self._event_from_row(interrupted) if interrupted else None
 
     def has_ready_events(self, event_types: Optional[list[str]] = None) -> bool:
         type_clause = ""

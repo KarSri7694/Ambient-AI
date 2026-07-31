@@ -35,6 +35,8 @@ class _RuntimeControl:
     def __init__(self):
         self.requested = False
         self.biodata_requested = False
+        self.interrupt_requested = False
+        self.interrupt_reason = None
 
     def manual_reflection_status(self):
         return {"requested": self.requested, "running": False}
@@ -67,6 +69,18 @@ class _RuntimeControl:
 
     def home_snapshot(self, *, date_value=None, since=None):
         return {"date": date_value, "since": since, "counts": {}, "timeline": [], "attention": []}
+
+    def interrupt_status(self):
+        return {
+            "requested": self.interrupt_requested,
+            "reason": self.interrupt_reason,
+            "active_work": {"kind": "direct_chat"} if self.interrupt_requested else None,
+        }
+
+    def request_interrupt(self, *, reason="Interrupted from test"):
+        self.interrupt_requested = True
+        self.interrupt_reason = reason
+        return {"ok": True, "accepted": True, "status": self.interrupt_status()}
 
 
 class RuntimeLogServerTests(unittest.TestCase):
@@ -158,6 +172,20 @@ class RuntimeLogServerTests(unittest.TestCase):
         self.assertEqual(started.status_code, 200)
         self.assertTrue(started.json()["status"]["requested"])
         self.assertTrue(runtime.biodata_requested)
+
+    def test_interrupt_runtime_api_uses_runtime_control(self):
+        runtime = _RuntimeControl()
+        client = TestClient(create_runtime_log_app(RuntimeLogBuffer(), runtime_control=runtime))
+
+        status = client.get("/api/runtime/interrupt/status")
+        started = client.post("/api/runtime/interrupt", json={"reason": "stop current item"})
+
+        self.assertEqual(status.status_code, 200)
+        self.assertFalse(status.json()["status"]["requested"])
+        self.assertEqual(started.status_code, 200)
+        self.assertTrue(started.json()["status"]["requested"])
+        self.assertEqual(started.json()["status"]["reason"], "stop current item")
+        self.assertTrue(runtime.interrupt_requested)
 
     def test_home_runtime_api_uses_date_and_visit_watermark(self):
         runtime = _RuntimeControl()

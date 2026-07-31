@@ -14,6 +14,7 @@ from application.services.interaction_trace import interaction_trace
 from application.services.llm_interaction_service import InteractionSuspended
 from application.services.opportunity_judgment_service import OpportunityJudgmentService
 from application.services.resource_governor_service import ResourceUnavailableError
+from application.services.runtime_interrupt_service import WorkInterrupted
 from core.models import AmbientEvent, DelegatedTask, OpportunityCandidate, ProactiveInboxItem, VisualObservation
 
 
@@ -556,6 +557,11 @@ Do not repeat an action already reported as performed.
                 "outcome": "resource_deferred",
                 "reason": exc.decision.reason,
             })
+        except WorkInterrupted as exc:
+            reason = str(exc) or "Interrupted by local user"
+            self.store.complete_event(event.event_id, status="interrupted", error_text=reason)
+            self.logger.info("Ambient event %s was interrupted by local user.", event.event_id)
+            return event_result({"processed": True, "outcome": "interrupted", "reason": reason})
         except Exception as exc:
             self.logger.exception("Autonomy event %s failed.", event.event_id)
             self.store.retry_event(event.event_id, error_text=str(exc))
@@ -942,6 +948,21 @@ Do not repeat an action already reported as performed.
                     event_callback=delegated_event_callback,
                 )
             )
+        except WorkInterrupted as exc:
+            latest = self.store.get_delegated_task(claimed.delegation_id)
+            reason = str(exc) or "Interrupted by local user"
+            return await self._finish_delegation_execution(
+                event=event,
+                delegated=latest or claimed,
+                result_payload={
+                    "status": "interrupted",
+                    "summary": "The delegated control task was interrupted by the local user.",
+                    "details": reason,
+                    "actions_performed": [],
+                    "sources": [],
+                    "blockers": [reason],
+                },
+            )
         except Exception as exc:
             latest = self.store.get_delegated_task(claimed.delegation_id)
             if control_started or (latest is not None and latest.control_started_at):
@@ -971,7 +992,7 @@ Do not repeat an action already reported as performed.
         self, *, event: AmbientEvent, delegated: DelegatedTask, result_payload: dict[str, Any]
     ) -> dict[str, Any]:
         raw_status = str(result_payload.get("status") or "completed").lower()
-        status = raw_status if raw_status in {"completed", "blocked", "failed", "terminated"} else "completed"
+        status = raw_status if raw_status in {"completed", "blocked", "failed", "terminated", "interrupted"} else "completed"
         continuation_event_id = uuid.uuid4().hex
         completion_payload = {
             "delegation_id": delegated.delegation_id,

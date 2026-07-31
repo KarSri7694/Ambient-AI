@@ -431,6 +431,52 @@ def test_bounded_visual_request_options_are_forwarded_to_llama_cpp():
     assert captured["extra_body"]["chat_template_kwargs"] == {"enable_thinking": False}
 
 
+def test_default_max_tokens_is_applied_when_request_does_not_override():
+    adapter = LlamaCppAdapter("http://localhost:8080", default_max_tokens=60000)
+    captured = {}
+
+    class _Completions:
+        async def create(self, **kwargs):
+            captured.update(kwargs)
+            return "stream"
+
+    adapter.client = SimpleNamespace(chat=SimpleNamespace(completions=_Completions()))
+    adapter._require_model_ready = lambda _model: None
+
+    result = asyncio.run(
+        adapter.chat_completion_stream(
+            model="main",
+            messages=[{"role": "user", "content": "hello"}],
+        )
+    )
+
+    assert result == "stream"
+    assert captured["max_tokens"] == 60000
+
+
+def test_per_request_max_tokens_overrides_adapter_default():
+    adapter = LlamaCppAdapter("http://localhost:8080", default_max_tokens=60000)
+    captured = {}
+
+    class _Completions:
+        async def create(self, **kwargs):
+            captured.update(kwargs)
+            return "stream"
+
+    adapter.client = SimpleNamespace(chat=SimpleNamespace(completions=_Completions()))
+    adapter._require_model_ready = lambda _model: None
+
+    asyncio.run(
+        adapter.chat_completion_stream(
+            model="main",
+            messages=[{"role": "user", "content": "hello"}],
+            max_tokens=512,
+        )
+    )
+
+    assert captured["max_tokens"] == 512
+
+
 def test_async_load_does_not_block_event_loop(monkeypatch):
     adapter = LlamaCppAdapter("http://localhost:8080")
 

@@ -42,6 +42,11 @@ class CapabilityRegistry:
     """Classify MCP and direct tools into a small, coherent capability surface."""
 
     _READ_PREFIXES = ("get_", "list_", "view_", "read_", "search", "google_search")
+    _READ_MARKERS = ("get", "list", "view", "read", "search", "find", "fetch", "lookup")
+    _WRITE_MARKERS = (
+        "send", "create", "update", "delete", "remove", "trash", "archive",
+        "draft", "reply", "forward", "move", "mark", "insert", "patch",
+    )
     _HARD_ACTION_WORDS = re.compile(
         r"\b(purchase|buy|checkout|delete|erase|remove account|change password|credential|"
         r"publish|post publicly|send payment|transfer money)\b",
@@ -85,12 +90,12 @@ class CapabilityRegistry:
             return self._d(name, "research.web", "research", "read", False, True, "low", ("web",), "sources", 2)
         if lowered in {"add_task", "queue_night_task", "schedule_task_at"} or "reminder" in lowered:
             return self._d(name, "assistance.reminder", "personal_assistance", "write", True, True, "medium", ("tasks",), "provider_readback", 1, True)
-        if "calendar" in lowered and lowered.startswith(self._READ_PREFIXES):
+        if "calendar" in lowered and self._looks_read_only_tool(lowered):
             return self._d(name, "assistance.calendar.read", "personal_assistance", "read", False, True, "low", ("calendar",), "result", 1)
         if lowered in {"schedule_meeting", "create_event", "update_event", "delete_event"} or "calendar" in lowered:
             return self._d(name, "communication.calendar.write", "communication", "write", True, lowered.startswith("delete") is False, "high", ("calendar",), "provider_readback", 2, True)
         if any(word in lowered for word in ("email", "gmail", "message", "slack", "teams", "outlook")):
-            if lowered.startswith(self._READ_PREFIXES):
+            if self._looks_read_only_tool(lowered):
                 return self._d(name, "communication.read", "communication", "read", False, True, "medium", ("communications",), "result", 1)
             return self._d(name, "communication.send", "communication", "write", True, False, "high", ("communications",), "provider_readback", 2, True)
         if lowered == "powershell_terminal" or any(word in lowered for word in ("terminal", "shell", "command")):
@@ -124,6 +129,13 @@ class CapabilityRegistry:
             risk_class=risk, data_scopes=scopes, verification=verification,
             budget_cost=cost, idempotent=idempotent,
         )
+
+    @classmethod
+    def _looks_read_only_tool(cls, lowered: str) -> bool:
+        tokens = [token for token in re.split(r"[^a-z0-9]+|_", lowered) if token]
+        if any(token in cls._WRITE_MARKERS for token in tokens):
+            return False
+        return lowered.startswith(cls._READ_PREFIXES) or any(token in cls._READ_MARKERS for token in tokens)
 
 
 class AutonomyBudget:

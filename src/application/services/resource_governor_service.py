@@ -381,7 +381,7 @@ class ResourceGovernorService:
 
 
 class ModelResidencyManager:
-    """Serializes model transitions and restores only the configured tiny chat model."""
+    """Serialize necessary model transitions while preserving useful residency."""
 
     def __init__(
         self,
@@ -389,6 +389,7 @@ class ModelResidencyManager:
         provider,
         governor: ResourceGovernorService,
         lightweight_chat_model: str = "",
+        keep_active_model_resident: bool = True,
         recovery_stable_seconds: float = 30.0,
         transition_cooldown_seconds: float = 60.0,
         logger: logging.Logger | None = None,
@@ -396,6 +397,7 @@ class ModelResidencyManager:
         self.provider = provider
         self.governor = governor
         self.lightweight_chat_model = str(lightweight_chat_model or "").strip()
+        self.keep_active_model_resident = bool(keep_active_model_resident)
         self.recovery_stable_seconds = max(0.0, float(recovery_stable_seconds))
         self.transition_cooldown_seconds = max(0.0, float(transition_cooldown_seconds))
         self.logger = logger or logging.getLogger(self.__class__.__name__)
@@ -429,8 +431,24 @@ class ModelResidencyManager:
             if before == model_name:
                 resident_decision = self.governor.verify_after_load(request)
                 if not resident_decision.allowed:
-                    await self.provider.unload_model()
-                    self._last_transition_at = time.monotonic()
+                    self.governor._audit(
+                        "resource.resident_model_headroom_low",
+                        model_name,
+                        {
+                            "role": role,
+                            "reason": resident_decision.reason,
+                            "post_load_decision": asdict(resident_decision),
+                        },
+                    )
+                    return resident_decision
+                self.governor._audit(
+                    "resource.model_reused",
+                    model_name,
+                    {
+                        "role": role,
+                        "post_load_decision": asdict(resident_decision),
+                    },
+                )
                 return resident_decision
             started_at = time.monotonic()
             await self.provider.load_model(model_name)
@@ -579,6 +597,15 @@ class ModelResidencyManager:
         if await self.evict_if_critical():
             return False
         loaded = self.provider.get_current_model()
+        if not self.lightweight_chat_model:
+            # With no dedicated lightweight model configured, retaining the
+            # current healthy model avoids unloading it at every brief gap
+            # between screenshots, autonomy events, and chat turns.
+            if self.keep_active_model_resident:
+                return loaded is not None
+            if loaded:
+                await self.unload_model(reason="interactive response window ended")
+            return False
         if loaded and loaded != self.lightweight_chat_model:
             await self.unload_model(reason="interactive response window ended")
         return await self.ensure_lightweight_resident(user_active=user_active, startup=False)
@@ -587,4 +614,5 @@ class ModelResidencyManager:
         return {
             "loaded_model": self.provider.get_current_model(),
             "lightweight_chat_model": self.lightweight_chat_model or None,
+            "keep_active_model_resident": self.keep_active_model_resident,
         }

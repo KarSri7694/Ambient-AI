@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Activity, Archive, BarChart3, Bot, BrainCircuit, Database, FileText, Home, Inbox,
-  ListRestart, MessageSquare, Moon, Pause, Play, RotateCcw, ScrollText, Sun, TestTube2,
+  ListRestart, MessageSquare, Moon, OctagonX, Pause, Play, RotateCcw, ScrollText, Sun, TestTube2,
   UserRound,
 } from "lucide-react";
 import { getJson, sendJson } from "./api";
@@ -94,11 +94,19 @@ export function App() {
     refetchInterval: 2000,
     retry: false,
   });
+  const interrupt = useQuery({
+    queryKey: ["runtime-interrupt-status"],
+    queryFn: () => getJson<any>("/api/runtime/interrupt/status"),
+    refetchInterval: 2000,
+    retry: false,
+  });
   const capturePaused = Boolean(privacy.data?.capture?.paused);
   const reflectionStatus = reflection.data?.status || {};
   const reflectionBusy = Boolean(reflectionStatus.running || reflectionStatus.requested);
   const biodataStatus = biodata.data?.status || {};
   const biodataBusy = Boolean(biodataStatus.running || biodataStatus.requested);
+  const interruptStatus = interrupt.data?.status || {};
+  const interruptActive = Boolean(interruptStatus.active_work || interruptStatus.requested);
   const captureMutation = useMutation({
     mutationFn: () => sendJson(`/api/privacy/capture/${capturePaused ? "resume" : "pause"}`, "POST"),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["privacy-status"] }),
@@ -110,6 +118,16 @@ export function App() {
   const biodataMutation = useMutation({
     mutationFn: () => sendJson("/api/runtime/biodata/run", "POST"),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["manual-biodata-status"] }),
+  });
+  const interruptMutation = useMutation({
+    mutationFn: () => sendJson("/api/runtime/interrupt", "POST", { reason: "Interrupted by local user" }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["runtime-interrupt-status"] });
+      queryClient.invalidateQueries({ queryKey: ["resource-status"] });
+      queryClient.invalidateQueries({ queryKey: ["processing-queue"] });
+      queryClient.invalidateQueries({ queryKey: ["runtime-logs"] });
+      queryClient.invalidateQueries({ queryKey: ["chat-sessions"] });
+    },
   });
   const page = useMemo(() => {
     switch (path) {
@@ -167,8 +185,19 @@ export function App() {
           </div>
           <div className="flex items-center gap-2">
             <Badge tone={capturePaused ? "warn" : "good"}>{capturePaused ? "Capture paused" : "Capture active"}</Badge>
+            {interruptActive && <Badge tone="danger">{interruptStatus.requested ? "Interrupt requested" : `Working: ${interruptStatus.active_work?.kind || "runtime"}`}</Badge>}
             {reflectionBusy && <Badge tone={reflectionStatus.running ? "warn" : "neutral"}>{reflectionStatus.running ? "Reflection running" : "Reflection queued"}</Badge>}
             {biodataBusy && <Badge tone={biodataStatus.running ? "warn" : "neutral"}>{biodataStatus.running ? "Biodata running" : "Biodata queued"}</Badge>}
+            <Button
+              variant="danger"
+              onClick={() => {
+                if (window.confirm("Interrupt the current work item and skip it?")) interruptMutation.mutate();
+              }}
+              disabled={interruptMutation.isPending || !interruptActive}
+              title="Stop the current LLM/tool loop and mark the current item as interrupted"
+            >
+              <OctagonX size={16} />Interrupt
+            </Button>
             <Button variant="secondary" onClick={() => biodataMutation.mutate()} disabled={biodataMutation.isPending || biodataBusy} title="Extract pending observations into USER_INFO.md and MEMORY.md now">
               <UserRound size={16} />{biodataBusy ? "Biodata queued" : "Update biodata"}
             </Button>

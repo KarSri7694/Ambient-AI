@@ -64,6 +64,7 @@ def _build_semantic_dedupe_service() -> SemanticDeduplicationService:
                 model_load_timeout_seconds=CONFIG.get_float(
                     "runtime", "model_load_timeout_seconds", 600.0
                 ),
+                default_max_tokens=CONFIG.get_int("runtime", "max_generation_tokens", 60000),
             ),
             log_store=SQLiteInteractionLogAdapter(db_path=INTERACTION_LOG_DB_PATH),
             current_response_path=None,

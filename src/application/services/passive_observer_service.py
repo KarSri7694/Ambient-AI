@@ -8,7 +8,7 @@ import uuid
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import urlsplit
 
 from PIL import Image
@@ -121,6 +121,7 @@ the screenshot and supplied accessibility text. Do not explain your reasoning.""
         capture_store: Optional[Any] = None,
         persist_payloads: bool = False,
         capture_control: Optional[Any] = None,
+        interrupt_checker: Optional[Callable[[], None]] = None,
         logger: logging.Logger | None = None,
     ):
         self.memory = memory
@@ -150,7 +151,12 @@ the screenshot and supplied accessibility text. Do not explain your reasoning.""
         self.capture_store = capture_store
         self.persist_payloads = bool(persist_payloads)
         self.capture_control = capture_control
+        self.interrupt_checker = interrupt_checker
         self.logger = logger or logging.getLogger(self.__class__.__name__)
+
+    def _check_interrupted(self) -> None:
+        if self.interrupt_checker is not None:
+            self.interrupt_checker()
 
     def capture_screenshot(self) -> str:
         screenshot_path = self._capture_path()
@@ -197,6 +203,7 @@ the screenshot and supplied accessibility text. Do not explain your reasoning.""
         force_full_analysis: bool = False,
         allow_uiat_fallback: bool = True,
     ) -> Optional[VisualObservation]:
+        self._check_interrupted()
         stored_screenshot_path = persisted_screenshot_path or screenshot_path
         try:
             parsed = await self._analyze(
@@ -907,6 +914,7 @@ the screenshot and supplied accessibility text. Do not explain your reasoning.""
         usage: Dict[str, int] = {}
         server_timings: Dict[str, Any] = {}
         async for chunk in completion:
+            self._check_interrupted()
             chunk_usage = getattr(chunk, "usage", None)
             if chunk_usage is not None:
                 for field in ("prompt_tokens", "completion_tokens", "total_tokens"):

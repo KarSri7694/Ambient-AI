@@ -2,7 +2,7 @@ import json
 import logging
 import hashlib
 from datetime import datetime
-from typing import List
+from typing import Callable, List
 
 from application.ports.LLMProvider import LLMProvider
 from application.ports.memory_port import MemoryPort
@@ -50,12 +50,18 @@ Rules:
         memory: MemoryPort,
         llm_provider: LLMProvider,
         semantic_memory: SemanticMemoryService | None = None,
+        interrupt_checker: Callable[[], None] | None = None,
         logger: logging.Logger | None = None,
     ):
         self.memory = memory
         self.llm = llm_provider
         self.semantic_memory = semantic_memory
+        self.interrupt_checker = interrupt_checker
         self.logger = logger or logging.getLogger(self.__class__.__name__)
+
+    def _check_interrupted(self) -> None:
+        if self.interrupt_checker is not None:
+            self.interrupt_checker()
 
     def _build_system_prompt(self, prompt: str) -> str:
         now = datetime.now()
@@ -73,6 +79,7 @@ Rules:
         return bool(self._candidate_rows(observations))
 
     async def update_biodata(self, *, model: str, transcript_contexts: List[dict] | None = None) -> dict:
+        self._check_interrupted()
         observations = self.memory.get_recent_biodata_pending_visual_observations(limit=self.OBSERVATION_LIMIT)
         candidates = self._candidate_rows(observations)
         transcripts = self._transcript_rows(transcript_contexts or [])
@@ -307,6 +314,7 @@ Rules:
     async def _consume_stream_text(self, completion) -> str:
         parts: List[str] = []
         async for chunk in completion:
+            self._check_interrupted()
             if not getattr(chunk, "choices", None):
                 continue
             delta = chunk.choices[0].delta
