@@ -580,14 +580,60 @@ class ProductionScenarioExecutor:
                 observer = PassiveObserverService(
                     memory=memory, llm_provider=llm, screen_capture=capture,
                     screenshot_root=str(self.workspace / "screens"),
-                    # The production coordinator deliberately uses one vision-capable
-                    # model for screen enrichment, judgment, and investigation.
-                    fast_model=self.model_roles["followup_execution_model"],
-                    full_model=self.model_roles["followup_execution_model"],
+                    fast_model=self.model_roles["passive_observer_model"],
+                    full_model=self.model_roles.get("full_passive_observer_model")
+                    or self.model_roles["followup_execution_model"],
+                    fast_model_retry_count=parser.getint(
+                        "passive_observer", "fast_model_retry_count", fallback=0
+                    ),
+                    processing_budget_seconds=parser.getfloat(
+                        "passive_observer", "processing_budget_seconds", fallback=20.0
+                    ),
+                    vlm_request_timeout_seconds=parser.getfloat(
+                        "passive_observer", "vlm_request_timeout_seconds", fallback=16.0
+                    ),
+                    max_output_tokens=parser.getint(
+                        "passive_observer", "max_output_tokens", fallback=256
+                    ),
+                    inference_width=parser.getint(
+                        "passive_observer", "inference_width", fallback=960
+                    ),
+                    inference_height=parser.getint(
+                        "passive_observer", "inference_height", fallback=540
+                    ),
+                    inference_jpeg_quality=parser.getint(
+                        "passive_observer", "inference_jpeg_quality", fallback=82
+                    ),
+                    uiat_text_max_chars=parser.getint(
+                        "passive_observer", "uiat_text_max_chars", fallback=1200
+                    ),
                     persist_observations=True, capture_store=capture_store, persist_payloads=True,
                 )
                 coordinator.visual_observer = observer
-                coordinator.visual_model = self.model_roles["followup_execution_model"]
+                coordinator.visual_model = self.model_roles["passive_observer_model"]
+                if parser.getboolean("passive_observer", "deep_enrichment_enabled", fallback=True):
+                    coordinator.deep_visual_observer = PassiveObserverService(
+                        memory=memory, llm_provider=llm, screen_capture=capture,
+                        screenshot_root=str(self.workspace / "screens"),
+                        fast_model=self.model_roles.get("full_passive_observer_model")
+                        or self.model_roles["followup_execution_model"],
+                        full_model=self.model_roles.get("full_passive_observer_model")
+                        or self.model_roles["followup_execution_model"],
+                        fast_model_retry_count=0,
+                        processing_budget_seconds=parser.getfloat(
+                            "passive_observer", "deep_vlm_request_timeout_seconds", fallback=120.0
+                        ),
+                        vlm_request_timeout_seconds=parser.getfloat(
+                            "passive_observer", "deep_vlm_request_timeout_seconds", fallback=120.0
+                        ),
+                        max_output_tokens=parser.getint(
+                            "passive_observer", "deep_max_output_tokens", fallback=768
+                        ),
+                        inference_width=1280, inference_height=720,
+                        inference_jpeg_quality=90, uiat_text_max_chars=4000,
+                        persist_observations=True, capture_store=capture_store,
+                        persist_payloads=True,
+                    )
                 queue = ScreenshotQueueService(
                     maxlen=180,
                     ssim_threshold=parser.getfloat("passive_observer", "ssim_threshold", fallback=0.92),
@@ -630,6 +676,9 @@ class ProductionScenarioExecutor:
                             "context": lightweight_context,
                         },
                     )
+                    perception_result = await coordinator.process_next_visual()
+                    autonomy_results.append(perception_result)
+                    self.emit("vision", "perception_result", perception_result)
                     await llm.load_model(self.model_roles["followup_execution_model"])
                     batch_result = await coordinator.process_batch(
                         model=self.model_roles["followup_execution_model"],

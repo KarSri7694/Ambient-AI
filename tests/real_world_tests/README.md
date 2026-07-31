@@ -65,7 +65,7 @@ Run all commands from the repository root.
 7. Start the configured llama.cpp model router. The normal project configuration uses:
 
    ```powershell
-   llama-server --models-preset .\models_preset.ini --models-max 1 --no-models-autoload --host 127.0.0.1 --port 8080 --api-key testkey
+   llama-server --models-preset .\models_preset.ini --models-max 2 --no-models-autoload --host 127.0.0.1 --port 8080 --api-key testkey
    ```
 
 8. Stop the normal Ambient AI process (`python src/app.py`). The lab and normal runtime intentionally cannot run at the same time because they share models, GPU resources, and MCP tools.

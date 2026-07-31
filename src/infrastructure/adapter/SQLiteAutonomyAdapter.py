@@ -349,6 +349,44 @@ class SQLiteAutonomyAdapter(AutonomyStorePort):
             ).fetchone()
         return self._event_from_row(row)
 
+    def coalesce_pending_visual_captures(self, *, context_key: str, keep: int = 2) -> int:
+        normalized_key = str(context_key or "").strip().lower()
+        if not normalized_key:
+            return 0
+        matches: list[str] = []
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """SELECT rowid, event_id, payload_json FROM ambient_events
+                   WHERE event_type='lightweight_visual_capture'
+                     AND status IN ('pending', 'resource_deferred')
+                   ORDER BY julianday(occurred_at) DESC, rowid DESC"""
+            ).fetchall()
+            for row in rows:
+                try:
+                    payload = json.loads(row["payload_json"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    payload = {}
+                candidate = str(
+                    payload.get("domain")
+                    or payload.get("app_name")
+                    or payload.get("process_name")
+                    or ""
+                ).strip().lower()
+                if candidate == normalized_key:
+                    matches.append(row["event_id"])
+            stale = matches[max(1, int(keep)):]
+            if stale:
+                placeholders = ",".join("?" for _ in stale)
+                conn.execute(
+                    f"""UPDATE ambient_events
+                        SET status='ignored', processed_at=?,
+                            error_text='Superseded by a newer unclaimed visual capture',
+                            leased_at=NULL, lease_expires_at=NULL
+                        WHERE event_id IN ({placeholders})""",
+                    [_utciso(), *stale],
+                )
+        return len(stale)
+
     def claim_next_event(
         self,
         *,
@@ -591,15 +629,23 @@ class SQLiteAutonomyAdapter(AutonomyStorePort):
             conn.commit()
         return self._event_from_row(cancelled) if cancelled else None
 
-    def has_ready_events(self) -> bool:
+    def has_ready_events(self, event_types: Optional[list[str]] = None) -> bool:
+        type_clause = ""
+        params: list[Any] = [_utciso()]
+        if event_types:
+            normalized = [str(value) for value in event_types if str(value)]
+            placeholders = ",".join("?" for _ in normalized)
+            type_clause = f"AND event_type IN ({placeholders})"
+            params.extend(normalized)
         with self._connect() as conn:
             row = conn.execute(
-                """SELECT 1 FROM ambient_events
+                f"""SELECT 1 FROM ambient_events
                    WHERE status IN ('pending', 'resource_deferred')
                      AND julianday(available_at)<=julianday(?)
                      AND event_type!='audio_capture_pending'
+                     {type_clause}
                    LIMIT 1""",
-                (_utciso(),),
+                params,
             ).fetchone()
         return row is not None
 

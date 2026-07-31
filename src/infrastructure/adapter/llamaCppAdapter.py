@@ -23,6 +23,7 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         base_url: str,
         api_key: str = "testkey",
         model_load_timeout_seconds: float = 600.0,
+        isolated_model_tracking: bool = False,
     ):
         """Create an adapter for a llama.cpp-compatible OpenAI API server."""
         self.logger = logging.getLogger(self.__class__.__name__)
@@ -35,6 +36,7 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
             api_key=api_key
         )
         self.model_load_timeout_seconds = max(1.0, float(model_load_timeout_seconds))
+        self.isolated_model_tracking = bool(isolated_model_tracking)
         self.currently_loaded_model: Optional[str] = None
         self._ready_model: Optional[str] = None
         self.kv_state = KVStateControl(self)
@@ -53,6 +55,18 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
 
         started_at = time.monotonic()
         deadline = started_at + self.model_load_timeout_seconds
+        try:
+            target_already_loaded = any(
+                item.get("id") == model_name
+                and item.get("status", {}).get("value") == "loaded"
+                for item in self._fetch_models()
+            )
+        except requests.RequestException:
+            target_already_loaded = False
+        if target_already_loaded:
+            self.logger.info("Model %s is already resident; confirming inference readiness.", model_name)
+            self._wait_until_model_ready(model_name, deadline=deadline, started_at=started_at)
+            return
         loaded_model = self._sync_loaded_model_state()
         if loaded_model == model_name:
             self.logger.info("Model %s is reported loaded; confirming inference readiness.", model_name)
@@ -91,13 +105,17 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         )
         self._wait_until_model_ready(model_name, deadline=deadline, started_at=started_at)
 
-    async def unload_model(self) -> None:
+    async def unload_model(self, model_name: Optional[str] = None) -> None:
         """Unload the currently tracked model from the llama.cpp server."""
-        await asyncio.to_thread(self.unload_model_sync)
+        await asyncio.to_thread(self.unload_model_sync, model_name)
 
-    def unload_model_sync(self) -> Optional[str]:
+    def unload_model_sync(self, model_name: Optional[str] = None) -> Optional[str]:
         """Synchronously unload the currently tracked model and return its name."""
-        loaded_model = self._sync_loaded_model_state()
+        loaded_model = str(model_name or "").strip() or (
+            self.currently_loaded_model
+            if getattr(self, "isolated_model_tracking", False)
+            else self._sync_loaded_model_state()
+        )
         if loaded_model is None:
             return None
         model = {"model": loaded_model}
@@ -109,12 +127,14 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         if response.status_code == 200:
             self.logger.info(f"Successfully unloaded model: {loaded_model}")
             unloaded_model = loaded_model
-            self._set_loaded_model_state(None)
+            if self.currently_loaded_model == loaded_model:
+                self._set_loaded_model_state(None)
             self._wait_for_model_status(unloaded_model, expected_status="unloaded")
             return unloaded_model
         elif response.status_code == 400 and "model is not running" in response.text.lower():
             self.logger.info(f"Model {loaded_model} is not running.")
-            self._set_loaded_model_state(None)
+            if self.currently_loaded_model == loaded_model:
+                self._set_loaded_model_state(None)
             return loaded_model
         raise RuntimeError(
             f"Failed to unload model {loaded_model}: HTTP {response.status_code}: "
@@ -123,6 +143,8 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
 
     def get_current_model(self) -> Optional[str]:
         """Return the model name this adapter currently tracks as loaded."""
+        if getattr(self, "isolated_model_tracking", False):
+            return self.currently_loaded_model
         return self.currently_loaded_model or self.kv_state.read_shared_state().get("currently_loaded_model")
 
     def _discover_loaded_model(self) -> Optional[str]:
@@ -196,7 +218,8 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
             self._ready_model = None
         if ready and model_name:
             self._ready_model = model_name
-        self.kv_state.update_shared_state(currently_loaded_model=model_name)
+        if not getattr(self, "isolated_model_tracking", False):
+            self.kv_state.update_shared_state(currently_loaded_model=model_name)
 
     def _invalidate_ready_model(self, model_name: Optional[str] = None) -> None:
         if model_name is None or getattr(self, "_ready_model", None) == model_name:
@@ -207,6 +230,8 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
             models = self._fetch_models()
         except requests.RequestException as exc:
             self.logger.warning("Failed to query loaded llama.cpp models: %s", exc)
+            if getattr(self, "isolated_model_tracking", False):
+                return self.currently_loaded_model
             return self.currently_loaded_model or self.kv_state.read_shared_state().get("currently_loaded_model")
 
         loaded_ids = [
@@ -221,6 +246,9 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         chosen = None
         if self.currently_loaded_model in loaded_ids:
             chosen = self.currently_loaded_model
+        elif getattr(self, "isolated_model_tracking", False):
+            self._set_loaded_model_state(None)
+            return None
         else:
             shared_model = self.kv_state.read_shared_state().get("currently_loaded_model")
             if shared_model in loaded_ids:
@@ -596,6 +624,10 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         top_k: Optional[int] = None,
+        max_tokens: Optional[int] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        chat_template_kwargs: Optional[Dict[str, Any]] = None,
+        request_timeout_seconds: Optional[float] = None,
     ) -> Iterator:
         """
         Create a streaming chat completion through the OpenAI-compatible API.
@@ -640,9 +672,17 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
             kwargs["temperature"] = temperature
         if top_p is not None:
             kwargs["top_p"] = top_p
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max(1, int(max_tokens))
+        if response_format is not None:
+            kwargs["response_format"] = response_format
+        if request_timeout_seconds is not None:
+            kwargs["timeout"] = max(0.1, float(request_timeout_seconds))
         extra_body: Dict[str, Any] = {}
         if top_k is not None and top_k > 0:
             extra_body["top_k"] = top_k
+        if chat_template_kwargs:
+            extra_body["chat_template_kwargs"] = chat_template_kwargs
         if extra_body:
             kwargs["extra_body"] = extra_body
         if tools:

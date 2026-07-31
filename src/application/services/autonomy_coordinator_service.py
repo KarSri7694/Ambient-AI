@@ -56,11 +56,13 @@ Do not repeat an action already reported as performed.
         max_inbox_items_per_day: int = 30,
         capture_store: Optional[Any] = None,
         visual_observer: Optional[Any] = None,
+        deep_visual_observer: Optional[Any] = None,
         visual_model: str = "",
         user_context_service: Optional[Any] = None,
         chat_store: Optional[Any] = None,
         chat_event_broker: Optional[Any] = None,
         task_store: Optional[Any] = None,
+        max_pending_visual_per_context: int = 2,
         logger: logging.Logger | None = None,
     ):
         self.store = store
@@ -71,11 +73,13 @@ Do not repeat an action already reported as performed.
         self.max_inbox_items_per_day = max(1, int(max_inbox_items_per_day))
         self.capture_store = capture_store
         self.visual_observer = visual_observer
+        self.deep_visual_observer = deep_visual_observer
         self.visual_model = str(visual_model or "")
         self.user_context_service = user_context_service
         self.chat_store = chat_store
         self.chat_event_broker = chat_event_broker
         self.task_store = task_store
+        self.max_pending_visual_per_context = max(1, int(max_pending_visual_per_context))
         self.logger = logger or logging.getLogger(self.__class__.__name__)
 
     def enqueue_visual_observation(self, observation: VisualObservation) -> AmbientEvent:
@@ -94,6 +98,11 @@ Do not repeat an action already reported as performed.
             "possible_next_task": observation.possible_next_task,
             "suggested_research_topics": observation.suggested_research_topics,
             "captured_at": observation.created_at,
+            "analysis_status": observation.analysis_status,
+            "analysis_latency_ms": observation.analysis_latency_ms,
+            "analysis_model": observation.analysis_model,
+            "needs_deep_analysis": observation.needs_deep_analysis,
+            "source_capture_event_id": observation.source_capture_event_id,
         }
         return self.enqueue_event(
             event_type="visual_context_changed",
@@ -163,7 +172,21 @@ Do not repeat an action already reported as performed.
             priority=0.55,
             available_at=captured_at,
         )
-        return self.store.enqueue_event(event)
+        stored = self.store.enqueue_event(event)
+        coalesce = getattr(self.store, "coalesce_pending_visual_captures", None)
+        context_key = str(
+            context.get("domain") or context.get("app_name") or context.get("process_name") or ""
+        ).strip()
+        if coalesce is not None and context_key:
+            removed = coalesce(
+                context_key=context_key,
+                keep=self.max_pending_visual_per_context,
+            )
+            if removed:
+                self.logger.info(
+                    "Coalesced %s superseded visual capture(s) for %s.", removed, context_key
+                )
+        return stored
 
     def enqueue_scheduled_task(self, *, task_id: int, description: str, run_at_utc: str, metadata_json: str | None = None) -> AmbientEvent:
         return self.enqueue_event(
@@ -250,10 +273,14 @@ Do not repeat an action already reported as performed.
         llm_service,
         personalization_context: str,
         event_callback=None,
+        event_types: list[str] | None = None,
     ) -> dict[str, Any]:
         if self.mode == "disabled":
             return {"processed": False, "reason": "disabled"}
-        event = self.store.claim_next_event(lease_seconds=self.event_lease_seconds)
+        event = self.store.claim_next_event(
+            lease_seconds=self.event_lease_seconds,
+            event_types=event_types,
+        )
         if event is None:
             return {"processed": False, "reason": "no_events"}
         self.logger.info(
@@ -269,10 +296,11 @@ Do not repeat an action already reported as performed.
             return payload
 
         try:
-            personalization_context = self._personalization_for_event(
-                event,
-                fallback=personalization_context,
-            )
+            if event.event_type != "lightweight_visual_capture":
+                personalization_context = self._personalization_for_event(
+                    event,
+                    fallback=personalization_context,
+                )
             if event.event_type == "lightweight_visual_capture":
                 event = await self._enrich_lightweight_visual(
                     event,
@@ -298,9 +326,17 @@ Do not repeat an action already reported as performed.
                     event.event_id,
                     self._safe_json(event.payload_json).get("capture_mode", "lightweight"),
                 )
-                personalization_context = self._personalization_for_event(
-                    event,
-                    fallback=personalization_context,
+                self.store.complete_event(event.event_id)
+                enriched_payload = self._safe_json(event.payload_json)
+                return event_result(
+                    {
+                        "processed": True,
+                        "outcome": "perception_completed",
+                        "observation_id": enriched_payload.get("observation_id"),
+                        "analysis_status": enriched_payload.get("analysis_status"),
+                        "analysis_latency_ms": enriched_payload.get("analysis_latency_ms"),
+                        "downstream_event_id": enriched_payload.get("downstream_event_id"),
+                    }
                 )
             if event.event_type == "delegated_action_completed":
                 return event_result(
@@ -310,6 +346,13 @@ Do not repeat an action already reported as performed.
                         llm_service=llm_service,
                         personalization_context=personalization_context,
                         event_callback=event_callback,
+                    )
+                )
+            if event.event_type == "visual_deep_enrichment":
+                return event_result(
+                    await self._process_deep_visual(
+                        event,
+                        personalization_context=personalization_context,
                     )
                 )
             if event.event_type == "approval_granted" and (
@@ -563,6 +606,23 @@ Do not repeat an action already reported as performed.
     def has_ready_work(self) -> bool:
         return bool(getattr(self.store, "has_ready_events", lambda: True)())
 
+    def has_ready_visual_work(self) -> bool:
+        checker = getattr(self.store, "has_ready_events", None)
+        if checker is None:
+            return False
+        try:
+            return bool(checker(event_types=["lightweight_visual_capture"]))
+        except TypeError:
+            return False
+
+    async def process_next_visual(self) -> dict[str, Any]:
+        return await self.process_next(
+            model=self.visual_model,
+            llm_service=None,
+            personalization_context="",
+            event_types=["lightweight_visual_capture"],
+        )
+
     def event_counts(self) -> dict[str, int]:
         return dict(getattr(self.store, "event_counts", lambda: {})())
 
@@ -637,6 +697,8 @@ Do not repeat an action already reported as performed.
                 captured_at=event.occurred_at,
                 similarity_score=payload.get("similarity_score"),
                 uiat_context_override=uiat_context,
+                observation_id=f"capture-{event.event_id}",
+                source_capture_event_id=event.event_id,
             )
         if observation is None:
             skipped = {
@@ -646,6 +708,26 @@ Do not repeat an action already reported as performed.
                 "capture_skip_reason": "visual_observer_returned_no_observation",
             }
             return replace(event, payload_json=json.dumps(skipped, ensure_ascii=False))
+        if observation.needs_deep_analysis and self.deep_visual_observer is not None:
+            downstream_event = self.enqueue_event(
+                event_type="visual_deep_enrichment",
+                source_kind="passive_observer",
+                source_ref=observation.observation_id,
+                occurred_at=observation.created_at,
+                payload={
+                    **payload,
+                    "screenshot_ref": screenshot_ref,
+                    "observation_id": observation.observation_id,
+                    "source_capture_event_id": event.event_id,
+                    "fast_summary": observation.summary,
+                    "fast_detailed_description": observation.detailed_description,
+                },
+                confidence=observation.confidence,
+                privacy_label="sensitive_visual",
+                priority=0.78,
+            )
+        else:
+            downstream_event = self.enqueue_visual_observation(observation)
         enriched = {
             **payload,
             "observation_id": observation.observation_id,
@@ -656,12 +738,88 @@ Do not repeat an action already reported as performed.
             "detailed_description": observation.detailed_description,
             "activity": observation.inferred_user_activity,
             "capture_mode": "vision_enriched",
+            "analysis_status": observation.analysis_status,
+            "analysis_latency_ms": observation.analysis_latency_ms,
+            "analysis_model": observation.analysis_model,
+            "needs_deep_analysis": observation.needs_deep_analysis,
+            "downstream_event_id": downstream_event.event_id,
         }
         return replace(
             event,
             payload_json=json.dumps(enriched, ensure_ascii=False),
             confidence=max(event.confidence, observation.confidence or 0.65),
         )
+
+    async def _process_deep_visual(
+        self,
+        event: AmbientEvent,
+        *,
+        personalization_context: str,
+    ) -> dict[str, Any]:
+        payload = self._safe_json(event.payload_json)
+        observation_id = str(payload.get("observation_id") or event.source_ref).strip()
+        screenshot_ref = str(payload.get("screenshot_ref") or "").strip()
+        existing = None
+        memory = getattr(self.deep_visual_observer or self.visual_observer, "memory", None)
+        if memory is not None and hasattr(memory, "get_visual_observation"):
+            existing = memory.get_visual_observation(observation_id)
+
+        updated = None
+        if self.deep_visual_observer is not None and self.capture_store is not None and screenshot_ref:
+            uiat_context = {
+                "window_title": payload.get("window_title"),
+                "window_class": payload.get("window_class"),
+                "process_id": payload.get("process_id"),
+                "process_name": payload.get("process_name"),
+                "app_hint": payload.get("app_name"),
+                "foreground_url": payload.get("url"),
+                "domain_hint": payload.get("domain"),
+                "visible_text_summary": payload.get("accessible_text"),
+                "contains_dialog": payload.get("contains_dialog"),
+                "contains_notification": payload.get("contains_notification"),
+                "capture_policy_applied": True,
+            }
+            try:
+                with self.capture_store.materialize(screenshot_ref) as materialized:
+                    updated = await self.deep_visual_observer.process_screenshot(
+                        screenshot_path=materialized,
+                        persisted_screenshot_path=screenshot_ref,
+                        archive_source=False,
+                        model=self.deep_visual_observer.full_model,
+                        recent_context=personalization_context,
+                        captured_at=event.occurred_at,
+                        similarity_score=payload.get("similarity_score"),
+                        uiat_context_override=uiat_context,
+                        observation_id=observation_id,
+                        source_capture_event_id=payload.get("source_capture_event_id"),
+                        force_full_analysis=True,
+                        allow_uiat_fallback=False,
+                    )
+            except Exception as exc:
+                self.logger.warning("Deep visual enrichment failed for %s: %s", observation_id, exc)
+
+        if updated is None:
+            updated = existing
+        if updated is None:
+            self.store.complete_event(
+                event.event_id,
+                status="dead_letter",
+                error_text="deep visual enrichment had no persisted first-pass observation",
+            )
+            return {"processed": True, "outcome": "deep_enrichment_missing_observation"}
+
+        status = "deep_enriched" if updated is not existing else "deep_enrichment_failed"
+        updated = replace(updated, analysis_status=status, needs_deep_analysis=False)
+        if memory is not None and hasattr(memory, "append_visual_observation"):
+            memory.append_visual_observation(updated)
+        downstream = self.enqueue_visual_observation(updated)
+        self.store.complete_event(event.event_id)
+        return {
+            "processed": True,
+            "outcome": status,
+            "observation_id": updated.observation_id,
+            "downstream_event_id": downstream.event_id,
+        }
 
     def _allowed_tool_names(self, llm_service, confidence: float) -> set[str]:
         definitions = llm_service.available_tool_definitions()
@@ -751,9 +909,15 @@ Do not repeat an action already reported as performed.
         def delegated_event_callback(item: dict[str, Any]) -> None:
             nonlocal control_started
             tool_name = str(item.get("tool_name") or "")
-            if item.get("type") == "tool_started" and tool_name not in {
-                "finish_browser_task", "finish_computer_task"
-            }:
+            item_type = str(item.get("type") or "")
+            control_event = (
+                item_type == "browser_visual_step"
+                or (
+                    item_type == "tool_started"
+                    and tool_name not in {"finish_browser_task", "finish_computer_task"}
+                )
+            )
+            if control_event:
                 if not control_started:
                     control_started = True
                     self.store.update_delegated_task(

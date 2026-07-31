@@ -1,5 +1,6 @@
 import copy
 import json
+import logging
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +25,7 @@ class LoggingLLMProvider(LLMProvider):
         capture_store: Any = None,
         residency_manager: Any = None,
     ):
+        self.logger = logging.getLogger(self.__class__.__name__)
         self.provider = provider
         self.log_store = log_store
         self.current_response_path = Path(current_response_path) if current_response_path else None
@@ -32,6 +34,39 @@ class LoggingLLMProvider(LLMProvider):
         self._current_response_state: Dict[str, Any] | None = None
         if self.current_response_path is not None:
             self.current_response_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _persist_interaction_image(
+        self,
+        image: str,
+        *,
+        interaction_id: str,
+        preferred_reference: str = "",
+    ) -> str | None:
+        """Return a stable image reference suitable for a durable interaction row."""
+        preferred = str(preferred_reference or "").strip()
+        if preferred.startswith("capture://"):
+            return preferred
+        image_value = str(image or "").strip()
+        if not image_value:
+            return None
+        if image_value.startswith("capture://") or self.capture_store is None:
+            return image_value
+        try:
+            return self.capture_store.store_file(
+                image_value,
+                kind="interaction_image",
+                delete_source=False,
+            )
+        except (OSError, ValueError) as exc:
+            # Logging must never prevent the actual inference request. Retaining
+            # the path preserves legacy behavior for persistent media roots.
+            self.logger.warning(
+                "Could not persist interaction image %s for %s: %s",
+                image_value,
+                interaction_id,
+                exc,
+            )
+            return image_value
 
     def __getattr__(self, name: str):
         return getattr(self.provider, name)
@@ -92,6 +127,11 @@ class LoggingLLMProvider(LLMProvider):
         source = current_interaction_source()
         metadata = current_interaction_metadata()
         interaction_run_id = metadata.get("interaction_run_id") or uuid.uuid4().hex
+        logged_image_path = self._persist_interaction_image(
+            image,
+            interaction_id=interaction_id,
+            preferred_reference=str(metadata.get("image_path") or ""),
+        )
         self._write_current_response(
             source=source,
             model=getattr(self.provider, "currently_loaded_model", "") or "unknown",
@@ -123,7 +163,7 @@ class LoggingLLMProvider(LLMProvider):
                     source=source,
                     model=getattr(self.provider, "currently_loaded_model", "") or "unknown",
                     messages_json=self._messages_json([{"role": "user", "content": prompt}], source=source, interaction_id=interaction_id),
-                    image_path=image or None,
+                    image_path=logged_image_path,
                     response_text=response,
                     duration_ms=int((perf_counter() - started) * 1000),
                     metadata_json=json.dumps(metadata, ensure_ascii=False, indent=2) if metadata else None,
@@ -152,7 +192,7 @@ class LoggingLLMProvider(LLMProvider):
                     source=source,
                     model=getattr(self.provider, "currently_loaded_model", "") or "unknown",
                     messages_json=self._messages_json([{"role": "user", "content": prompt}], source=source, interaction_id=interaction_id),
-                    image_path=image or None,
+                    image_path=logged_image_path,
                     error_text=str(exc),
                     duration_ms=int((perf_counter() - started) * 1000),
                     metadata_json=json.dumps(metadata, ensure_ascii=False, indent=2) if metadata else None,
@@ -170,6 +210,10 @@ class LoggingLLMProvider(LLMProvider):
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         top_k: Optional[int] = None,
+        max_tokens: Optional[int] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        chat_template_kwargs: Optional[Dict[str, Any]] = None,
+        request_timeout_seconds: Optional[float] = None,
     ):
         started_at = datetime.now().isoformat()
         started = perf_counter()
@@ -177,20 +221,34 @@ class LoggingLLMProvider(LLMProvider):
         source = current_interaction_source()
         metadata = current_interaction_metadata()
         interaction_run_id = metadata.get("interaction_run_id") or uuid.uuid4().hex
+        logged_image_path = self._persist_interaction_image(
+            image,
+            interaction_id=interaction_id,
+            preferred_reference=str(metadata.get("image_path") or ""),
+        )
         response_text_parts: List[str] = []
         reasoning_text_parts: List[str] = []
         streamed_tool_calls: Dict[int, Dict[str, Any]] = {}
 
         try:
-            completion = await self.provider.chat_completion_stream(
-                model=model,
-                messages=messages,
-                tools=tools,
-                image=image,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-            )
+            provider_kwargs: Dict[str, Any] = {
+                "model": model,
+                "messages": messages,
+                "tools": tools,
+                "image": image,
+                "temperature": temperature,
+                "top_p": top_p,
+                "top_k": top_k,
+            }
+            if max_tokens is not None:
+                provider_kwargs["max_tokens"] = max_tokens
+            if response_format is not None:
+                provider_kwargs["response_format"] = response_format
+            if chat_template_kwargs is not None:
+                provider_kwargs["chat_template_kwargs"] = chat_template_kwargs
+            if request_timeout_seconds is not None:
+                provider_kwargs["request_timeout_seconds"] = request_timeout_seconds
+            completion = await self.provider.chat_completion_stream(**provider_kwargs)
             self._write_current_response(
                 source=source,
                 model=model,
@@ -260,7 +318,7 @@ class LoggingLLMProvider(LLMProvider):
                             model=model,
                             messages_json=self._messages_json(messages, source=source, interaction_id=interaction_id),
                             tools_json=json.dumps(tools, ensure_ascii=False, indent=2) if tools is not None else None,
-                            image_path=image or None,
+                            image_path=logged_image_path,
                             response_text="".join(response_text_parts) or None,
                             reasoning_text="".join(reasoning_text_parts) or None,
                             tool_calls_json=json.dumps(list(streamed_tool_calls.values()), ensure_ascii=False, indent=2)
@@ -294,7 +352,7 @@ class LoggingLLMProvider(LLMProvider):
                             model=model,
                             messages_json=self._messages_json(messages, source=source, interaction_id=interaction_id),
                             tools_json=json.dumps(tools, ensure_ascii=False, indent=2) if tools is not None else None,
-                            image_path=image or None,
+                            image_path=logged_image_path,
                             response_text="".join(response_text_parts) or None,
                             reasoning_text="".join(reasoning_text_parts) or None,
                             tool_calls_json=json.dumps(list(streamed_tool_calls.values()), ensure_ascii=False, indent=2)
@@ -329,7 +387,7 @@ class LoggingLLMProvider(LLMProvider):
                     model=model,
                     messages_json=self._messages_json(messages, source=source, interaction_id=interaction_id),
                     tools_json=json.dumps(tools, ensure_ascii=False, indent=2) if tools is not None else None,
-                    image_path=image or None,
+                    image_path=logged_image_path,
                     error_text=str(exc),
                     duration_ms=int((perf_counter() - started) * 1000),
                     metadata_json=json.dumps(metadata, ensure_ascii=False, indent=2) if metadata else None,

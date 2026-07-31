@@ -2,6 +2,7 @@ import json
 import asyncio
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -76,6 +77,63 @@ def test_fara_action_parser_accepts_official_xml_shape(tmp_path):
     assert action == {"action": "scroll", "pixels": -600}
 
 
+def test_fara_action_parser_recovers_qwen_xml_action_from_reasoning(tmp_path):
+    session = _session(tmp_path)
+    action = session._parse_text_action(
+        """The next step is direct navigation.
+<tool_call>
+<function=computer_use>
+<parameter=action>
+visit_url", "url": "https://huggingface.co/bartowski/Fara1.5-27B-GGUF/tree/main"
+</function>
+</tool_call>"""
+    )
+    assert action == {
+        "action": "visit_url",
+        "url": "https://huggingface.co/bartowski/Fara1.5-27B-GGUF/tree/main",
+    }
+
+
+def test_fara_request_action_reads_reasoning_content(tmp_path):
+    asyncio.run(_exercise_reasoning_content_action(tmp_path))
+
+
+async def _exercise_reasoning_content_action(tmp_path):
+    class _ReasoningLLM:
+        async def chat_completion_stream(self, **kwargs):
+            assert kwargs["tools"][0]["function"]["name"] == "computer_use"
+            assert kwargs["chat_template_kwargs"] == {"enable_thinking": False}
+
+            async def _stream():
+                delta = SimpleNamespace(
+                    content=None,
+                    reasoning_content=(
+                        "<tool_call><function=computer_use>"
+                        "<parameter=action>web_search\", \"query\": \"Fara 1.5 27B GGUF\""
+                        "</parameter></function></tool_call>"
+                    ),
+                    tool_calls=None,
+                )
+                yield SimpleNamespace(choices=[SimpleNamespace(delta=delta)])
+
+            return _stream()
+
+    screenshot = tmp_path / "screen.png"
+    screenshot.write_bytes(b"not-a-real-png")
+    session = _session(tmp_path)
+    session.llm = _ReasoningLLM()
+
+    action = await session._request_action(
+        task="Find Fara GGUF files.",
+        model="Fara1.5-27B",
+        screenshot_path=screenshot,
+        current_url="https://duckduckgo.com/",
+        step=1,
+    )
+
+    assert action == {"action": "web_search", "query": "Fara 1.5 27B GGUF"}
+
+
 def test_fara_action_validation_is_coordinate_bounded(tmp_path):
     session = _session(tmp_path)
     assert session._validate_action(
@@ -87,6 +145,25 @@ def test_fara_action_validation_is_coordinate_bounded(tmp_path):
         )
     with pytest.raises(ValueError, match="not allowed"):
         session._validate_action({"action": "run_javascript", "text": "alert(1)"})
+
+
+def test_fara_validation_recovers_malformed_structured_action_field(tmp_path):
+    session = _session(tmp_path)
+    action = session._validate_action(
+        {
+            "action": (
+                'visit_url", "coordinate": [831, 64], '
+                '"text": "https://huggingface.co/bartowski/Fara1.5-27B-GGUF/tree/main", '
+                '"press_enter": true, "delete_existing_text": true}'
+            )
+        }
+    )
+
+    assert action["action"] == "visit_url"
+    assert action["url"] == "https://huggingface.co/bartowski/Fara1.5-27B-GGUF/tree/main"
+    assert action["text"] == "https://huggingface.co/bartowski/Fara1.5-27B-GGUF/tree/main"
+    assert action["press_enter"] is True
+    assert action["delete_existing_text"] is True
 
 
 def test_visual_backend_source_has_no_dom_or_uia_grounding():

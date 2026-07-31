@@ -13,6 +13,7 @@ sys.path.insert(0, str(SRC_ROOT))
 from application.services.interaction_trace import interaction_trace
 from infrastructure.adapter.LoggingLLMProvider import LoggingLLMProvider
 from infrastructure.adapter.SQLiteInteractionLogAdapter import SQLiteInteractionLogAdapter
+from infrastructure.plain_capture_store import PlainCaptureStore
 
 
 class _FakeDelta:
@@ -82,6 +83,73 @@ class InteractionLoggingTests(unittest.TestCase):
             self.assertEqual(rows[0].response_text, "hello world")
             self.assertEqual(json.loads(rows[0].metadata_json)["kind"], "test")
             self.assertIsNotNone(rows[0].interaction_run_id)
+
+    def test_ephemeral_interaction_image_is_copied_to_capture_store(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image_path = root / "temporary-inference.jpg"
+            image_path.write_bytes(b"jpeg-bytes")
+            captures = PlainCaptureStore(str(root / "captures"))
+            store = SQLiteInteractionLogAdapter(str(root / "interaction_logs.db"))
+            provider = LoggingLLMProvider(
+                FakeLLMProvider(),
+                store,
+                capture_store=captures,
+            )
+
+            async def _run():
+                stream = await provider.chat_completion_stream(
+                    model="vision-model",
+                    messages=[{"role": "user", "content": "inspect"}],
+                    image=str(image_path),
+                )
+                async for _ in stream:
+                    pass
+
+            asyncio.run(_run())
+            image_path.unlink()
+
+            row = store.list_recent(limit=1)[0]
+            self.assertTrue(str(row.image_path).startswith("capture://"))
+            data, metadata = captures.read_bytes(str(row.image_path))
+            self.assertEqual(data, b"jpeg-bytes")
+            self.assertEqual(metadata["kind"], "interaction_image")
+
+    def test_existing_capture_reference_is_reused_without_duplicate(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            captures = PlainCaptureStore(str(root / "captures"))
+            original_ref = captures.store_bytes(
+                b"original-image",
+                original_name="screen.png",
+                kind="screenshot",
+                mime_type="image/png",
+            )
+            inference_path = root / "resized.jpg"
+            inference_path.write_bytes(b"resized-image")
+            store = SQLiteInteractionLogAdapter(str(root / "interaction_logs.db"))
+            provider = LoggingLLMProvider(
+                FakeLLMProvider(),
+                store,
+                capture_store=captures,
+            )
+
+            async def _run():
+                with interaction_trace("passive_observer", {"image_path": original_ref}):
+                    stream = await provider.chat_completion_stream(
+                        model="vision-model",
+                        messages=[{"role": "user", "content": "inspect"}],
+                        image=str(inference_path),
+                    )
+                    async for _ in stream:
+                        pass
+
+            asyncio.run(_run())
+
+            row = store.list_recent(limit=1)[0]
+            self.assertEqual(row.image_path, original_ref)
+            interaction_images = list((root / "captures" / "interaction_image").glob("*"))
+            self.assertEqual(interaction_images, [])
 
     def test_attach_report_persists_and_updates_markdown(self):
         with tempfile.TemporaryDirectory() as tmpdir:

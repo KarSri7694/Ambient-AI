@@ -3,6 +3,7 @@ import json
 import logging
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import requests
@@ -397,6 +398,39 @@ def test_inference_refuses_model_without_confirmed_readiness():
         )
 
 
+def test_bounded_visual_request_options_are_forwarded_to_llama_cpp():
+    adapter = LlamaCppAdapter("http://localhost:8080")
+    captured = {}
+
+    class _Completions:
+        async def create(self, **kwargs):
+            captured.update(kwargs)
+            return "stream"
+
+    adapter.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=_Completions())
+    )
+    adapter._require_model_ready = lambda _model: None
+    schema = {"type": "json_schema", "json_schema": {"name": "observation", "schema": {"type": "object"}}}
+
+    result = asyncio.run(
+        adapter.chat_completion_stream(
+            model="fast-vlm",
+            messages=[{"role": "user", "content": "inspect"}],
+            max_tokens=256,
+            response_format=schema,
+            chat_template_kwargs={"enable_thinking": False},
+            request_timeout_seconds=16,
+        )
+    )
+
+    assert result == "stream"
+    assert captured["max_tokens"] == 256
+    assert captured["response_format"] == schema
+    assert captured["timeout"] == 16
+    assert captured["extra_body"]["chat_template_kwargs"] == {"enable_thinking": False}
+
+
 def test_async_load_does_not_block_event_loop(monkeypatch):
     adapter = LlamaCppAdapter("http://localhost:8080")
 
@@ -415,6 +449,83 @@ def test_async_load_does_not_block_event_loop(monkeypatch):
         return event_loop_remained_responsive
 
     assert asyncio.run(exercise()) is True
+
+
+def test_isolated_adapter_does_not_adopt_another_resident_model(monkeypatch):
+    adapter = LlamaCppAdapter(
+        "http://localhost:8080",
+        isolated_model_tracking=True,
+    )
+    shared_state = {"currently_loaded_model": "main-model"}
+    adapter.kv_state.read_shared_state = lambda: dict(shared_state)
+    adapter.kv_state.update_shared_state = lambda **values: shared_state.update(values)
+    monkeypatch.setattr(
+        adapter,
+        "_fetch_models",
+        lambda: [
+            {"id": "main-model", "status": {"value": "loaded"}},
+            {"id": "passive-vlm", "status": {"value": "loaded"}},
+        ],
+    )
+
+    assert adapter._sync_loaded_model_state() is None
+    assert adapter.get_current_model() is None
+    assert shared_state["currently_loaded_model"] == "main-model"
+
+
+def test_isolated_adapters_unload_only_the_model_they_own(monkeypatch):
+    main = LlamaCppAdapter("http://localhost:8080", isolated_model_tracking=True)
+    vision = LlamaCppAdapter("http://localhost:8080", isolated_model_tracking=True)
+    main.currently_loaded_model = "main-model"
+    main._ready_model = "main-model"
+    vision.currently_loaded_model = "passive-vlm"
+    vision._ready_model = "passive-vlm"
+    calls = []
+
+    def fake_post(url, json=None, timeout=None):
+        calls.append((url, json))
+        return _HttpResponse(payload={"success": True})
+
+    monkeypatch.setattr("infrastructure.adapter.llamaCppAdapter.requests.post", fake_post)
+    monkeypatch.setattr(main, "_wait_for_model_status", lambda *args, **kwargs: None)
+    monkeypatch.setattr(vision, "_wait_for_model_status", lambda *args, **kwargs: None)
+
+    main.unload_model_sync()
+
+    assert calls == [
+        ("http://localhost:8080/models/unload", {"model": "main-model"})
+    ]
+    assert main.currently_loaded_model is None
+    assert vision.currently_loaded_model == "passive-vlm"
+
+
+def test_isolated_adapter_reuses_already_resident_owned_model(monkeypatch):
+    adapter = LlamaCppAdapter(
+        "http://localhost:8080",
+        isolated_model_tracking=True,
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_fetch_models",
+        lambda timeout_seconds=10: [
+            {"id": "main-model", "status": {"value": "loaded"}},
+            {"id": "passive-vlm", "status": {"value": "loaded"}},
+        ],
+    )
+
+    def fake_ready(model_name, *, deadline, started_at=None):
+        adapter._set_loaded_model_state(model_name, ready=True)
+
+    monkeypatch.setattr(adapter, "_wait_until_model_ready", fake_ready)
+    monkeypatch.setattr(
+        "infrastructure.adapter.llamaCppAdapter.requests.post",
+        lambda *args, **kwargs: pytest.fail("resident model should not be loaded or unloaded again"),
+    )
+
+    adapter.load_model_sync("passive-vlm")
+
+    assert adapter.currently_loaded_model == "passive-vlm"
+    assert adapter._ready_model == "passive-vlm"
 
 
 def test_kv_state_stack_is_lifo(monkeypatch):

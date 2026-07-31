@@ -17,7 +17,7 @@ from application.services.capability_policy_service import CapabilityPolicyServi
 from application.services.capture_control_service import CaptureControlService
 from application.services.opportunity_judgment_service import OpportunityJudgmentService
 from application.services.llm_interaction_service import InteractionSuspended
-from core.models import AmbientEvent, ApprovalGrant, DelegatedTask
+from core.models import AmbientEvent, ApprovalGrant, DelegatedTask, VisualObservation
 from infrastructure.adapter.SQLiteAutonomyAdapter import SQLiteAutonomyAdapter
 from infrastructure.plain_capture_store import PlainCaptureStore
 from infrastructure.runtime_log_server import RuntimeLogBuffer, create_runtime_log_app
@@ -117,6 +117,67 @@ class _CompletingInvestigationService:
     async def run_interaction(self, **kwargs):
         self.calls.append(kwargs)
         return "Completed the queued ROCm benchmark comparison."
+
+
+class _FastVisualObserver:
+    def __init__(self, memory=None, needs_deep_analysis=False):
+        self.calls = []
+        self.memory = memory
+        self.needs_deep_analysis = needs_deep_analysis
+
+    async def process_screenshot(self, **kwargs):
+        self.calls.append(kwargs)
+        observation = VisualObservation(
+            observation_id=kwargs["observation_id"],
+            screenshot_path=kwargs["persisted_screenshot_path"],
+            created_at=kwargs["captured_at"],
+            app_name="Browser",
+            page_hint="Example page",
+            summary="A product comparison is visible.",
+            detailed_description="Two products and their prices are shown.",
+            inferred_user_activity="Comparing products",
+            confidence=0.75,
+            analysis_status="model",
+            analysis_latency_ms=4200,
+            analysis_model="fast-vlm",
+            source_capture_event_id=kwargs["source_capture_event_id"],
+            needs_deep_analysis=self.needs_deep_analysis,
+        )
+        if self.memory is not None:
+            self.memory.append_visual_observation(observation)
+        return observation
+
+
+class _VisualMemory:
+    def __init__(self):
+        self.items = {}
+
+    def append_visual_observation(self, observation):
+        self.items[observation.observation_id] = observation
+
+    def get_visual_observation(self, observation_id):
+        return self.items.get(observation_id)
+
+
+class _DeepVisualObserver:
+    def __init__(self, memory):
+        self.memory = memory
+        self.full_model = "deep-vlm"
+        self.calls = []
+
+    async def process_screenshot(self, **kwargs):
+        self.calls.append(kwargs)
+        existing = self.memory.get_visual_observation(kwargs["observation_id"])
+        return VisualObservation(
+            **{
+                **existing.__dict__,
+                "summary": "A detailed product comparison with prices is visible.",
+                "detailed_description": "The larger model extracted both product names and exact prices.",
+                "analysis_model": "deep-vlm",
+                "analysis_latency_ms": 12000,
+                "needs_deep_analysis": False,
+            }
+        )
 
 
 def _event(event_id: str = "event-1", fingerprint: str = "fingerprint-1") -> AmbientEvent:
@@ -225,6 +286,109 @@ def test_event_store_repairs_future_screen_timestamps_from_legacy_local_clock(tm
     claimed = restarted.claim_next_event()
     assert claimed is not None
     assert datetime.fromisoformat(claimed.occurred_at) <= datetime.now(timezone.utc)
+
+
+def test_visual_perception_completes_capture_before_judgment(tmp_path):
+    store = SQLiteAutonomyAdapter(str(tmp_path / "autonomy.db"))
+    capture_store = PlainCaptureStore(str(tmp_path / "captures"))
+    screenshot = tmp_path / "screen.png"
+    screenshot.write_bytes(b"test-image")
+    screenshot_ref = capture_store.store_file(str(screenshot), kind="screenshot", delete_source=False)
+    observer = _FastVisualObserver()
+    user_context = _UserContext()
+    coordinator = AutonomyCoordinatorService(
+        store=store,
+        judgment=_CapturingJudgment(),
+        policy=CapabilityPolicyService(store=store),
+        mode="shadow",
+        capture_store=capture_store,
+        visual_observer=observer,
+        visual_model="fast-vlm",
+        user_context_service=user_context,
+    )
+    captured_at = datetime.now(timezone.utc).isoformat()
+    capture_event = coordinator.enqueue_lightweight_visual(
+        screenshot_ref=screenshot_ref,
+        captured_at=captured_at,
+        context={"app_name": "Browser", "window_title": "Example", "accessible_text": "Products"},
+        similarity_score=0.5,
+    )
+
+    result = asyncio.run(coordinator.process_next_visual())
+
+    assert result["outcome"] == "perception_completed"
+    assert result["analysis_latency_ms"] == 4200
+    assert observer.calls[0]["source_capture_event_id"] == capture_event.event_id
+    assert user_context.queries == []
+    counts = store.event_counts()
+    assert counts["processed"] == 1
+    assert counts["pending"] == 1
+    downstream = store.claim_next_event(event_types=["visual_context_changed"])
+    assert downstream is not None
+    assert json.loads(downstream.payload_json)["analysis_model"] == "fast-vlm"
+
+
+def test_high_salience_visual_is_deep_enriched_asynchronously(tmp_path):
+    store = SQLiteAutonomyAdapter(str(tmp_path / "autonomy.db"))
+    capture_store = PlainCaptureStore(str(tmp_path / "captures"))
+    screenshot = tmp_path / "screen.png"
+    screenshot.write_bytes(b"test-image")
+    screenshot_ref = capture_store.store_file(str(screenshot), kind="screenshot", delete_source=False)
+    memory = _VisualMemory()
+    fast = _FastVisualObserver(memory=memory, needs_deep_analysis=True)
+    deep = _DeepVisualObserver(memory)
+    coordinator = AutonomyCoordinatorService(
+        store=store,
+        judgment=_CapturingJudgment(),
+        policy=CapabilityPolicyService(store=store),
+        mode="shadow",
+        capture_store=capture_store,
+        visual_observer=fast,
+        deep_visual_observer=deep,
+        visual_model="fast-vlm",
+    )
+    coordinator.enqueue_lightweight_visual(
+        screenshot_ref=screenshot_ref,
+        captured_at=datetime.now(timezone.utc).isoformat(),
+        context={"app_name": "Browser", "window_title": "Checkout warning"},
+        similarity_score=0.4,
+    )
+
+    perception = asyncio.run(coordinator.process_next_visual())
+    deep_result = asyncio.run(
+        coordinator.process_next(model="deep-vlm", llm_service=None, personalization_context="profile")
+    )
+
+    assert perception["outcome"] == "perception_completed"
+    assert deep_result["outcome"] == "deep_enriched"
+    assert deep.calls[0]["force_full_analysis"] is True
+    downstream = store.claim_next_event(event_types=["visual_context_changed"])
+    assert downstream is not None
+    downstream_payload = json.loads(downstream.payload_json)
+    assert downstream_payload["analysis_status"] == "deep_enriched"
+    assert downstream_payload["analysis_model"] == "deep-vlm"
+
+
+def test_visual_capture_backlog_keeps_only_recent_context_items(tmp_path):
+    store = SQLiteAutonomyAdapter(str(tmp_path / "autonomy.db"))
+    coordinator = AutonomyCoordinatorService(
+        store=store,
+        judgment=_CapturingJudgment(),
+        policy=CapabilityPolicyService(store=store),
+        mode="shadow",
+        max_pending_visual_per_context=2,
+    )
+    for index in range(3):
+        coordinator.enqueue_lightweight_visual(
+            screenshot_ref=f"capture://{'a' * 31}{index}",
+            captured_at=(datetime.now(timezone.utc) + timedelta(seconds=index)).isoformat(),
+            context={"app_name": "Browser", "accessible_text": f"state {index}"},
+            similarity_score=0.5,
+        )
+
+    counts = store.event_counts()
+    assert counts["pending"] == 2
+    assert counts["ignored"] == 1
 
 
 def test_shadow_coordinator_judges_active_context_without_idle_trigger(tmp_path):

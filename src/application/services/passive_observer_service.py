@@ -1,12 +1,17 @@
+import asyncio
 import json
 import logging
 import re
+import tempfile
+import time
 import uuid
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
+
+from PIL import Image
 
 from application.ports.LLMProvider import LLMProvider
 from application.ports.memory_port import MemoryPort
@@ -45,26 +50,49 @@ Rules:
 - Use the provided screenshot timestamp only as context for when the observation was captured.
 - If the screen is idle, blank, locked, or not useful, keep the four fields minimal and factual.
 """
-    FAST_ROUTER_PROMPT = """You are a fast screen routing model for an ambient personal agent.
-
-Look at the screenshot and return JSON only with exactly these fields:
-{
-  "app_page": "short app/site and page/screen description combined into one line",
-  "summary": "1 sentence summary of what is on screen",
-  "detailed_description": "short but concrete description of the current screen state",
-  "inferred_user_activity": "what the user appears to be doing",
-  "maybe_require_a_reminder": false,
-  "reminder_context": {
-    "message_to_user": "",
-    "due_date": ""
-  }
-}
-
-Rules:
-- Keep the response compact and concrete.
-- Prefer continuity-sensitive observations over exhaustive description.
-- Return valid JSON only.
-"""
+    FAST_ROUTER_PROMPT = """Extract the current screen state for an ambient assistant.
+Return only the requested JSON. Use visible evidence, not speculation. Keep the summary to one
+sentence and the detailed description below 500 characters. Record at most five salient facts.
+Set needs_deep_analysis only when important text or intent cannot be captured confidently from
+the screenshot and supplied accessibility text. Do not explain your reasoning."""
+    FAST_RESPONSE_SCHEMA = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "ambient_visual_observation",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": [
+                    "app_page", "summary", "detailed_description", "inferred_user_activity",
+                    "maybe_require_a_reminder", "reminder_context", "salient_facts",
+                    "salience", "needs_deep_analysis",
+                ],
+                "properties": {
+                    "app_page": {"type": "string", "maxLength": 160},
+                    "summary": {"type": "string", "maxLength": 240},
+                    "detailed_description": {"type": "string", "maxLength": 500},
+                    "inferred_user_activity": {"type": "string", "maxLength": 200},
+                    "maybe_require_a_reminder": {"type": "boolean"},
+                    "reminder_context": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["message_to_user", "due_date"],
+                        "properties": {
+                            "message_to_user": {"type": "string", "maxLength": 240},
+                            "due_date": {"type": "string", "maxLength": 40},
+                        },
+                    },
+                    "salient_facts": {
+                        "type": "array", "maxItems": 5,
+                        "items": {"type": "string", "maxLength": 180},
+                    },
+                    "salience": {"type": "string", "enum": ["low", "medium", "high"]},
+                    "needs_deep_analysis": {"type": "boolean"},
+                },
+            },
+        },
+    }
 
     def __init__(
         self,
@@ -81,6 +109,13 @@ Rules:
         always_full_apps: Optional[List[str]] = None,
         always_full_domains: Optional[List[str]] = None,
         fast_model_retry_count: int = 2,
+        processing_budget_seconds: float = 20.0,
+        vlm_request_timeout_seconds: float = 16.0,
+        max_output_tokens: int = 256,
+        inference_width: int = 960,
+        inference_height: int = 540,
+        inference_jpeg_quality: int = 82,
+        uiat_text_max_chars: int = 1200,
         uiat_adapter: Optional[Any] = None,
         persist_observations: bool = True,
         capture_store: Optional[Any] = None,
@@ -101,6 +136,15 @@ Rules:
         self.always_full_apps = {str(item).strip().lower() for item in (always_full_apps or []) if str(item).strip()}
         self.always_full_domains = {str(item).strip().lower() for item in (always_full_domains or []) if str(item).strip()}
         self.fast_model_retry_count = max(0, int(fast_model_retry_count))
+        self.processing_budget_seconds = max(1.0, float(processing_budget_seconds))
+        self.vlm_request_timeout_seconds = max(
+            0.5, min(float(vlm_request_timeout_seconds), self.processing_budget_seconds)
+        )
+        self.max_output_tokens = max(64, int(max_output_tokens))
+        self.inference_width = max(320, int(inference_width))
+        self.inference_height = max(180, int(inference_height))
+        self.inference_jpeg_quality = max(40, min(95, int(inference_jpeg_quality)))
+        self.uiat_text_max_chars = max(200, int(uiat_text_max_chars))
         self.uiat_adapter = uiat_adapter
         self.persist_observations = bool(persist_observations)
         self.capture_store = capture_store
@@ -148,16 +192,23 @@ Rules:
         persisted_screenshot_path: str | None = None,
         archive_source: bool = True,
         uiat_context_override: Optional[Dict[str, Any]] = None,
+        observation_id: str | None = None,
+        source_capture_event_id: str | None = None,
+        force_full_analysis: bool = False,
+        allow_uiat_fallback: bool = True,
     ) -> Optional[VisualObservation]:
         stored_screenshot_path = persisted_screenshot_path or screenshot_path
         try:
             parsed = await self._analyze(
                 screenshot_path=screenshot_path,
+                interaction_image_path=stored_screenshot_path,
                 model=model,
                 recent_context=recent_context,
                 captured_at=captured_at,
                 similarity_score=similarity_score,
                 uiat_context_override=uiat_context_override,
+                force_full_analysis=force_full_analysis,
+                allow_uiat_fallback=allow_uiat_fallback,
             )
         finally:
             if archive_source and self.capture_store is not None and Path(screenshot_path).exists():
@@ -178,7 +229,7 @@ Rules:
                 mime_type="application/json",
             )
         observation = VisualObservation(
-            observation_id=uuid.uuid4().hex,
+            observation_id=observation_id or uuid.uuid4().hex,
             screenshot_path=stored_screenshot_path,
             created_at=captured_at or datetime.now().isoformat(),
             observation_type="screen",
@@ -189,14 +240,19 @@ Rules:
             detailed_description=self._opt_text(parsed.get("detailed_description")) or "",
             inferred_user_activity=self._opt_text(parsed.get("inferred_user_activity")) or "",
             previous_activity_status="unclear",
-            salient_entities=[],
+            salient_entities=self._list_text(parsed.get("salient_facts")),
             completed_items=[],
             open_loops=[],
             possible_next_task=None,
             suggested_research_topics=[],
             user_fact_hypotheses=[],
-            confidence=0.0,
+            confidence=0.45 if parsed.get("_analysis_status") == "uiat_fallback" else 0.75,
             raw_payload_json=raw_payload_json,
+            analysis_status=str(parsed.get("_analysis_status") or "model"),
+            analysis_latency_ms=int(parsed.get("_analysis_latency_ms") or 0),
+            analysis_model=str(parsed.get("_analysis_model") or self.fast_model or model),
+            needs_deep_analysis=bool(parsed.get("needs_deep_analysis")),
+            source_capture_event_id=source_capture_event_id,
         )
         if not self.persist_observations:
             self.logger.debug(
@@ -281,22 +337,30 @@ Rules:
         self,
         *,
         screenshot_path: str,
+        interaction_image_path: str = "",
         model: str,
         recent_context: str,
         captured_at: str | None = None,
         similarity_score: float | None = None,
         uiat_context_override: Optional[Dict[str, Any]] = None,
+        force_full_analysis: bool = False,
+        allow_uiat_fallback: bool = True,
     ) -> dict:
         if not Path(screenshot_path).exists():
             self.logger.warning("Passive observer screenshot missing before analysis: %s", screenshot_path)
             return {}
-        recent_observations = self.memory.get_recent_visual_observations(limit=3)
+        analysis_started = time.perf_counter()
+        recent_observations = self.memory.get_recent_visual_observations(limit=1)
         previous_observation = recent_observations[0] if recent_observations else None
         uiat_context = dict(uiat_context_override or self._inspect_foreground_window())
-        route = self._route_screenshot(
-            similarity_score=similarity_score,
-            uiat_context=uiat_context,
-            previous_observation=previous_observation,
+        route = (
+            "full_vlm"
+            if force_full_analysis
+            else self._route_screenshot(
+                similarity_score=similarity_score,
+                uiat_context=uiat_context,
+                previous_observation=previous_observation,
+            )
         )
         if route == "skip":
             return {}
@@ -304,6 +368,7 @@ Rules:
         if route == "fast_model":
             parsed = await self._run_fast_model(
                 screenshot_path=screenshot_path,
+                interaction_image_path=interaction_image_path,
                 model=model,
                 captured_at=captured_at,
                 similarity_score=similarity_score,
@@ -313,6 +378,7 @@ Rules:
         else:
             parsed = await self._run_full_model(
                 screenshot_path=screenshot_path,
+                interaction_image_path=interaction_image_path,
                 model=model,
                 recent_context=recent_context,
                 captured_at=captured_at,
@@ -321,8 +387,16 @@ Rules:
                 recent_observations=recent_observations,
                 uiat_context=uiat_context,
             )
+        if (not isinstance(parsed, dict) or not parsed) and allow_uiat_fallback:
+            parsed = self._uiat_fallback(
+                uiat_context=uiat_context,
+                captured_at=captured_at,
+                reason="vlm_timeout_or_invalid_response",
+            )
         if isinstance(parsed, dict) and parsed:
             parsed.setdefault("_analysis_mode", route)
+            parsed.setdefault("_analysis_latency_ms", int((time.perf_counter() - analysis_started) * 1000))
+            parsed.setdefault("_analysis_model", self.fast_model if route == "fast_model" else self.full_model)
             if similarity_score is not None:
                 parsed.setdefault("_similarity_score", similarity_score)
             if uiat_context:
@@ -479,18 +553,12 @@ Rules:
         if excluded:
             self.logger.debug("Routing decision=skip reason=policy_ignore")
             return "skip"
-        if has_override:
-            self.logger.debug("Routing decision=full_vlm reason=override")
-            return "full_vlm"
-        if similarity_score is None:
-            self.logger.debug("Routing decision=full_vlm reason=no_similarity_score")
-            return "full_vlm"
-        if similarity_score < self.full_vlm_ssim_threshold:
-            self.logger.debug(
-                "Routing decision=full_vlm reason=similarity_below_threshold full_threshold=%s",
-                self.full_vlm_ssim_threshold,
-            )
-            return "full_vlm"
+        # Every selected capture first uses the bounded perception model. Signals
+        # that previously forced a synchronous full-model call now request an
+        # asynchronous deep-enrichment event after the observation is durable.
+        if has_override or similarity_score is None or similarity_score < self.full_vlm_ssim_threshold:
+            self.logger.debug("Routing decision=fast_model reason=bounded_first_pass")
+            return "fast_model"
         self.logger.debug(
             "Routing decision=fast_model reason=similarity_band full_threshold=%s skip_threshold=queue",
             self.full_vlm_ssim_threshold,
@@ -511,6 +579,7 @@ Rules:
         self,
         *,
         screenshot_path: str,
+        interaction_image_path: str,
         model: str,
         captured_at: str | None,
         similarity_score: float | None,
@@ -535,7 +604,7 @@ Rules:
                 "window_class": uiat_context.get("window_class"),
                 "domain_hint": uiat_context.get("domain_hint"),
                 "app_hint": uiat_context.get("app_hint"),
-                "visible_text_summary": str(uiat_context.get("visible_text_summary") or "")[:1500],
+                "visible_text_summary": str(uiat_context.get("visible_text_summary") or "")[:self.uiat_text_max_chars],
                 "contains_dialog": bool(uiat_context.get("contains_dialog")),
                 "contains_notification": bool(uiat_context.get("contains_notification")),
             },
@@ -554,9 +623,17 @@ Rules:
                 prompt=self.FAST_ROUTER_PROMPT,
                 payload=payload,
                 screenshot_path=screenshot_path,
+                interaction_image_path=interaction_image_path,
                 model_name=self.fast_model or model,
             )
             if parsed:
+                if (
+                    bool(uiat_context.get("contains_dialog"))
+                    or bool(uiat_context.get("contains_notification"))
+                    or "error" in str(uiat_context.get("window_title") or "").lower()
+                ):
+                    parsed["needs_deep_analysis"] = True
+                    parsed["salience"] = "high"
                 self.logger.debug("Fast model returned valid JSON on attempt=%s", attempt)
                 return parsed
             self.logger.debug("Fast model returned invalid/empty JSON on attempt=%s", attempt)
@@ -566,6 +643,7 @@ Rules:
         self,
         *,
         screenshot_path: str,
+        interaction_image_path: str,
         model: str,
         recent_context: str,
         captured_at: str | None,
@@ -621,6 +699,7 @@ Rules:
             prompt=self.FULL_OBSERVER_PROMPT,
             payload=payload,
             screenshot_path=screenshot_path,
+            interaction_image_path=interaction_image_path,
             model_name=self.full_model or model,
         )
 
@@ -630,6 +709,7 @@ Rules:
         prompt: str,
         payload: Dict[str, Any],
         screenshot_path: str,
+        interaction_image_path: str = "",
         model_name: str,
     ) -> dict:
         self.logger.debug(
@@ -638,20 +718,70 @@ Rules:
             screenshot_path,
             sorted(payload.keys()),
         )
-        with interaction_trace("passive_observer", metadata={"image_path": screenshot_path, "model": model_name}):
-            if hasattr(self.llm, "load_model"):
-                await self.llm.load_model(model_name)
-            completion = await self.llm.chat_completion_stream(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": self._build_system_prompt(prompt)},
-                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False, indent=2)},
-                ],
-                tools=None,
-                image=screenshot_path,
+        text = ""
+        stream_metrics: Dict[str, Any] = {}
+        try:
+            with tempfile.TemporaryDirectory(prefix="ambient-vision-") as temp_dir:
+                prepared_path = str(Path(temp_dir) / "screen.jpg")
+                inference_path = await asyncio.to_thread(
+                    self._prepare_inference_image, screenshot_path, prepared_path
+                )
+                with interaction_trace(
+                    "passive_observer",
+                    metadata={
+                        "image_path": interaction_image_path or screenshot_path,
+                        "inference_image_path": screenshot_path,
+                        "model": model_name,
+                    },
+                ):
+                    async with asyncio.timeout(self.vlm_request_timeout_seconds):
+                        if hasattr(self.llm, "load_model"):
+                            await self.llm.load_model(model_name)
+                        messages = [
+                            {"role": "system", "content": self._build_system_prompt(prompt)},
+                            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                        ]
+                        try:
+                            completion = await self.llm.chat_completion_stream(
+                                model=model_name,
+                                messages=messages,
+                                tools=None,
+                                image=inference_path,
+                                temperature=0.1,
+                                max_tokens=self.max_output_tokens,
+                                response_format=(
+                                    self.FAST_RESPONSE_SCHEMA if prompt == self.FAST_ROUTER_PROMPT else None
+                                ),
+                                chat_template_kwargs={"enable_thinking": False},
+                                request_timeout_seconds=self.vlm_request_timeout_seconds,
+                            )
+                        except TypeError as exc:
+                            if "unexpected keyword argument" not in str(exc):
+                                raise
+                            self.logger.debug(
+                                "LLM provider lacks bounded-request extensions; using compatibility call."
+                            )
+                            completion = await self.llm.chat_completion_stream(
+                                model=model_name,
+                                messages=messages,
+                                tools=None,
+                                image=inference_path,
+                                temperature=0.1,
+                            )
+                        text, stream_metrics = await self._consume_stream_text(completion)
+        except TimeoutError:
+            self.logger.warning(
+                "Passive observer model %s exceeded %.1fs request budget.",
+                model_name,
+                self.vlm_request_timeout_seconds,
             )
-        text = await self._consume_stream_text(completion)
+            return {}
+        except Exception as exc:
+            self.logger.warning("Passive observer model %s failed: %s", model_name, exc)
+            return {}
         parsed = self._parse_json_object(text)
+        if parsed:
+            parsed.setdefault("_stream_metrics", stream_metrics)
         self.logger.debug(
             "Passive observer model=%s parsed_json=%s raw_text_chars=%s",
             model_name,
@@ -659,6 +789,55 @@ Rules:
             len(text or ""),
         )
         return parsed if isinstance(parsed, dict) else {}
+
+    def _prepare_inference_image(self, source_path: str, output_path: str) -> str:
+        try:
+            with Image.open(source_path) as image:
+                converted = image.convert("RGB")
+                converted.thumbnail((self.inference_width, self.inference_height), Image.Resampling.LANCZOS)
+                canvas = Image.new("RGB", (self.inference_width, self.inference_height), "black")
+                offset = (
+                    (self.inference_width - converted.width) // 2,
+                    (self.inference_height - converted.height) // 2,
+                )
+                canvas.paste(converted, offset)
+                canvas.save(output_path, format="JPEG", quality=self.inference_jpeg_quality, optimize=True)
+            return output_path
+        except Exception as exc:
+            # Keep test doubles and unusual but server-supported image formats usable.
+            # The model endpoint will provide the authoritative decoding result.
+            self.logger.debug("Could not create inference derivative for %s: %s", source_path, exc)
+            return source_path
+
+    def _uiat_fallback(
+        self,
+        *,
+        uiat_context: Dict[str, Any],
+        captured_at: str | None,
+        reason: str,
+    ) -> dict:
+        app = str(uiat_context.get("app_hint") or "Unknown app").strip()
+        domain = str(uiat_context.get("domain_hint") or "").strip()
+        title = str(uiat_context.get("window_title") or "").strip()
+        visible = " ".join(str(uiat_context.get("visible_text_summary") or "").split())
+        page = domain or title or "screen"
+        detail = visible[:500] or f"Foreground window: {title or page}."
+        return {
+            "app_page": f"{app} / {page}"[:160],
+            "summary": f"{app} is showing {page}."[:240],
+            "detailed_description": detail,
+            "inferred_user_activity": f"Using {app}."[:200],
+            "maybe_require_a_reminder": False,
+            "reminder_context": {"message_to_user": "", "due_date": ""},
+            "salient_facts": [],
+            "salience": "low",
+            "needs_deep_analysis": bool(
+                uiat_context.get("contains_dialog") or uiat_context.get("contains_notification")
+            ),
+            "_analysis_status": "uiat_fallback",
+            "_fallback_reason": reason,
+            "_captured_at": captured_at or datetime.now().isoformat(),
+        }
 
     def _attach_to_session(self, observation: VisualObservation) -> VisualSession:
         existing = self.memory.list_visual_sessions(statuses=["open"], limit=3)
@@ -722,15 +901,35 @@ Rules:
     def _capture_path(self) -> Path:
         return self.screenshot_root / f"observer_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
 
-    async def _consume_stream_text(self, completion) -> str:
+    async def _consume_stream_text(self, completion) -> tuple[str, Dict[str, Any]]:
         parts: List[str] = []
+        reasoning_chars = 0
+        usage: Dict[str, int] = {}
+        server_timings: Dict[str, Any] = {}
         async for chunk in completion:
+            chunk_usage = getattr(chunk, "usage", None)
+            if chunk_usage is not None:
+                for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                    value = getattr(chunk_usage, field, None)
+                    if value is not None:
+                        usage[field] = int(value)
+            timings = getattr(chunk, "timings", None)
+            if timings is None:
+                timings = (getattr(chunk, "model_extra", None) or {}).get("timings")
+            if isinstance(timings, dict):
+                server_timings = timings
             if not getattr(chunk, "choices", None):
                 continue
             delta = chunk.choices[0].delta
-            if delta.content:
-                parts.append(delta.content)
-        return "".join(parts)
+            content = getattr(delta, "content", None)
+            if content:
+                parts.append(content)
+            reasoning_chars += len(getattr(delta, "reasoning_content", None) or "")
+        return "".join(parts), {
+            "usage": usage,
+            "reasoning_chars": reasoning_chars,
+            "server_timings": server_timings,
+        }
 
     def _parse_json_object(self, response_text: str) -> dict:
         text = response_text.strip()

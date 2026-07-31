@@ -231,9 +231,13 @@ pause switch, live application/domain exclusions, and storage-pressure warnings.
 
 Ambient awareness does not require heavy models to remain loaded. Window metadata,
 UI Automation text, screenshots, and audio segments are persisted as plain files first.
-Screenshots are taken during normal lightweight capture, but vision analysis waits for
-a granted resource lease. Audio uses the same durable queue and defers ASR under memory
-pressure. Deferred work is not counted as a failure and is never dropped.
+Screenshots are taken during normal lightweight capture. A bounded fast-perception lane
+uses a small non-thinking VLM to persist an observation before opportunity judgment,
+RAG, reflection, or artifact work begins. The hot request uses a 960x540 inference copy,
+a 256-token JSON schema, and a 16-second request deadline; timeout or malformed output
+falls back to captured UI Automation text instead of blocking the queue. High-salience
+screens can be revisited asynchronously by the larger VLM. Audio uses the same durable
+queue and defers ASR under memory pressure.
 
 No per-model memory estimates are configured or hardcoded. Before a model transition,
 the governor checks current measured RAM and VRAM against the selected preset. After the
@@ -252,11 +256,22 @@ Ambient AI manages model residency through llama.cpp's `/models/load` and
 `/models/unload` endpoints, so start the server in router mode before `src/app.py`:
 
 ```powershell
-llama-server --models-preset .\models_preset.ini --models-max 1 --no-models-autoload --host 127.0.0.1 --port 8080 --api-key testkey
+llama-server --models-preset .\models_preset.ini --models-max 2 --no-models-autoload --host 127.0.0.1 --port 8080 --api-key testkey
 ```
 
 Ambient AI does not start this process automatically. If it is unavailable, capture
 continues and the runtime logs a clear error, but judgment and research remain deferred.
+
+Set `[models].passive_observer_model = Ambient-Fast-Vision` and leave
+`[vision_runtime].api_base_url` blank. Both the small screenshot VLM and the main
+reasoning model then use this one router process and port. They are tracked as separate
+model roles, so ordinary main-model swaps cannot unload the passive observer.
+
+With `[vision_runtime].keep_resident = true` (the default), the passive VLM is preloaded
+once and remains in VRAM while Ambient AI runs; the router therefore needs
+`--models-max 2`. Set it to `false` on a tighter GPU to load the VLM before visual work
+and unload it after each processed screenshot. No second llama-server instance is
+needed in either mode.
 
 ### 2. Start the semantic llama.cpp server
 Example:

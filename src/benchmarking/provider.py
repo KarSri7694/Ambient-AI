@@ -85,6 +85,10 @@ class BenchmarkingLLMProvider(LLMProvider):
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         top_k: Optional[int] = None,
+        max_tokens: Optional[int] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        chat_template_kwargs: Optional[Dict[str, Any]] = None,
+        request_timeout_seconds: Optional[float] = None,
     ):
         started_at = now_iso()
         started = perf_counter()
@@ -95,15 +99,19 @@ class BenchmarkingLLMProvider(LLMProvider):
         usage_completion_tokens: Optional[int] = None
         usage_total_tokens: Optional[int] = None
 
-        completion = self.provider.chat_completion_stream(
-            model=model,
-            messages=messages,
-            tools=tools,
-            image=image,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-        )
+        provider_kwargs: Dict[str, Any] = {
+            "model": model, "messages": messages, "tools": tools, "image": image,
+            "temperature": temperature, "top_p": top_p, "top_k": top_k,
+        }
+        if max_tokens is not None:
+            provider_kwargs["max_tokens"] = max_tokens
+        if response_format is not None:
+            provider_kwargs["response_format"] = response_format
+        if chat_template_kwargs is not None:
+            provider_kwargs["chat_template_kwargs"] = chat_template_kwargs
+        if request_timeout_seconds is not None:
+            provider_kwargs["request_timeout_seconds"] = request_timeout_seconds
+        completion = self.provider.chat_completion_stream(**provider_kwargs)
         if hasattr(completion, "__await__"):
             completion = await completion
 

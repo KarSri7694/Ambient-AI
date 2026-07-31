@@ -53,7 +53,10 @@ class FakeVisualLLM:
         self.events.append(("unload", self.currently_loaded_model))
         self.currently_loaded_model = None
 
-    async def chat_completion_stream(self, model, messages, tools=None, image="", temperature=0.7, top_p=0.95, top_k=0):
+    async def chat_completion_stream(
+        self, model, messages, tools=None, image="", temperature=0.7,
+        top_p=0.95, top_k=0, **kwargs,
+    ):
         user_message = next((item for item in reversed(messages) if item.get("role") == "user"), {})
         payload = {}
         try:
@@ -68,6 +71,7 @@ class FakeVisualLLM:
                 "payload": payload,
                 "user_content": user_message.get("content", ""),
                 "system_content": next((item.get("content", "") for item in messages if item.get("role") == "system"), ""),
+                "request_options": kwargs,
             }
         )
         response = self.responses.pop(0)
@@ -87,6 +91,12 @@ class FakeScreenCapture:
         payload = self.payloads.pop(0)
         path.write_bytes(payload)
         return str(path)
+
+
+class SlowVisualLLM(FakeVisualLLM):
+    async def chat_completion_stream(self, *args, **kwargs):
+        await asyncio.sleep(0.7)
+        return await super().chat_completion_stream(*args, **kwargs)
 
 
 class FakeTaskQueue:
@@ -301,7 +311,7 @@ class PassiveObserverTests(unittest.TestCase):
         payload = json.loads(observation.raw_payload_json or "{}")
         self.assertEqual(payload.get("_analysis_mode"), "fast_model")
 
-    def test_process_screenshot_uses_full_model_for_large_change(self):
+    def test_process_screenshot_uses_bounded_first_pass_for_large_change(self):
         llm = FakeVisualLLM(
             [
                 json.dumps(
@@ -336,9 +346,49 @@ class PassiveObserverTests(unittest.TestCase):
         )
 
         self.assertIsNotNone(observation)
-        self.assertEqual(llm.calls[0]["model"], "full-model")
+        self.assertEqual(llm.calls[0]["model"], "fast-model")
         payload = json.loads(observation.raw_payload_json or "{}")
-        self.assertEqual(payload.get("_analysis_mode"), "full_vlm")
+        self.assertEqual(payload.get("_analysis_mode"), "fast_model")
+        self.assertEqual(llm.calls[0]["request_options"]["max_tokens"], 256)
+        self.assertFalse(llm.calls[0]["request_options"]["chat_template_kwargs"]["enable_thinking"])
+        self.assertEqual(llm.calls[0]["request_options"]["response_format"]["type"], "json_schema")
+
+    def test_timeout_persists_uiat_fallback_without_retry(self):
+        llm = SlowVisualLLM(["{}"])
+        screenshot = self.temp_path / "timeout.png"
+        screenshot.write_bytes(b"queued")
+        service = PassiveObserverService(
+            memory=self.memory,
+            llm_provider=llm,
+            screen_capture=FakeScreenCapture([]),
+            screenshot_root=str(self.temp_path / "shots"),
+            fast_model="fast-model",
+            fast_model_retry_count=0,
+            processing_budget_seconds=1,
+            vlm_request_timeout_seconds=0.5,
+        )
+
+        observation = asyncio.run(
+            service.process_screenshot(
+                screenshot_path=str(screenshot),
+                model="fast-model",
+                recent_context="profile text that must not enter the hot request",
+                captured_at="2026-07-31T10:00:00",
+                similarity_score=0.8,
+                uiat_context_override={
+                    "app_hint": "Browser",
+                    "window_title": "Product comparison",
+                    "domain_hint": "example.com",
+                    "visible_text_summary": "Product A costs 100 and Product B costs 90",
+                },
+            )
+        )
+
+        self.assertIsNotNone(observation)
+        self.assertEqual(observation.analysis_status, "uiat_fallback")
+        self.assertIn("Product A costs 100", observation.detailed_description)
+        self.assertLess(observation.analysis_latency_ms, 1000)
+        self.assertEqual(llm.calls, [])
 
     def test_process_screenshot_skips_ignored_app_without_override(self):
         llm = FakeVisualLLM([])

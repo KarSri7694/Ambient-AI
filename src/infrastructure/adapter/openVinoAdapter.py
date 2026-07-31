@@ -230,10 +230,13 @@ class OpenVinoAdapter(LLMProvider, ModelManager):
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
         image: str = "",
-        max_tokens: int = 32000,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         top_k: Optional[int] = None,
+        max_tokens: Optional[int] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        chat_template_kwargs: Optional[Dict[str, Any]] = None,
+        request_timeout_seconds: Optional[float] = None,
     ) -> Iterator[_ChunkShim]:
         """Streaming chat completion.
 
@@ -247,7 +250,7 @@ class OpenVinoAdapter(LLMProvider, ModelManager):
             "messages": messages,
             "tools": tools,
             "model": model,
-            "max_tokens": max_tokens,
+            "max_tokens": max_tokens if max_tokens is not None else 32000,
             "image": image or None,
         }
         if temperature is not None:

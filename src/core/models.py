@@ -357,6 +357,11 @@ class VisualObservation:
     followup_sent_at: Optional[str] = None
     biodata_sent_at: Optional[str] = None
     raw_payload_json: Optional[str] = None
+    analysis_status: str = "model"
+    analysis_latency_ms: int = 0
+    analysis_model: Optional[str] = None
+    needs_deep_analysis: bool = False
+    source_capture_event_id: Optional[str] = None
 
 
 @dataclass(frozen=True)

@@ -234,7 +234,12 @@ class SQLiteMemoryAdapter(MemoryPort):
                     session_id TEXT,
                     followup_sent_at TEXT,
                     biodata_sent_at TEXT,
-                    raw_payload_json TEXT
+                    raw_payload_json TEXT,
+                    analysis_status TEXT NOT NULL DEFAULT 'model',
+                    analysis_latency_ms INTEGER NOT NULL DEFAULT 0,
+                    analysis_model TEXT,
+                    needs_deep_analysis INTEGER NOT NULL DEFAULT 0,
+                    source_capture_event_id TEXT
                 )
                 """
             )
@@ -348,6 +353,11 @@ class SQLiteMemoryAdapter(MemoryPort):
             "detailed_description": "TEXT NOT NULL DEFAULT ''",
             "followup_sent_at": "TEXT",
             "biodata_sent_at": "TEXT",
+            "analysis_status": "TEXT NOT NULL DEFAULT 'model'",
+            "analysis_latency_ms": "INTEGER NOT NULL DEFAULT 0",
+            "analysis_model": "TEXT",
+            "needs_deep_analysis": "INTEGER NOT NULL DEFAULT 0",
+            "source_capture_event_id": "TEXT",
         }
         with self._managed_connection() as conn:
             existing = {
@@ -504,6 +514,11 @@ class SQLiteMemoryAdapter(MemoryPort):
             followup_sent_at=row["followup_sent_at"],
             biodata_sent_at=row["biodata_sent_at"],
             raw_payload_json=row["raw_payload_json"],
+            analysis_status=row["analysis_status"],
+            analysis_latency_ms=int(row["analysis_latency_ms"] or 0),
+            analysis_model=row["analysis_model"],
+            needs_deep_analysis=bool(row["needs_deep_analysis"]),
+            source_capture_event_id=row["source_capture_event_id"],
         )
 
     def _visual_user_fact_from_row(self, row: sqlite3.Row) -> VisualUserFact:
@@ -1486,8 +1501,10 @@ class SQLiteMemoryAdapter(MemoryPort):
                     app_name, window_title, page_hint, summary, detailed_description, inferred_user_activity,
                     previous_activity_status, salient_entities, completed_items, open_loops,
                     possible_next_task, suggested_research_topics, user_fact_hypotheses,
-                    confidence, session_id, followup_sent_at, biodata_sent_at, raw_payload_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    confidence, session_id, followup_sent_at, biodata_sent_at, raw_payload_json,
+                    analysis_status, analysis_latency_ms, analysis_model,
+                    needs_deep_analysis, source_capture_event_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     observation.observation_id,
@@ -1512,6 +1529,11 @@ class SQLiteMemoryAdapter(MemoryPort):
                     observation.followup_sent_at,
                     observation.biodata_sent_at,
                     observation.raw_payload_json,
+                    observation.analysis_status,
+                    observation.analysis_latency_ms,
+                    observation.analysis_model,
+                    int(observation.needs_deep_analysis),
+                    observation.source_capture_event_id,
                 ),
             )
         observation_text = " ".join(

@@ -21,6 +21,10 @@ class LLMProvider(ABC):
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         top_k: Optional[int] = None,
+        max_tokens: Optional[int] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        chat_template_kwargs: Optional[Dict[str, Any]] = None,
+        request_timeout_seconds: Optional[float] = None,
     ) -> Iterator:
         """
         Create a streaming chat completion.

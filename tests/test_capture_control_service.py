@@ -81,7 +81,7 @@ def test_queued_capture_policy_is_not_reapplied_after_the_policy_changes(tmp_pat
         previous_observation=None,
     )
     assert live_route == "skip"
-    assert queued_route == "full_vlm"
+    assert queued_route == "fast_model"
 
 
 def test_firefox_accessibility_toolbar_url_reaches_domain_policy(tmp_path):

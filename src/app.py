@@ -79,6 +79,14 @@ logger = logging.getLogger(__name__)
 API_BASE_URL = CONFIG.get_str("runtime", "api_base_url", "http://localhost:8080")
 API_KEY = CONFIG.get_str("runtime", "api_key", "testkey")
 MODEL_LOAD_TIMEOUT_SECONDS = CONFIG.get_float("runtime", "model_load_timeout_seconds", 600.0)
+VISION_API_BASE_URL = CONFIG.get_str("vision_runtime", "api_base_url", "").strip()
+VISION_API_KEY = CONFIG.get_str("vision_runtime", "api_key", "").strip() or API_KEY
+VISION_PRELOAD = CONFIG.get_bool("vision_runtime", "preload", True)
+VISION_KEEP_RESIDENT = CONFIG.get_bool("vision_runtime", "keep_resident", True)
+VISION_MODEL_LOAD_TIMEOUT_SECONDS = CONFIG.get_float(
+    "vision_runtime", "model_load_timeout_seconds", MODEL_LOAD_TIMEOUT_SECONDS
+)
+VISION_EFFECTIVE_API_BASE_URL = VISION_API_BASE_URL or API_BASE_URL
 DEFAULT_MODEL = CONFIG.get_str("runtime", "default_model", "Qwen-3.5-9B-Mythos-Distilled-Q4_K_M-Vision")
 PASSIVE_OBSERVER_MODEL = CONFIG.get_model("passive_observer_model", DEFAULT_MODEL)
 FULL_PASSIVE_OBSERVER_MODEL = CONFIG.get_model("full_passive_observer_model", DEFAULT_MODEL)
@@ -143,6 +151,33 @@ PASSIVE_OBSERVER_CAPTURE_INTERVAL_SECONDS = CONFIG.get_float(
 PASSIVE_OBSERVER_FAST_ROUTING_ENABLED = CONFIG.get_bool("passive_observer", "fast_routing_enabled", True)
 PASSIVE_OBSERVER_FULL_VLM_SSIM_THRESHOLD = CONFIG.get_float("passive_observer", "full_vlm_ssim_threshold", 0.70)
 PASSIVE_OBSERVER_FAST_MODEL_RETRY_COUNT = CONFIG.get_int("passive_observer", "fast_model_retry_count", 2)
+PASSIVE_OBSERVER_PROCESSING_BUDGET_SECONDS = CONFIG.get_float(
+    "passive_observer", "processing_budget_seconds", 20.0
+)
+PASSIVE_OBSERVER_VLM_REQUEST_TIMEOUT_SECONDS = CONFIG.get_float(
+    "passive_observer", "vlm_request_timeout_seconds", 16.0
+)
+PASSIVE_OBSERVER_MAX_OUTPUT_TOKENS = CONFIG.get_int("passive_observer", "max_output_tokens", 256)
+PASSIVE_OBSERVER_INFERENCE_WIDTH = CONFIG.get_int("passive_observer", "inference_width", 960)
+PASSIVE_OBSERVER_INFERENCE_HEIGHT = CONFIG.get_int("passive_observer", "inference_height", 540)
+PASSIVE_OBSERVER_INFERENCE_JPEG_QUALITY = CONFIG.get_int(
+    "passive_observer", "inference_jpeg_quality", 82
+)
+PASSIVE_OBSERVER_UIAT_TEXT_MAX_CHARS = CONFIG.get_int(
+    "passive_observer", "uiat_text_max_chars", 1200
+)
+PASSIVE_OBSERVER_DEEP_ENRICHMENT_ENABLED = CONFIG.get_bool(
+    "passive_observer", "deep_enrichment_enabled", True
+)
+PASSIVE_OBSERVER_DEEP_TIMEOUT_SECONDS = CONFIG.get_float(
+    "passive_observer", "deep_vlm_request_timeout_seconds", 120.0
+)
+PASSIVE_OBSERVER_DEEP_MAX_OUTPUT_TOKENS = CONFIG.get_int(
+    "passive_observer", "deep_max_output_tokens", 768
+)
+PASSIVE_OBSERVER_MAX_PENDING_PER_CONTEXT = CONFIG.get_int(
+    "passive_observer", "max_pending_per_context", 2
+)
 PASSIVE_OBSERVER_UIAT_MODE = CONFIG.get_str("passive_observer", "uiat_mode", "screen_content")
 LOG_API_ENABLED = CONFIG.get_bool("log_api", "enabled", True)
 LOG_API_HOST = CONFIG.get_str("log_api", "host", "0.0.0.0")
@@ -758,6 +793,7 @@ class AmbientRuntime:
             base_url=API_BASE_URL,
             api_key=API_KEY,
             model_load_timeout_seconds=MODEL_LOAD_TIMEOUT_SECONDS,
+            isolated_model_tracking=True,
         )
         autonomy_store = SQLiteAutonomyAdapter(str(AUTONOMY_DB_PATH))
         if self.resource_governor.audit is None:
@@ -780,6 +816,24 @@ class AmbientRuntime:
             capture_store=self.capture_store,
             residency_manager=residency_manager,
         )
+        vision_llm = logged_llm
+        self._vision_llm = None
+        self._vision_ready = False
+        self._vision_retry_after = 0.0
+        if PASSIVE_OBSERVER_ENABLED:
+            vision_raw_llm = LlamaCppAdapter(
+                base_url=VISION_EFFECTIVE_API_BASE_URL,
+                api_key=VISION_API_KEY,
+                model_load_timeout_seconds=VISION_MODEL_LOAD_TIMEOUT_SECONDS,
+                isolated_model_tracking=True,
+            )
+            vision_llm = LoggingLLMProvider(
+                provider=vision_raw_llm,
+                log_store=interaction_log_store,
+                current_response_path=str(CURRENT_RESPONSE_PATH),
+                capture_store=self.capture_store,
+            )
+            self._vision_llm = vision_llm
         capability_policy = CapabilityPolicyService(
             store=autonomy_store,
             budget=AutonomyBudget(
@@ -988,34 +1042,55 @@ class AmbientRuntime:
         passive_observer = (
             PassiveObserverService(
                 memory=memory_store,
-                llm_provider=logged_llm,
+                llm_provider=vision_llm,
                 screen_capture=MssScreenCaptureAdapter(output_dir=str(PASSIVE_OBSERVER_ROOT / "screenshots")),
                 screenshot_root=str(PASSIVE_OBSERVER_ROOT / "screenshots"),
-                fast_model=(
-                    FOLLOWUP_EXECUTION_MODEL
-                    if AUTONOMY_COORDINATOR_ENABLED
-                    else PASSIVE_OBSERVER_MODEL
-                ),
-                # Coordinator batches deliberately use one model across fast/full
-                # screen analysis, judgment, and research to avoid model swaps.
-                full_model=(
-                    FOLLOWUP_EXECUTION_MODEL
-                    if AUTONOMY_COORDINATOR_ENABLED
-                    else FULL_PASSIVE_OBSERVER_MODEL
-                ),
+                fast_model=PASSIVE_OBSERVER_MODEL,
+                full_model=FULL_PASSIVE_OBSERVER_MODEL,
                 full_vlm_ssim_threshold=PASSIVE_OBSERVER_FULL_VLM_SSIM_THRESHOLD,
                 ignore_apps=PASSIVE_OBSERVER_IGNORE_APPS,
                 ignore_domains=PASSIVE_OBSERVER_IGNORE_DOMAINS,
                 always_full_apps=PASSIVE_OBSERVER_ALWAYS_FULL_APPS,
                 always_full_domains=PASSIVE_OBSERVER_ALWAYS_FULL_DOMAINS,
                 fast_model_retry_count=PASSIVE_OBSERVER_FAST_MODEL_RETRY_COUNT,
+                processing_budget_seconds=PASSIVE_OBSERVER_PROCESSING_BUDGET_SECONDS,
+                vlm_request_timeout_seconds=PASSIVE_OBSERVER_VLM_REQUEST_TIMEOUT_SECONDS,
+                max_output_tokens=PASSIVE_OBSERVER_MAX_OUTPUT_TOKENS,
+                inference_width=PASSIVE_OBSERVER_INFERENCE_WIDTH,
+                inference_height=PASSIVE_OBSERVER_INFERENCE_HEIGHT,
+                inference_jpeg_quality=PASSIVE_OBSERVER_INFERENCE_JPEG_QUALITY,
+                uiat_text_max_chars=PASSIVE_OBSERVER_UIAT_TEXT_MAX_CHARS,
                 uiat_adapter=UIATAdapter(mode=PASSIVE_OBSERVER_UIAT_MODE) if PASSIVE_OBSERVER_FAST_ROUTING_ENABLED else None,
-                persist_observations=not ALWAYS_ON_MODE,
+                persist_observations=True,
                 capture_store=self.capture_store,
                 persist_payloads=AUTONOMY_COORDINATOR_ENABLED,
                 capture_control=self.capture_control,
             )
             if PASSIVE_OBSERVER_ENABLED
+            else None
+        )
+        deep_visual_observer = (
+            PassiveObserverService(
+                memory=memory_store,
+                llm_provider=logged_llm,
+                screen_capture=MssScreenCaptureAdapter(output_dir=str(PASSIVE_OBSERVER_ROOT / "screenshots")),
+                screenshot_root=str(PASSIVE_OBSERVER_ROOT / "screenshots"),
+                fast_model=FULL_PASSIVE_OBSERVER_MODEL,
+                full_model=FULL_PASSIVE_OBSERVER_MODEL,
+                fast_model_retry_count=0,
+                processing_budget_seconds=PASSIVE_OBSERVER_DEEP_TIMEOUT_SECONDS,
+                vlm_request_timeout_seconds=PASSIVE_OBSERVER_DEEP_TIMEOUT_SECONDS,
+                max_output_tokens=PASSIVE_OBSERVER_DEEP_MAX_OUTPUT_TOKENS,
+                inference_width=1280,
+                inference_height=720,
+                inference_jpeg_quality=90,
+                uiat_text_max_chars=4000,
+                persist_observations=True,
+                capture_store=self.capture_store,
+                persist_payloads=AUTONOMY_COORDINATOR_ENABLED,
+                capture_control=self.capture_control,
+            )
+            if PASSIVE_OBSERVER_ENABLED and PASSIVE_OBSERVER_DEEP_ENRICHMENT_ENABLED
             else None
         )
         autonomy_coordinator = (
@@ -1028,13 +1103,13 @@ class AmbientRuntime:
                 max_inbox_items_per_day=AUTONOMY_MAX_INBOX_ITEMS_PER_DAY,
                 capture_store=self.capture_store,
                 visual_observer=passive_observer,
-                # Use one vision-capable model for enrichment, judgment, and research
-                # so an ambient batch never swaps presets between its phases.
-                visual_model=FOLLOWUP_EXECUTION_MODEL,
+                deep_visual_observer=deep_visual_observer,
+                visual_model=PASSIVE_OBSERVER_MODEL,
                 user_context_service=user_context_service,
                 chat_store=self.chat_store,
                 chat_event_broker=self.chat_event_broker,
                 task_store=task_queue,
+                max_pending_visual_per_context=PASSIVE_OBSERVER_MAX_PENDING_PER_CONTEXT,
             )
             if AUTONOMY_COORDINATOR_ENABLED
             else None
@@ -1789,6 +1864,20 @@ class AmbientRuntime:
             self.stop_event.clear()
             self._tool_bridge = tool_bridge
             await self._initialize_mcp_tools(tool_bridge, llm_service)
+            if self._vision_llm is not None and VISION_PRELOAD and VISION_KEEP_RESIDENT:
+                try:
+                    logger.info(
+                        "Preloading resident passive-observer model %s on shared router %s.",
+                        PASSIVE_OBSERVER_MODEL,
+                        VISION_EFFECTIVE_API_BASE_URL,
+                    )
+                    await self._vision_llm.load_model(PASSIVE_OBSERVER_MODEL)
+                    self._vision_ready = True
+                except Exception:
+                    self._vision_retry_after = time.monotonic() + 30.0
+                    logger.exception(
+                        "Passive-observer model preloading failed; captures will remain queued until it is ready."
+                    )
             services_initialized = await self._restore_chat_residency(
                 llm_adapter=llm_adapter,
                 services_initialized=services_initialized,
@@ -2134,6 +2223,51 @@ class AmbientRuntime:
                         continue
                     if job is not None:
                         logger.warning("Queued screenshot no longer exists, skipping: %s", job.screenshot_path)
+
+                if autonomy_coordinator is not None and autonomy_coordinator.has_ready_visual_work():
+                    if (
+                        self._vision_llm is not None
+                        and not self._vision_ready
+                    ):
+                        if time.monotonic() >= self._vision_retry_after:
+                            try:
+                                await self._vision_llm.load_model(PASSIVE_OBSERVER_MODEL)
+                                self._vision_ready = True
+                            except Exception:
+                                self._vision_retry_after = time.monotonic() + 30.0
+                                logger.exception(
+                                    "Passive-observer model is not ready; visual captures remain queued."
+                                )
+                        if not self._vision_ready:
+                            if await self._sleep_or_stop(0.25):
+                                break
+                            continue
+                    try:
+                        with self.gpu_lock:
+                            visual_result = await autonomy_coordinator.process_next_visual()
+                        if visual_result.get("processed"):
+                            biodata_context_events_since_update += 1
+                            logger.info(
+                                "Visual perception completed in %sms (status=%s, observation=%s).",
+                                visual_result.get("analysis_latency_ms"),
+                                visual_result.get("analysis_status"),
+                                visual_result.get("observation_id"),
+                            )
+                    except Exception:
+                        logger.exception("Fast visual perception work unit failed.")
+                    finally:
+                        if self._vision_llm is not None and not VISION_KEEP_RESIDENT:
+                            try:
+                                await self._vision_llm.unload_model()
+                            except Exception:
+                                logger.exception(
+                                    "Failed to unload the passive-observer model after visual processing."
+                                )
+                            finally:
+                                self._vision_ready = False
+                    if await self._sleep_or_stop(0.05):
+                        break
+                    continue
 
                 if autonomy_coordinator is not None and autonomy_coordinator.has_ready_work():
                     inference_request = InferenceRequest(
@@ -2572,6 +2706,11 @@ class AmbientRuntime:
                     services_initialized=services_initialized,
                     reason="application shutdown",
                 )
+            if self._vision_llm is not None and not VISION_KEEP_RESIDENT:
+                try:
+                    await self._vision_llm.unload_model()
+                except Exception:
+                    logger.exception("Failed to unload the passive-observer model during shutdown.")
             await llm_service.cleanup_browser_sessions()
             await tool_bridge.cleanup()
             self._tool_bridge = None

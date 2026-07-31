@@ -66,18 +66,33 @@ class RealWorldTracingLLMProvider(LLMProvider):
         self, model: str, messages: list[dict[str, Any]], tools: Optional[list[dict[str, Any]]] = None,
         image: str = "", temperature: Optional[float] = None, top_p: Optional[float] = None,
         top_k: Optional[int] = None,
+        max_tokens: Optional[int] = None, response_format: Optional[dict[str, Any]] = None,
+        chat_template_kwargs: Optional[dict[str, Any]] = None,
+        request_timeout_seconds: Optional[float] = None,
     ):
         started = perf_counter()
         request_payload = {
             "messages": copy.deepcopy(messages), "tools": copy.deepcopy(tools),
             "image_path": image or None, "temperature": temperature, "top_p": top_p, "top_k": top_k,
+            "max_tokens": max_tokens, "response_format": copy.deepcopy(response_format),
+            "chat_template_kwargs": copy.deepcopy(chat_template_kwargs),
+            "request_timeout_seconds": request_timeout_seconds,
         }
         self.emit("model", "model_request", request_payload, model=model, status="running")
         try:
-            completion = self.provider.chat_completion_stream(
-                model=model, messages=messages, tools=tools, image=image,
-                temperature=temperature, top_p=top_p, top_k=top_k,
-            )
+            provider_kwargs: dict[str, Any] = {
+                "model": model, "messages": messages, "tools": tools, "image": image,
+                "temperature": temperature, "top_p": top_p, "top_k": top_k,
+            }
+            if max_tokens is not None:
+                provider_kwargs["max_tokens"] = max_tokens
+            if response_format is not None:
+                provider_kwargs["response_format"] = response_format
+            if chat_template_kwargs is not None:
+                provider_kwargs["chat_template_kwargs"] = chat_template_kwargs
+            if request_timeout_seconds is not None:
+                provider_kwargs["request_timeout_seconds"] = request_timeout_seconds
+            completion = self.provider.chat_completion_stream(**provider_kwargs)
             if hasattr(completion, "__await__"):
                 completion = await completion
         except Exception as exc:
