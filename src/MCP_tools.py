@@ -61,6 +61,9 @@ def _build_semantic_dedupe_service() -> SemanticDeduplicationService:
             provider=LlamaCppAdapter(
                 base_url=CONFIG.get_str("runtime", "api_base_url", "http://localhost:8080"),
                 api_key=CONFIG.get_str("runtime", "api_key", "testkey"),
+                model_load_timeout_seconds=CONFIG.get_float(
+                    "runtime", "model_load_timeout_seconds", 600.0
+                ),
             ),
             log_store=SQLiteInteractionLogAdapter(db_path=INTERACTION_LOG_DB_PATH),
             current_response_path=None,
@@ -574,9 +577,11 @@ async def use_browser(
 
     This never starts browser control by itself. The task is recorded as a
     pending approval and runs only after the local user allows it in the Ambient
-    AI web UI. Browser visibility is selected by application configuration, not
-    by the model. Raw browser tools are available only to that approved delegated
-    agent. Implemented by LLMInteractionService.
+    AI web UI. With the default Fara backend, browser work is visible,
+    screenshot-driven, and restricted to read-only public research. The agent is
+    not given DOM/UIAT data. Browser visibility is selected by
+    application configuration, not by the model. Implemented by
+    LLMInteractionService.
     """
     pass
 

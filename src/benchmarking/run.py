@@ -33,6 +33,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=CONFIG.get_str("benchmarking", "db_path", str(REPO_ROOT / "database" / "benchmarking.db")),
     )
     parser.add_argument("--api-base-url", default=CONFIG.get_str("runtime", "api_base_url", "http://localhost:8080"))
+    parser.add_argument(
+        "--model-load-timeout-seconds",
+        type=float,
+        default=CONFIG.get_float("runtime", "model_load_timeout_seconds", 600.0),
+    )
     parser.add_argument("--list-services", action="store_true")
     parser.add_argument("--list-cases", action="store_true")
     return parser
@@ -114,7 +119,10 @@ def main() -> int:
     )
     store.insert_run(run)
 
-    provider = LlamaCppAdapter(base_url=args.api_base_url)
+    provider = LlamaCppAdapter(
+        base_url=args.api_base_url,
+        model_load_timeout_seconds=args.model_load_timeout_seconds,
+    )
     benchmark_provider = BenchmarkingLLMProvider(provider)
     overall_status = "completed"
 

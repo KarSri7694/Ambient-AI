@@ -10,6 +10,8 @@ import os
 from pathlib import Path
 import threading
 
+from config import CONFIG
+
 from infrastructure.adapter.llamaCppAdapter import LlamaCppAdapter
 from infrastructure.adapter.MCPToolAdapter import MCPToolAdapter
 from infrastructure.adapter.SQLiteNotificationAdapter import SQLiteNotificationAdapter
@@ -31,6 +33,7 @@ logger = logging.getLogger(__name__)
 API_BASE_URL = "http://localhost:8080"
 DEFAULT_MODEL = "Qwen-4b-Thinking-2507-Q4_K_M"
 MCP_CONFIG_PATH = "mcp.json"
+MODEL_LOAD_TIMEOUT_SECONDS = CONFIG.get_float("runtime", "model_load_timeout_seconds", 600.0)
 
 # Backend selection: "llamacpp" (default) or "openvino"
 LLM_BACKEND = os.environ.get("LLM_BACKEND", "llamacpp").lower()
@@ -75,7 +78,10 @@ async def run_app() -> None:
         )
         default_model = OPENVINO_MODEL_PATH
     else:
-        llm_adapter = LlamaCppAdapter(base_url=API_BASE_URL)
+        llm_adapter = LlamaCppAdapter(
+            base_url=API_BASE_URL,
+            model_load_timeout_seconds=MODEL_LOAD_TIMEOUT_SECONDS,
+        )
         default_model = DEFAULT_MODEL
 
     tool_bridge = MCPToolAdapter()

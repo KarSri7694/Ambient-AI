@@ -84,7 +84,7 @@ Configured MCP tools currently include:
 - Custom local MCP tools from [src/MCP_tools.py](src/MCP_tools.py)
 - Finance tools from [src/finance_tools.py](src/finance_tools.py)
 - Tavily MCP remote search
-- A delegated Playwright MCP browser agent through `use_browser`
+- A delegated Fara visual browser agent through `use_browser`
 
 The exact active tool surface depends on the servers listed in [mcp.json](mcp.json).
 
@@ -139,6 +139,7 @@ $env:USER_DATA_DIR="D:\USER_DATA"      # optional
 Important runtime defaults in `src/app.py` and `config.example.ini`:
 
 - `DEFAULT_MODEL = "Qwen-3.5-9B-Mythos-Distilled-Q4_K_M-Vision"`
+- `[runtime] model_load_timeout_seconds = 600` bounds router loading plus `/health` readiness; increase it for exceptionally slow large-model loads
 - `EMBEDDING_MODEL_PATH = "EmbeddingGemma"`
 - `RERANKER_MODEL_PATH = "JinaReranker"`
 - autonomy starts in `shadow` mode
@@ -153,14 +154,29 @@ At minimum, verify:
 - the path to `src/finance_tools.py`
 - any required environment variables such as `GEMINI_API_KEY`, `SERPAPI_API_KEY`, or `TODOIST_API_TOKEN`
 
-The `playwright` server in `mcp.example.json` is marked with
-`"exposure": "browser_agent"`. Its raw `browser_*` tools are intentionally hidden
-from the main model. The main model sees `use_browser(task)`; browser visibility is
-selected by the user's `[browser] headless` setting. The delegated model runs with
-the configured `browser_agent_model` and must end with
-`finish_browser_task(exit_browser, status, summary)`. Setting `exit_browser=false`
-returns control to the main model while retaining the browser session; retained
-sessions close during application shutdown.
+The default `[browser] backend = fara_visual` runs a visible, dedicated local
+Chromium profile. The main model sees only `use_browser(task)` and the user must
+approve that bounded task in the web UI. Fara receives the latest screenshot and
+current URL, then controls the browser with pixel coordinates and keyboard input.
+It is never given DOM, locator, page-source, accessibility-tree, JavaScript, or
+UIAT access. The host policy blocks non-public URLs, account/cart/checkout paths,
+downloads, and all non-idempotent HTTP requests. This makes the default backend
+suited to public read-only research, comparisons, and collecting source links.
+
+Install the browser runtime once after installing the Windows requirements:
+
+```powershell
+python -m playwright install chromium
+```
+
+On Windows, `channel = msedge` can use the locally installed Microsoft Edge
+instead of downloading Playwright Chromium. A real local smoke test is available
+through `python scripts/check_fara_browser.py --browser-only`.
+
+Use a dedicated `persistent_profile_dir`; never point it at a signed-in personal
+browser profile. Set `backend = playwright_mcp` only for temporary compatibility
+with the old MCP browser agent. Its server remains isolated behind
+`"exposure": "browser_agent"` in `mcp.json` and is not used by the Fara backend.
 
 Local file-system and computer-control tools follow the same delegated-agent
 pattern but live under `src/local_control/` for maintenance. The main model sees

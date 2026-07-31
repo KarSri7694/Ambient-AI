@@ -1,3 +1,4 @@
+import asyncio
 import openai
 from typing import Optional, List, Dict, Any, Iterator
 import requests
@@ -17,7 +18,12 @@ from utils.kv_state_handling import KVStateControl
 class LlamaCppAdapter(LLMProvider, ModelManager):
     """Adapter for llama.cpp server — implements both LLMProvider and ModelManager."""
     DEFAULT_MODEL = "Qwen-4b-Thinking-2507-Q4_K_M"
-    def __init__(self, base_url: str, api_key: str = "testkey"):
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str = "testkey",
+        model_load_timeout_seconds: float = 600.0,
+    ):
         """Create an adapter for a llama.cpp-compatible OpenAI API server."""
         self.logger = logging.getLogger(self.__class__.__name__)
         # Keep all endpoint joins canonical. Some reverse proxies treat //v1 as
@@ -28,44 +34,66 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
             base_url=self.api_uri_v1,
             api_key=api_key
         )
+        self.model_load_timeout_seconds = max(1.0, float(model_load_timeout_seconds))
         self.currently_loaded_model: Optional[str] = None
+        self._ready_model: Optional[str] = None
         self.kv_state = KVStateControl(self)
 
     # ── ModelManager ──────────────────────────────────────────
 
     async def load_model(self, model_name: str, unload_previous: bool = True) -> None:
         """Load a model through the llama.cpp server model-management endpoint."""
-        self.load_model_sync(model_name, unload_previous=unload_previous)
+        await asyncio.to_thread(self.load_model_sync, model_name, unload_previous)
 
     def load_model_sync(self, model_name: str, unload_previous: bool = True) -> None:
-        """Synchronously load a model through the llama.cpp model-management endpoint."""
+        """Load a model and return only after its inference endpoint is healthy."""
+        model_name = str(model_name or "").strip()
+        if not model_name:
+            raise ValueError("A non-empty model name is required.")
+
+        started_at = time.monotonic()
+        deadline = started_at + self.model_load_timeout_seconds
         loaded_model = self._sync_loaded_model_state()
         if loaded_model == model_name:
-            self.logger.info(f"Model {model_name} is already loaded.")
-            self._wait_for_model_status(model_name, expected_status="loaded")
+            self.logger.info("Model %s is reported loaded; confirming inference readiness.", model_name)
+            self._wait_until_model_ready(model_name, deadline=deadline, started_at=started_at)
             return
 
         if unload_previous and loaded_model is not None:
             self.unload_model_sync()
 
         model = {"model": model_name}
-        response = requests.post(f"{self.base_url}/models/load", json=model)
-        if response.status_code == 200:
-            self.logger.info(f"Successfully loaded model: {model_name}")
-            self.currently_loaded_model = model_name
-            self.kv_state.update_shared_state(currently_loaded_model=model_name)
-            self._wait_for_model_status(model_name, expected_status="loaded")
-        elif response.status_code == 400 and "model is already running" in response.text.lower():
-            self.logger.info(f"Specified model: {model_name} is already running.")
-            self.currently_loaded_model = model_name
-            self.kv_state.update_shared_state(currently_loaded_model=model_name)
-            self._wait_for_model_status(model_name, expected_status="loaded")
-        else:
-            self.logger.error(f"Failed to load model: {model_name}. Response: {response.text}")
+        try:
+            response = requests.post(
+                f"{self.base_url}/models/load",
+                json=model,
+                timeout=max(1.0, deadline - time.monotonic()),
+            )
+        except requests.RequestException as exc:
+            self._invalidate_ready_model(model_name)
+            raise RuntimeError(f"Failed to request loading model {model_name}: {exc}") from exc
+
+        already_running = (
+            response.status_code == 400
+            and "model is already running" in response.text.lower()
+        )
+        if response.status_code != 200 and not already_running:
+            self._invalidate_ready_model(model_name)
+            raise RuntimeError(
+                f"Failed to load model {model_name}: HTTP {response.status_code}: "
+                f"{response.text.strip()}"
+            )
+
+        self.logger.info(
+            "Model load accepted for %s; waiting up to %.1fs for inference readiness.",
+            model_name,
+            self.model_load_timeout_seconds,
+        )
+        self._wait_until_model_ready(model_name, deadline=deadline, started_at=started_at)
 
     async def unload_model(self) -> None:
         """Unload the currently tracked model from the llama.cpp server."""
-        self.unload_model_sync()
+        await asyncio.to_thread(self.unload_model_sync)
 
     def unload_model_sync(self) -> Optional[str]:
         """Synchronously unload the currently tracked model and return its name."""
@@ -73,7 +101,11 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         if loaded_model is None:
             return None
         model = {"model": loaded_model}
-        response = requests.post(f"{self.base_url}/models/unload", json=model)
+        response = requests.post(
+            f"{self.base_url}/models/unload",
+            json=model,
+            timeout=min(30.0, getattr(self, "model_load_timeout_seconds", 600.0)),
+        )
         if response.status_code == 200:
             self.logger.info(f"Successfully unloaded model: {loaded_model}")
             unloaded_model = loaded_model
@@ -84,9 +116,10 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
             self.logger.info(f"Model {loaded_model} is not running.")
             self._set_loaded_model_state(None)
             return loaded_model
-        else:
-            self.logger.error(f"Failed to unload model: {loaded_model}. Response: {response.text}")
-            return None
+        raise RuntimeError(
+            f"Failed to unload model {loaded_model}: HTTP {response.status_code}: "
+            f"{response.text.strip()}"
+        )
 
     def get_current_model(self) -> Optional[str]:
         """Return the model name this adapter currently tracks as loaded."""
@@ -96,8 +129,12 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         """Query the llama.cpp API for the currently loaded model, if any."""
         return self._sync_loaded_model_state()
 
-    def _fetch_models(self) -> List[Dict[str, Any]]:
-        response = requests.get(f"{self.api_uri_v1}/models", timeout=10)
+    def _fetch_models(self, timeout_seconds: float = 10.0) -> List[Dict[str, Any]]:
+        """Return router metadata, including each model's lifecycle status."""
+        response = requests.get(
+            f"{self.base_url}/models",
+            timeout=max(0.1, float(timeout_seconds)),
+        )
         response.raise_for_status()
         payload = response.json()
         return payload.get("data", [])
@@ -152,9 +189,18 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         rendered_prompt = "\n".join(rendered_parts)
         return self.count_text_tokens(rendered_prompt, model_name=model_name)
 
-    def _set_loaded_model_state(self, model_name: Optional[str]) -> None:
+    def _set_loaded_model_state(self, model_name: Optional[str], *, ready: bool = False) -> None:
+        previous_model = self.currently_loaded_model
         self.currently_loaded_model = model_name
+        if model_name is None or previous_model != model_name or not ready:
+            self._ready_model = None
+        if ready and model_name:
+            self._ready_model = model_name
         self.kv_state.update_shared_state(currently_loaded_model=model_name)
+
+    def _invalidate_ready_model(self, model_name: Optional[str] = None) -> None:
+        if model_name is None or getattr(self, "_ready_model", None) == model_name:
+            self._ready_model = None
 
     def _sync_loaded_model_state(self) -> Optional[str]:
         try:
@@ -182,7 +228,12 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
             else:
                 chosen = loaded_ids[0]
 
-        self._set_loaded_model_state(chosen)
+        if getattr(self, "_ready_model", None) == chosen:
+            self._set_loaded_model_state(chosen, ready=True)
+        else:
+            # Router status alone is not enough to publish model residency. The
+            # model-scoped health check in load_model_sync must succeed first.
+            self._set_loaded_model_state(None)
         return chosen
 
     def _get_model_metadata(self, model_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -233,6 +284,112 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
             f"Last seen status was {last_status!r}."
         )
 
+    def _wait_until_model_ready(
+        self,
+        model_name: str,
+        *,
+        deadline: float,
+        started_at: Optional[float] = None,
+    ) -> None:
+        """Wait for router status and model-scoped health before publishing residency."""
+        started_at = started_at if started_at is not None else time.monotonic()
+        last_status: Optional[str] = None
+        last_error: Optional[BaseException] = None
+        next_progress_log = started_at
+
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            try:
+                metadata = next(
+                    (
+                        item
+                        for item in self._fetch_models(timeout_seconds=min(10.0, remaining))
+                        if item.get("id") == model_name
+                    ),
+                    None,
+                )
+                if metadata is None:
+                    last_status = "not_listed"
+                else:
+                    status = metadata.get("status", {}) or {}
+                    last_status = str(status.get("value") or "unknown")
+                    if status.get("failed") or status.get("exit_code") is not None:
+                        self._invalidate_ready_model(model_name)
+                        raise RuntimeError(
+                            f"Model {model_name} failed while loading "
+                            f"(status={last_status!r}, exit_code={status.get('exit_code')!r})."
+                        )
+
+                    if last_status == "loaded":
+                        health_response = requests.get(
+                            f"{self.base_url}/health",
+                            params={"model": model_name},
+                            timeout=max(0.1, min(10.0, remaining)),
+                        )
+                        if health_response.status_code == 200:
+                            self._set_loaded_model_state(model_name, ready=True)
+                            self.logger.info(
+                                "Model %s is inference-ready after %.2fs.",
+                                model_name,
+                                time.monotonic() - started_at,
+                            )
+                            return
+                        if health_response.status_code != 503:
+                            raise RuntimeError(
+                                f"Health check for model {model_name} failed with HTTP "
+                                f"{health_response.status_code}: {health_response.text.strip()}"
+                            )
+                        last_status = "health_loading"
+                last_error = None
+            except RuntimeError:
+                raise
+            except (requests.RequestException, ValueError) as exc:
+                last_error = exc
+
+            now = time.monotonic()
+            if now >= next_progress_log:
+                self.logger.info(
+                    "Waiting for model %s: status=%s, elapsed=%.1fs, timeout=%.1fs.",
+                    model_name,
+                    last_status or "unknown",
+                    now - started_at,
+                    getattr(self, "model_load_timeout_seconds", 600.0),
+                )
+                next_progress_log = now + 10.0
+            time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+
+        self._invalidate_ready_model(model_name)
+        elapsed = time.monotonic() - started_at
+        detail = f", last_error={last_error}" if last_error is not None else ""
+        raise RuntimeError(
+            f"Timed out after {elapsed:.1f}s waiting for model {model_name} to become "
+            f"inference-ready (last_status={last_status!r}{detail})."
+        )
+
+    def _require_model_ready(self, model_name: str) -> None:
+        """Confirm readiness for adapters attaching to an existing router model."""
+        if getattr(self, "_ready_model", None) == model_name:
+            return
+
+        started_at = time.monotonic()
+        try:
+            metadata = self._get_model_metadata(model_name)
+        except requests.RequestException as exc:
+            raise RuntimeError(
+                f"Cannot confirm inference readiness for model {model_name}: {exc}"
+            ) from exc
+        status = str(((metadata or {}).get("status", {}) or {}).get("value") or "unloaded")
+        if status not in {"loading", "loaded"}:
+            raise RuntimeError(
+                f"Refusing inference for model {model_name}: router status is {status!r}; "
+                "load_model must complete before inference."
+            )
+        self._wait_until_model_ready(
+            model_name,
+            deadline=started_at + self.model_load_timeout_seconds,
+            started_at=started_at,
+        )
+
     def _slot_base_url(self) -> str:
         """Resolve the server URL that exposes llama.cpp slot save/restore endpoints."""
         try:
@@ -242,7 +399,7 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         except requests.RequestException:
             pass
 
-        models_response = requests.get(f"{self.api_uri_v1}/models", timeout=10)
+        models_response = requests.get(f"{self.base_url}/models", timeout=10)
         models_response.raise_for_status()
 
         models = models_response.json().get("data", [])
@@ -421,6 +578,9 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
 
     def generate_response(self, prompt: str, image: str = "") -> str:
         """Create a non-streaming chat completion for a single prompt."""
+        if not self.currently_loaded_model:
+            raise RuntimeError("Cannot generate a response because no model is loaded.")
+        self._require_model_ready(self.currently_loaded_model)
         completion = self.client.chat.completions.create(
             model=self.currently_loaded_model,
             messages=[{"role": "user", "content": prompt}],
@@ -443,6 +603,7 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         If `image` is provided, it is attached to the final user message as a
         base64 data URL for multimodal models.
         """
+        await asyncio.to_thread(self._require_model_ready, model)
         copy_messages = copy.deepcopy(messages)
         if image and copy_messages:
             import base64

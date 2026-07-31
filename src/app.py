@@ -44,6 +44,7 @@ from infrastructure.adapter.LlamaCppSemanticAdapter import LlamaCppSemanticAdapt
 from infrastructure.adapter.llamaCppAdapter import LlamaCppAdapter
 from infrastructure.adapter.LoggingLLMProvider import LoggingLLMProvider
 from infrastructure.adapter.BrowserMCPToolAdapter import BrowserMCPToolAdapter
+from infrastructure.adapter.FaraVisualBrowserAdapter import FaraVisualBrowserAdapter
 from infrastructure.adapter.MCPToolAdapter import MCPToolAdapter
 from infrastructure.adapter.MSSScreenCaptureAdapter import MssScreenCaptureAdapter
 from infrastructure.adapter.SQLiteBenchmarkAdapter import SQLiteBenchmarkAdapter
@@ -77,6 +78,7 @@ logger = logging.getLogger(__name__)
 
 API_BASE_URL = CONFIG.get_str("runtime", "api_base_url", "http://localhost:8080")
 API_KEY = CONFIG.get_str("runtime", "api_key", "testkey")
+MODEL_LOAD_TIMEOUT_SECONDS = CONFIG.get_float("runtime", "model_load_timeout_seconds", 600.0)
 DEFAULT_MODEL = CONFIG.get_str("runtime", "default_model", "Qwen-3.5-9B-Mythos-Distilled-Q4_K_M-Vision")
 PASSIVE_OBSERVER_MODEL = CONFIG.get_model("passive_observer_model", DEFAULT_MODEL)
 FULL_PASSIVE_OBSERVER_MODEL = CONFIG.get_model("full_passive_observer_model", DEFAULT_MODEL)
@@ -148,6 +150,7 @@ LOG_API_PORT = CONFIG.get_int("log_api", "port", 8765)
 LOG_API_BUFFER_SIZE = CONFIG.get_int("log_api", "buffer_size", 2000)
 MCP_CONFIG_PATH = CONFIG.get_str("runtime", "mcp_config_path", "mcp.json")
 BROWSER_MCP_SERVER_NAME = CONFIG.get_str("browser", "server_name", "playwright")
+BROWSER_BACKEND = CONFIG.get_str("browser", "backend", "fara_visual").strip().lower()
 BROWSER_TASK_TIMEOUT_SECONDS = CONFIG.get_float("browser", "task_timeout_seconds", 180.0)
 BROWSER_HEADLESS = CONFIG.get_bool("browser", "headless", False)
 BROWSER_PROFILE_DIR = CONFIG.get_str(
@@ -155,6 +158,19 @@ BROWSER_PROFILE_DIR = CONFIG.get_str(
     "persistent_profile_dir",
     str(USER_DATA_DIR / "browser" / "profile"),
 )
+BROWSER_SCREENSHOT_DIR = CONFIG.get_str(
+    "browser", "screenshot_dir", str(USER_DATA_DIR / "browser" / "screenshots")
+)
+BROWSER_VIEWPORT_WIDTH = CONFIG.get_int("browser", "viewport_width", 1440)
+BROWSER_VIEWPORT_HEIGHT = CONFIG.get_int("browser", "viewport_height", 900)
+BROWSER_MAX_STEPS = CONFIG.get_int("browser", "max_steps", 100)
+BROWSER_SETTLE_MS = CONFIG.get_int("browser", "settle_ms", 700)
+BROWSER_SEARCH_URL_TEMPLATE = CONFIG.get_str(
+    "browser", "search_url_template", "https://duckduckgo.com/?q={query}"
+)
+BROWSER_CHANNEL = CONFIG.get_str("browser", "channel", "")
+BROWSER_EXECUTABLE_PATH = CONFIG.get_str("browser", "executable_path", "")
+BROWSER_SCREENSHOT_RETENTION = CONFIG.get_bool("browser", "retain_screenshots", True)
 FILESYSTEM_TASK_TIMEOUT_SECONDS = CONFIG.get_float("filesystem", "task_timeout_seconds", 120.0)
 FILESYSTEM_MAX_READ_BYTES = CONFIG.get_int("filesystem", "max_read_bytes", 256000)
 FILESYSTEM_MAX_LIST_ENTRIES = CONFIG.get_int("filesystem", "max_list_entries", 200)
@@ -287,6 +303,8 @@ BROWSER_DENIED_TOOL_NAMES = set(
     _parse_json_list("browser", "denied_tools_json")
     or ["browser_run_code", "browser_run_code_unsafe"]
 )
+BROWSER_BLOCKED_DOMAINS = _parse_json_list("browser", "blocked_domains_json")
+BROWSER_BLOCKED_PATH_MARKERS = _parse_json_list("browser", "blocked_path_markers_json")
 
 configure_runtime_log_streaming(max_entries=LOG_API_BUFFER_SIZE, debug_enabled=DEBUG_MODE)
 
@@ -736,7 +754,11 @@ class AmbientRuntime:
 
     def _build_services(self):
         ensure_runtime_databases()
-        raw_llm_adapter = LlamaCppAdapter(base_url=API_BASE_URL, api_key=API_KEY)
+        raw_llm_adapter = LlamaCppAdapter(
+            base_url=API_BASE_URL,
+            api_key=API_KEY,
+            model_load_timeout_seconds=MODEL_LOAD_TIMEOUT_SECONDS,
+        )
         autonomy_store = SQLiteAutonomyAdapter(str(AUTONOMY_DB_PATH))
         if self.resource_governor.audit is None:
             self.resource_governor.audit = autonomy_store.audit
@@ -768,12 +790,34 @@ class AmbientRuntime:
         tool_bridge = MCPToolAdapter()
         task_queue = SQLiteTaskQueueAdapter()
         scheduled_task_service = ScheduledTaskService(task_queue)
-        browser_tool_bridge = BrowserMCPToolAdapter(
-            config_path=MCP_CONFIG_PATH,
-            server_name=BROWSER_MCP_SERVER_NAME,
-            profile_dir=BROWSER_PROFILE_DIR,
-            denied_tool_names=BROWSER_DENIED_TOOL_NAMES,
-        )
+        if BROWSER_BACKEND == "fara_visual":
+            browser_tool_bridge = FaraVisualBrowserAdapter(
+                llm_provider=logged_llm,
+                profile_dir=BROWSER_PROFILE_DIR,
+                screenshot_dir=BROWSER_SCREENSHOT_DIR,
+                viewport_width=BROWSER_VIEWPORT_WIDTH,
+                viewport_height=BROWSER_VIEWPORT_HEIGHT,
+                max_steps=BROWSER_MAX_STEPS,
+                settle_ms=BROWSER_SETTLE_MS,
+                search_url_template=BROWSER_SEARCH_URL_TEMPLATE,
+                browser_channel=BROWSER_CHANNEL,
+                browser_executable_path=BROWSER_EXECUTABLE_PATH,
+                blocked_domains=BROWSER_BLOCKED_DOMAINS,
+                blocked_path_markers=BROWSER_BLOCKED_PATH_MARKERS,
+                screenshot_retention=BROWSER_SCREENSHOT_RETENTION,
+            )
+        elif BROWSER_BACKEND == "playwright_mcp":
+            browser_tool_bridge = BrowserMCPToolAdapter(
+                config_path=MCP_CONFIG_PATH,
+                server_name=BROWSER_MCP_SERVER_NAME,
+                profile_dir=BROWSER_PROFILE_DIR,
+                denied_tool_names=BROWSER_DENIED_TOOL_NAMES,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported [browser] backend '{BROWSER_BACKEND}'. "
+                "Use 'fara_visual' or 'playwright_mcp'."
+            )
         memory_store = SQLiteMemoryAdapter(
             db_path=str(MEMORY_DB_PATH),
             memory_root=str(MEMORY_ROOT),

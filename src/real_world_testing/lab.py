@@ -416,7 +416,14 @@ class ProductionScenarioExecutor:
         parser.read(self.config_path, encoding="utf-8")
         api_url = parser.get("runtime", "api_base_url", fallback="http://127.0.0.1:8080")
         api_key = parser.get("runtime", "api_key", fallback="")
-        raw = LlamaCppAdapter(base_url=api_url, api_key=api_key)
+        model_load_timeout_seconds = parser.getfloat(
+            "runtime", "model_load_timeout_seconds", fallback=600.0
+        )
+        raw = LlamaCppAdapter(
+            base_url=api_url,
+            api_key=api_key,
+            model_load_timeout_seconds=model_load_timeout_seconds,
+        )
         llm = RealWorldTracingLLMProvider(raw, self.emit)
         autonomy_store = SQLiteAutonomyAdapter(str(self.workspace / "autonomy.db"))
         memory = SQLiteMemoryAdapter(str(self.workspace / "memory.db"), str(self.workspace / "memory"))

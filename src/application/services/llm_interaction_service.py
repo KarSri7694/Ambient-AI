@@ -522,7 +522,7 @@ class LLMInteractionService:
         if not task.strip():
             raise ValueError("use_browser requires a non-empty task.")
         if self.browser_tool_bridge is None:
-            raise RuntimeError("Browser MCP delegation is not configured.")
+            raise RuntimeError("Browser delegation is not configured.")
         if not self.browser_agent_model:
             raise RuntimeError("No browser model is configured.")
 
@@ -543,52 +543,67 @@ class LLMInteractionService:
             try:
                 if self._retained_browser_sessions:
                     browser_session = self._retained_browser_sessions.pop()
-                    self.logger.info("Reusing retained browser MCP session.")
+                    self.logger.info("Reusing retained browser session.")
                 else:
                     browser_session = await self.browser_tool_bridge.open_session(
                         headless=self.browser_headless
                     )
-                browser_tools = await browser_session.get_all_tools()
-                if not browser_tools:
-                    raise RuntimeError("The browser MCP server did not expose any safe tools.")
-                browser_tools = [
-                    *browser_tools,
-                    copy.deepcopy(self.FINISH_BROWSER_TASK_TOOL),
-                ]
-                delegated_tool_names = {
-                    tool.get("function", {}).get("name")
-                    for tool in browser_tools
-                    if tool.get("function", {}).get("name")
-                    and tool.get("function", {}).get("name") not in self.TERMINAL_TOOL_NAMES
-                }
-
+                visual_runner = getattr(browser_session, "run_task", None)
                 await self.llm.load_model(self.browser_agent_model)
-                self._push_frame(
-                    model=self.browser_agent_model,
-                    depth=agent_depth + 1,
-                    tools=browser_tools,
-                    tool_bridge=browser_session,
-                    delegated_approval_id=approval_id,
-                    preauthorized_tool_names=(delegated_tool_names if approval_id else set()),
-                )
-                child_frame_pushed = True
-                allowed_tool_names = {
-                    tool.get("function", {}).get("name")
-                    for tool in browser_tools
-                    if tool.get("function", {}).get("name")
-                }
-                browser_result = await asyncio.wait_for(
-                    self.run_interaction(
-                        user_input="You have been given this browser task:\n" + task.strip(),
-                        system_prompt=self.BROWSER_AGENT_PROMPT,
+                if callable(visual_runner):
+                    self.logger.info(
+                        "Starting Fara visual browser task with model %s.",
+                        self.browser_agent_model,
+                    )
+                    browser_result = await asyncio.wait_for(
+                        visual_runner(
+                            task=task.strip(),
+                            model=self.browser_agent_model,
+                            event_callback=event_callback,
+                        ),
+                        timeout=self.browser_task_timeout_seconds,
+                    )
+                else:
+                    # Compatibility path for the legacy browser MCP backend.
+                    browser_tools = await browser_session.get_all_tools()
+                    if not browser_tools:
+                        raise RuntimeError("The browser backend did not expose any safe tools.")
+                    browser_tools = [
+                        *browser_tools,
+                        copy.deepcopy(self.FINISH_BROWSER_TASK_TOOL),
+                    ]
+                    delegated_tool_names = {
+                        tool.get("function", {}).get("name")
+                        for tool in browser_tools
+                        if tool.get("function", {}).get("name")
+                        and tool.get("function", {}).get("name") not in self.TERMINAL_TOOL_NAMES
+                    }
+                    self._push_frame(
                         model=self.browser_agent_model,
-                        agent_depth=agent_depth + 1,
-                        allowed_tool_names=allowed_tool_names,
-                    report_policy="silent",
-                    event_callback=event_callback,
-                    ),
-                    timeout=self.browser_task_timeout_seconds,
-                )
+                        depth=agent_depth + 1,
+                        tools=browser_tools,
+                        tool_bridge=browser_session,
+                        delegated_approval_id=approval_id,
+                        preauthorized_tool_names=(delegated_tool_names if approval_id else set()),
+                    )
+                    child_frame_pushed = True
+                    allowed_tool_names = {
+                        tool.get("function", {}).get("name")
+                        for tool in browser_tools
+                        if tool.get("function", {}).get("name")
+                    }
+                    browser_result = await asyncio.wait_for(
+                        self.run_interaction(
+                            user_input="You have been given this browser task:\n" + task.strip(),
+                            system_prompt=self.BROWSER_AGENT_PROMPT,
+                            model=self.browser_agent_model,
+                            agent_depth=agent_depth + 1,
+                            allowed_tool_names=allowed_tool_names,
+                            report_policy="silent",
+                            event_callback=event_callback,
+                        ),
+                        timeout=self.browser_task_timeout_seconds,
+                    )
             except BaseException as exc:
                 primary_error = exc
             finally:
@@ -608,7 +623,7 @@ class LLMInteractionService:
                             await browser_session.cleanup()
                         except BaseException as exc:
                             cleanup_error = exc
-                            self.logger.exception("Failed to close browser MCP session.")
+                            self.logger.exception("Failed to close browser session.")
 
                 restore_error: Optional[BaseException] = None
                 try:
@@ -751,7 +766,7 @@ class LLMInteractionService:
         if not task.strip():
             raise ValueError("use_browser requires a non-empty task.")
         if self.browser_tool_bridge is None:
-            raise RuntimeError("Browser MCP delegation is not configured.")
+            raise RuntimeError("Browser delegation is not configured.")
         if not self.browser_agent_model:
             raise RuntimeError("No browser model is configured.")
         if self.capability_policy is None or not hasattr(self.capability_policy.store, "create_approval"):
