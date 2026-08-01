@@ -285,6 +285,27 @@ def test_request_computer_use_creates_pending_approval(tmp_path):
     assert delegated.suspended_tool_call_id == "request-1"
 
 
+def test_request_computer_use_allows_negated_risky_words_for_approval(tmp_path):
+    store = SQLiteAutonomyAdapter(str(tmp_path / "autonomy.db"))
+    service = LLMInteractionService(
+        llm_provider=_DelegationProvider(),
+        tool_bridge=_Bridge(),
+        capability_policy=CapabilityPolicyService(store=store),
+        computer_agent_model="computer-model",
+        computer_enabled=True,
+    )
+
+    with pytest.raises(InteractionSuspended) as caught:
+        service._request_computer_use(
+            task="Read visible WhatsApp messages only. Do not type, send, delete, or download anything.",
+            reason="Approved read-only proactive check",
+            agent_depth=0,
+        )
+
+    assert caught.value.approval.capability == "computer.use"
+    assert caught.value.delegated_task.task.startswith("Read visible WhatsApp")
+
+
 def test_approval_event_deploys_computer_agent_once(tmp_path):
     store = SQLiteAutonomyAdapter(str(tmp_path / "autonomy.db"))
     provider = _Provider()

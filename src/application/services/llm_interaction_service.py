@@ -83,11 +83,6 @@ class LLMInteractionService:
     AGENT_DEPTH = 0
     MAX_AGENT_DEPTH = 3
     MAX_ITERATIONS = 25
-    BLOCKED_COMPUTER_TASK_RE = re.compile(
-        r"\b(delete|erase|format|wipe|shutdown|restart|log\s*out|lock\s+screen|"
-        r"change\s+password|credential|payment|checkout|purchase|transfer\s+money)\b",
-        re.IGNORECASE,
-    )
     TERMINAL_TOOL_NAMES = {
         "restore_previous_agent",
         "finish_browser_task",
@@ -971,8 +966,6 @@ class LLMInteractionService:
             raise RuntimeError("No computer-use model is configured.")
         if not task.strip():
             raise ValueError("request_computer_use requires a non-empty task.")
-        if self.BLOCKED_COMPUTER_TASK_RE.search(task):
-            raise RuntimeError("Computer-use request was denied because the task appears destructive or high-risk.")
         if self.capability_policy is None or not hasattr(self.capability_policy.store, "create_approval"):
             raise RuntimeError("Computer-use approvals require the autonomy approval store.")
 
@@ -1004,9 +997,6 @@ class LLMInteractionService:
             raise RuntimeError("No computer-use model is configured.")
         if not task.strip():
             raise ValueError("Computer-use deployment requires a non-empty task.")
-        if self.BLOCKED_COMPUTER_TASK_RE.search(task):
-            raise RuntimeError("Computer-use deployment was denied because the task appears destructive or high-risk.")
-
         async with self._computer_lock:
             resident_model_name = self.llm.get_current_model()
             parent_model_name = resident_model_name or self._frame.model

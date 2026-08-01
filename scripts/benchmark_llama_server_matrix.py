@@ -45,14 +45,21 @@ DEFAULT_PROMPTS = [
 
 TIMING_PATTERNS = {
     "prompt_eval": re.compile(
-        r"prompt eval time\s*=\s*([0-9.]+)\s*ms\s*/\s*([0-9]+)\s*tokens\s*\(([0-9.]+)\s*tokens per second\)",
+        r"prompt eval time\s*=\s*([0-9.]+)\s*ms\s*/\s*([0-9]+)\s*tokens\s*"
+        r"\(\s*([0-9.]+)\s*ms per token,\s*([0-9.]+)\s*tokens per second\s*\)",
         re.IGNORECASE,
     ),
     "eval": re.compile(
-        r"\beval time\s*=\s*([0-9.]+)\s*ms\s*/\s*([0-9]+)\s*runs?\s*\(([0-9.]+)\s*tokens per second\)",
+        r"(?<!prompt )\beval time\s*=\s*([0-9.]+)\s*ms\s*/\s*([0-9]+)\s*tokens\s*"
+        r"\(\s*([0-9.]+)\s*ms per token,\s*([0-9.]+)\s*tokens per second\s*\)",
         re.IGNORECASE,
     ),
     "total": re.compile(r"total time\s*=\s*([0-9.]+)\s*ms", re.IGNORECASE),
+    "draft": re.compile(
+        r"draft acceptance\s*=\s*([0-9.]+)\s*"
+        r"\(\s*([0-9]+)\s*accepted\s*/\s*([0-9]+)\s*generated\s*\),\s*mean len\s*=\s*([0-9.]+)",
+        re.IGNORECASE,
+    ),
 }
 
 
@@ -184,17 +191,28 @@ def parse_server_timings(log_text: str) -> dict[str, Any]:
         payload.update({
             "prompt_eval_ms": float(match.group(1)),
             "prompt_eval_tokens": int(match.group(2)),
-            "prompt_eval_tokens_per_second": float(match.group(3)),
+            "prompt_eval_ms_per_token": float(match.group(3)),
+            "prompt_eval_tokens_per_second": float(match.group(4)),
         })
     if eval_matches:
         match = eval_matches[-1]
         payload.update({
             "server_eval_ms": float(match.group(1)),
             "server_eval_tokens": int(match.group(2)),
-            "server_eval_tokens_per_second": float(match.group(3)),
+            "server_eval_ms_per_token": float(match.group(3)),
+            "server_eval_tokens_per_second": float(match.group(4)),
         })
     if total_matches:
         payload["server_total_ms"] = float(total_matches[-1].group(1))
+    draft_matches = list(TIMING_PATTERNS["draft"].finditer(log_text))
+    if draft_matches:
+        match = draft_matches[-1]
+        payload.update({
+            "draft_acceptance": float(match.group(1)),
+            "draft_tokens_accepted": int(match.group(2)),
+            "draft_tokens_generated": int(match.group(3)),
+            "draft_mean_length": float(match.group(4)),
+        })
     return payload
 
 

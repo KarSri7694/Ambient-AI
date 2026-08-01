@@ -325,15 +325,49 @@ path, offset = sys.argv[1], int(sys.argv[2])
 with open(path, "r", encoding="utf-8", errors="replace") as handle:
     handle.seek(offset)
     text = handle.read()
-prompt = list(re.finditer(r"prompt eval time\s*=\s*([0-9.]+)\s*ms\s*/\s*([0-9]+)\s*tokens\s*\(([0-9.]+)\s*tokens per second\)", text, re.I))
-gen = list(re.finditer(r"\beval time\s*=\s*([0-9.]+)\s*ms\s*/\s*([0-9]+)\s*runs?\s*\(([0-9.]+)\s*tokens per second\)", text, re.I))
+prompt = list(re.finditer(
+    r"prompt eval time\s*=\s*([0-9.]+)\s*ms\s*/\s*([0-9]+)\s*tokens\s*"
+    r"\(\s*([0-9.]+)\s*ms per token,\s*([0-9.]+)\s*tokens per second\s*\)",
+    text,
+    re.I,
+))
+gen = list(re.finditer(
+    r"(?<!prompt )\beval time\s*=\s*([0-9.]+)\s*ms\s*/\s*([0-9]+)\s*tokens\s*"
+    r"\(\s*([0-9.]+)\s*ms per token,\s*([0-9.]+)\s*tokens per second\s*\)",
+    text,
+    re.I,
+))
+draft = list(re.finditer(
+    r"draft acceptance\s*=\s*([0-9.]+)\s*"
+    r"\(\s*([0-9]+)\s*accepted\s*/\s*([0-9]+)\s*generated\s*\),\s*mean len\s*=\s*([0-9.]+)",
+    text,
+    re.I,
+))
 payload = {}
 if prompt:
     m = prompt[-1]
-    payload.update(prompt_eval_ms=float(m.group(1)), prompt_eval_tokens=int(m.group(2)), prompt_eval_tokens_per_second=float(m.group(3)))
+    payload.update(
+        prompt_eval_ms=float(m.group(1)),
+        prompt_eval_tokens=int(m.group(2)),
+        prompt_eval_ms_per_token=float(m.group(3)),
+        prompt_eval_tokens_per_second=float(m.group(4)),
+    )
 if gen:
     m = gen[-1]
-    payload.update(server_eval_ms=float(m.group(1)), server_eval_tokens=int(m.group(2)), server_eval_tokens_per_second=float(m.group(3)))
+    payload.update(
+        server_eval_ms=float(m.group(1)),
+        server_eval_tokens=int(m.group(2)),
+        server_eval_ms_per_token=float(m.group(3)),
+        server_eval_tokens_per_second=float(m.group(4)),
+    )
+if draft:
+    m = draft[-1]
+    payload.update(
+        draft_acceptance=float(m.group(1)),
+        draft_tokens_accepted=int(m.group(2)),
+        draft_tokens_generated=int(m.group(3)),
+        draft_mean_length=float(m.group(4)),
+    )
 print(json.dumps(payload))
 PY
 }

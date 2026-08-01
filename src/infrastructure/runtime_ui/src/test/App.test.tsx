@@ -25,7 +25,14 @@ describe("runtime shell", () => {
       if (path.includes("/api/runtime/biodata/run")) return json({ ok: true, accepted: true, status: { requested: true, running: false } });
       if (path.includes("/healthz")) return json({ status: "ok", latest_id: 12 });
       if (path.includes("/api/chat/sessions")) return json({ sessions: [], count: 0 });
-      if (path.includes("/api/home")) return json({ date: "2026-07-30", today: "2026-07-30", server_time: new Date().toISOString(), counts: {}, background: { events: {} }, timeline: [], attention: [], new_count: 0, briefing: null, briefing_pending: false, briefing_refresh: { running: false, last_error: null }, latest_headline: "Nothing important changed yet", latest_narrative: "I have not completed any meaningful work yet." });
+      if (path.includes("/api/home")) return json({
+        date: "2026-07-30", today: "2026-07-30", server_time: new Date().toISOString(),
+        counts: {}, background: { events: {} }, timeline: [], attention: [], new_count: 0,
+        briefing: null, briefing_pending: false, briefing_stale: false,
+        briefing_refresh: { running: false, last_error: null },
+        latest_headline: "Nothing important changed yet",
+        latest_narrative: "I have not completed any meaningful work yet.",
+      });
       return json({});
     }));
   });
@@ -45,6 +52,45 @@ describe("runtime shell", () => {
     expect(await screen.findByText("I have not completed any meaningful work yet.")).toBeInTheDocument();
     expect(fetch).toHaveBeenCalledWith("/api/home", expect.objectContaining({ cache: "no-store" }));
     expect(screen.getAllByRole("button", { name: "Home" })[0]).toHaveAttribute("aria-current", "page");
+  });
+
+  it("keeps cached briefing columns visible while the digest is stale", async () => {
+    window.history.replaceState({}, "", "/");
+    vi.mocked(fetch).mockImplementation((input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.includes("/api/home")) return json({
+        date: "2026-07-30", today: "2026-07-30", server_time: new Date().toISOString(),
+        counts: {}, background: { events: {} }, timeline: [], attention: [], new_count: 0,
+        briefing_stale: true, briefing_pending: true,
+        briefing_refresh: { running: false, last_error: null },
+        latest_headline: "Fresh runtime fallback",
+        latest_narrative: "The current runtime state changed after restart.",
+        briefing: {
+          headline: "Cached personalized digest",
+          overview: "Cached overview",
+          accomplishments: ["Cached accomplishment"],
+          updates: ["Cached learning"],
+          failures: ["Cached failure"],
+          attention: ["Cached attention"],
+          generated_at: new Date().toISOString(),
+        },
+      });
+      if (path.includes("/api/privacy/status")) return json({ capture: { paused: false }, capture_size_bytes: 0 });
+      if (path.includes("/api/runtime/resources")) return json({ preset: "balanced", residency: {}, snapshot: {}, event_counts: {} });
+      if (path.includes("/api/runtime/reflection/status")) return json({ ok: true, status: { requested: false, running: false } });
+      if (path.includes("/api/runtime/biodata/status")) return json({ ok: true, status: { requested: false, running: false } });
+      if (path.includes("/api/runtime/interrupt/status")) return json({ ok: true, status: { requested: false, active_work: null } });
+      if (path.includes("/healthz")) return json({ status: "ok", latest_id: 12 });
+      return json({});
+    });
+
+    renderApp();
+
+    expect(await screen.findByText("Cached accomplishment")).toBeInTheDocument();
+    expect(screen.getByText("Cached learning")).toBeInTheDocument();
+    expect(screen.getByText("Cached failure")).toBeInTheDocument();
+    expect(screen.getByText("Cached attention")).toBeInTheDocument();
+    expect(screen.getByText(/Showing last completed digest/i)).toBeInTheDocument();
   });
 
   it("opens the artifact library tab", async () => {

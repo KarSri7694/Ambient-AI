@@ -95,6 +95,8 @@ export function HomePage({ onNavigate }: { onNavigate: (path: string) => void })
   const attention = data?.attention || [];
   const briefing = data?.briefing;
   const briefingRefresh = data?.briefing_refresh || {};
+  const hasBriefing = Boolean(briefing);
+  const briefingIsFresh = hasBriefing && !data?.briefing_stale;
   const stats = useMemo(() => [
     { label: "Work completed", value: Number(counts.reports || 0) + Number(counts.activity_runs || 0), icon: Bot },
     { label: "Proactive updates", value: counts.proactive_updates || 0, icon: Inbox },
@@ -126,27 +128,31 @@ export function HomePage({ onNavigate }: { onNavigate: (path: string) => void })
     {data && <>
       <section className="home-briefing">
         <div className="home-section-head">
-          <div><p className="eyebrow">Latest update</p><h2>{briefing && !data.briefing_stale ? briefing.headline : data.latest_headline}</h2></div>
+          <div><p className="eyebrow">Latest update</p><h2>{briefingIsFresh ? briefing.headline : data.latest_headline}</h2></div>
           <div className="flex flex-wrap gap-2">
             {data.new_count > 0 && <Badge tone="good">{data.new_count} new since last visit</Badge>}
+            {briefing && data.briefing_stale && <Badge tone="warn">Digest updating</Badge>}
             {data.briefing_pending && briefingRefresh.running && <Badge tone="warn">Personalized digest refreshing</Badge>}
             {data.briefing_pending && !briefingRefresh.running && briefingRefresh.last_error && <Badge tone="danger">Digest retry scheduled</Badge>}
             {data.briefing_pending && !briefingRefresh.running && !briefingRefresh.last_error && <Badge tone="warn">Personalized digest pending</Badge>}
           </div>
         </div>
         <div className="home-overview">
-          <Markdown>{briefing && !data.briefing_stale ? briefing.overview : data.latest_narrative}</Markdown>
+          <Markdown>{briefingIsFresh ? briefing.overview : data.latest_narrative}</Markdown>
         </div>
-        {briefing && !data.briefing_stale && <>
+        {briefing && <>
           <div className="home-brief-columns">
             <BriefList title="What I accomplished" items={briefing.accomplishments} />
             <BriefList title="What I learned for you" items={briefing.updates} />
             <BriefList title="What did not work" items={briefing.failures} />
             <BriefList title="What needs you" items={briefing.attention} />
           </div>
-          <p className="home-generated">Personalized from your local profile and prepared {formatDate(briefing.generated_at)}</p>
+          <p className="home-generated">
+            Personalized from your local profile and prepared {formatDate(briefing.generated_at)}
+            {data.briefing_stale ? " · Showing last completed digest while the latest one is prepared." : ""}
+          </p>
         </>}
-        {(!briefing || data.briefing_stale) && <p className="home-generated">This latest summary is built directly from current runtime outcomes. {briefingRefresh.last_error ? `The deeper personalized digest will retry after ${formatDate(briefingRefresh.retry_after)}.` : "Ambient AI will replace it with a deeper profile-aware narrative in the next idle resource window."}</p>}
+        {!briefing && <p className="home-generated">This latest summary is built directly from current runtime outcomes. {briefingRefresh.last_error ? `The deeper personalized digest will retry after ${formatDate(briefingRefresh.retry_after)}.` : "Ambient AI will replace it with a deeper profile-aware narrative in the next idle resource window."}</p>}
       </section>
 
       <section className="home-stat-grid">

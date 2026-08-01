@@ -9,7 +9,7 @@ from typing import Any, Optional
 
 from application.services.capability_policy_service import CapabilityRegistry
 from application.services.interaction_trace import interaction_trace
-from core.models import OpportunityCandidate, ProactiveInboxItem
+from core.models import OpportunityCandidate, ProactiveInboxItem, VisualObservation
 
 
 @dataclass(frozen=True)
@@ -75,7 +75,11 @@ Rules:
         "gmail": (
             "Check Gmail for important recent emails, unread messages, replies needed, "
             "deadlines, bills, meetings, travel, account/security notices, recruiter/work "
-            "messages, or anything the user should not miss. Use read/search/list Gmail tools only."
+            "messages, or anything the user should not miss. Use read/search/list Gmail tools only. "
+            "Required Gmail workflow: first call search_gmail_messages with a Gmail search query; "
+            "then extract the returned Gmail message IDs; only then call get_gmail_messages_content_batch "
+            "with those exact message IDs. Never call get_gmail_messages_content_batch with an empty "
+            "message_ids list, and never use 'me' as a message_id."
         ),
         "calendar": (
             "Check Google Calendar for today and the next 7 days. Find upcoming events, "
@@ -106,6 +110,7 @@ Rules:
         capability_policy: Any,
         semantic_dedupe_service: Any = None,
         user_context_service: Any = None,
+        memory: Any = None,
         model: str,
         enabled: bool = False,
         global_grant: bool = False,
@@ -123,6 +128,7 @@ Rules:
         self.capability_policy = capability_policy
         self.semantic_dedupe = semantic_dedupe_service
         self.user_context_service = user_context_service
+        self.memory = memory
         self.model = str(model or "").strip()
         self.enabled = bool(enabled)
         self.global_grant = bool(global_grant)
@@ -215,6 +221,7 @@ Rules:
                 item = self._create_inbox_item(finding)
                 created.append(item)
                 self._record_created(finding, item)
+                self._record_biodata_candidate(finding, item)
 
             summary = f"Checked {len(self.enabled_sources)} source(s); surfaced {len(created)} finding(s)."
             if errors:
@@ -421,6 +428,78 @@ Rules:
             metadata={"source": finding.source, "importance": finding.importance},
             provider_ref=item.inbox_id,
         )
+
+    def _record_biodata_candidate(self, finding: ProactiveFinding, item: ProactiveInboxItem) -> None:
+        """Feed accepted proactive findings into the existing biodata pipeline.
+
+        Proactive sweep should not directly decide what belongs in USER_INFO.md.
+        It records a pending synthetic observation; UserBioDataService later
+        decides whether the signal is durable user_info, short-lived memory, or
+        not worth storing.
+        """
+        if self.memory is None or not hasattr(self.memory, "append_visual_observation"):
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        source_label = finding.source.replace("_", " ").title()
+        evidence_text = "\n".join(f"- {entry}" for entry in finding.evidence[:8])
+        details = "\n\n".join(
+            part for part in [
+                finding.summary,
+                f"Suggested next step: {finding.suggested_next_step}" if finding.suggested_next_step else "",
+                f"Evidence:\n{evidence_text}" if evidence_text else "",
+            ]
+            if part
+        )
+        hypotheses: list[dict[str, str]] = []
+        if finding.importance in {"high", "urgent"} or finding.requires_user_action:
+            hypotheses.append(
+                {
+                    "category": "commitment" if finding.requires_user_action else "concern",
+                    "summary": finding.suggested_next_step or finding.summary[:240],
+                    "confidence": f"{finding.confidence:.2f}",
+                }
+            )
+        raw_payload = {
+            "source": "proactive_sweep",
+            "proactive_source": finding.source,
+            "inbox_id": item.inbox_id,
+            "opportunity_id": item.opportunity_id,
+            "importance": finding.importance,
+            "requires_user_action": finding.requires_user_action,
+            "sensitive": finding.sensitive,
+            "evidence": finding.evidence,
+            "suggested_next_step": finding.suggested_next_step,
+        }
+        observation = VisualObservation(
+            observation_id=f"proactive-{item.inbox_id}",
+            screenshot_path=f"proactive://{finding.source}/{item.inbox_id}",
+            created_at=now,
+            observation_type="proactive_finding",
+            app_name=f"Proactive {source_label}",
+            window_title=finding.title,
+            page_hint=finding.source,
+            summary=finding.title,
+            detailed_description=details,
+            inferred_user_activity=(
+                f"Ambient AI found a {finding.importance} proactive {finding.source} signal: "
+                f"{finding.summary}"
+            ),
+            previous_activity_status="active",
+            salient_entities=[finding.source, finding.importance],
+            open_loops=[finding.suggested_next_step] if finding.suggested_next_step else [],
+            possible_next_task=finding.suggested_next_step or None,
+            user_fact_hypotheses=hypotheses,
+            confidence=finding.confidence,
+            followup_sent_at=now,
+            biodata_sent_at=None,
+            raw_payload_json=json.dumps(raw_payload, ensure_ascii=False),
+            analysis_status="proactive_sweep",
+            analysis_model=self.model,
+        )
+        try:
+            self.memory.append_visual_observation(observation)
+        except Exception:
+            self.logger.exception("Could not record proactive finding as biodata candidate.")
 
     def _create_inbox_item(self, finding: ProactiveFinding) -> ProactiveInboxItem:
         now = datetime.now(timezone.utc).isoformat()

@@ -1,7 +1,13 @@
 import json
 import asyncio
+import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+SRC_ROOT = REPO_ROOT / "src"
+sys.path.insert(0, str(SRC_ROOT))
 
 from application.services.daily_briefing_service import DailyBriefingService
 
@@ -148,6 +154,13 @@ def test_idle_refresh_caches_sanitized_ai_digest():
     after_model_audit = service.snapshot(date_value=now.astimezone().date().isoformat())
     assert after_model_audit["briefing_stale"] is False
     assert after_model_audit["background"]["audit_actions"]["resource.model_loaded"] == 1
+    service.autonomy_store.daily_event_counts = (
+        lambda start, end: {"processed": 99, "pending": 7}
+        if datetime.fromisoformat(start) <= now < datetime.fromisoformat(end)
+        else {}
+    )
+    after_event_count_churn = service.snapshot(date_value=now.astimezone().date().isoformat())
+    assert after_event_count_churn["briefing_stale"] is False
     assert asyncio.run(service.refresh_if_due())["ran"] is False
 
 

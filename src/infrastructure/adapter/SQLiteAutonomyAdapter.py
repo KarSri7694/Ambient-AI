@@ -732,7 +732,7 @@ class SQLiteAutonomyAdapter(AutonomyStorePort):
         if status:
             query += " WHERE status=?"
             params.append(status)
-        query += " ORDER BY updated_at DESC LIMIT ?"
+        query += " ORDER BY julianday(created_at) DESC, julianday(updated_at) DESC LIMIT ?"
         params.append(max(1, min(int(limit), 500)))
         with self._connect() as conn:
             return [self._opportunity_from_row(row) for row in conn.execute(query, params).fetchall()]
@@ -779,7 +779,7 @@ class SQLiteAutonomyAdapter(AutonomyStorePort):
         if status:
             query += " WHERE status=?"
             params.append(status)
-        query += " ORDER BY updated_at DESC LIMIT ?"
+        query += " ORDER BY created_at DESC, updated_at DESC LIMIT ?"
         params.append(max(1, min(int(limit), 500)))
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()

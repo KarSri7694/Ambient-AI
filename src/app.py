@@ -9,7 +9,7 @@ import queue
 import re
 import threading
 import time
-from typing import Optional
+from typing import Any, Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -344,7 +344,19 @@ def _parse_json_list(section: str, option: str) -> list[str]:
         return []
     if not isinstance(payload, list):
         return []
-    return [str(item).strip() for item in payload if str(item).strip()]
+    values: list[str] = []
+
+    def collect_items(items: list[Any]) -> None:
+        for item in items:
+            if isinstance(item, list):
+                collect_items(item)
+                continue
+            normalized = str(item).strip()
+            if normalized:
+                values.append(normalized)
+
+    collect_items(payload)
+    return values
 
 
 PASSIVE_OBSERVER_IGNORE_APPS = _parse_json_list("passive_observer", "ignore_apps_json")
@@ -1177,6 +1189,7 @@ class AmbientRuntime:
             capability_policy=capability_policy,
             semantic_dedupe_service=semantic_dedupe,
             user_context_service=user_context_service,
+            memory=memory_store,
             model=PROACTIVE_AUTONOMY_MODEL,
             enabled=PROACTIVE_AUTONOMY_ENABLED,
             global_grant=PROACTIVE_AUTONOMY_GLOBAL_GRANT,

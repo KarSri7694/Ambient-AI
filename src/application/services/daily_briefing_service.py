@@ -335,11 +335,11 @@ class DailyBriefingService:
             "artifact_changes": len(artifacts), "pending_approvals": len(pending_approvals),
             "queued_tasks": len(tasks), "attention": len(attention),
         }
-        # Resource lease/model load audits are useful live telemetry, but they
-        # must not invalidate the digest: generating the digest creates those
-        # audits itself and would otherwise cause a permanent stale loop.
+        # Runtime event counts and resource/model audits are useful live
+        # telemetry, but they must not invalidate the digest: restarts, leases,
+        # retries, and digest generation itself can change those counters
+        # without changing the human-meaningful daily story.
         stable_background = {
-            "events": event_counts,
             "artifact_maintenance_runs": len(maintenance_runs),
         }
         canonical = {
