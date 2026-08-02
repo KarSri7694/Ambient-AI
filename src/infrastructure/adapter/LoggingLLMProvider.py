@@ -32,6 +32,7 @@ class LoggingLLMProvider(LLMProvider):
         self.capture_store = capture_store
         self.residency_manager = residency_manager
         self._current_response_state: Dict[str, Any] | None = None
+        self._tool_call_interactions: Dict[str, str] = {}
         if self.current_response_path is not None:
             self.current_response_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -398,6 +399,63 @@ class LoggingLLMProvider(LLMProvider):
 
     def _log(self, entry: InteractionLogEntry) -> None:
         self.log_store.insert(entry)
+        if not entry.tool_calls_json:
+            return
+        try:
+            tool_calls = json.loads(entry.tool_calls_json)
+        except (TypeError, json.JSONDecodeError):
+            return
+        if not isinstance(tool_calls, list):
+            return
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            tool_call_id = str(tool_call.get("id") or "").strip()
+            if tool_call_id:
+                self._tool_call_interactions[tool_call_id] = entry.interaction_id
+
+    def attach_tool_result(
+        self,
+        tool_call_id: str,
+        *,
+        tool_name: str,
+        arguments_json: str,
+        output: str,
+        ok: bool,
+        status: str = "completed",
+    ) -> None:
+        """Persist the outcome of a tool call against its originating model turn."""
+        interaction_id = self._tool_call_interactions.get(str(tool_call_id or ""))
+        if not interaction_id:
+            self.logger.debug("No persisted interaction found for tool call %s.", tool_call_id)
+            return
+        self.log_store.attach_tool_result(
+            interaction_id,
+            str(tool_call_id),
+            tool_name=tool_name,
+            arguments_json=arguments_json,
+            output=output,
+            ok=ok,
+            status=status,
+        )
+
+    def register_tool_calls(self, tool_calls: List[Dict[str, Any]]) -> None:
+        """Associate native or text-recovered calls with the current log row."""
+        if not tool_calls:
+            return
+        interaction_run_id = str(current_interaction_metadata().get("interaction_run_id") or "")
+        interaction_id = self.log_store.attach_tool_calls_to_latest_run(
+            interaction_run_id,
+            json.dumps(tool_calls, ensure_ascii=False, indent=2),
+        )
+        if not interaction_id:
+            return
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            tool_call_id = str(tool_call.get("id") or "").strip()
+            if tool_call_id:
+                self._tool_call_interactions[tool_call_id] = interaction_id
 
     def attach_report(self, interaction_run_id: str, report: Dict[str, Any]) -> None:
         report_json = json.dumps(report, ensure_ascii=False, indent=2)

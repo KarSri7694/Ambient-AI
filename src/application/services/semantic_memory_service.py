@@ -86,6 +86,7 @@ class SemanticMemoryService:
         rerank_limit: Optional[int] = None,
         source_types: Optional[List[str]] = None,
         sync_max_batches: Optional[int] = 1,
+        query_instruction: str = "",
     ) -> List[SemanticMemoryResult]:
         if not self.is_enabled():
             return []
@@ -94,7 +95,14 @@ class SemanticMemoryService:
             return []
         self.ensure_embeddings_synced(max_batches=sync_max_batches)
         try:
-            query_embedding = self.semantic_adapter.embed_texts([normalized_query])
+            if query_instruction and hasattr(self.semantic_adapter, "embed_query"):
+                query_embedding = [
+                    self.semantic_adapter.embed_query(
+                        normalized_query, instruction=query_instruction
+                    )
+                ]
+            else:
+                query_embedding = self.semantic_adapter.embed_texts([normalized_query])
         except Exception as exc:
             self.logger.warning("Semantic query embedding failed: %s", exc)
             return []

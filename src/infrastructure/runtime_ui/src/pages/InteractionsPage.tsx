@@ -7,6 +7,37 @@ import type { InteractionInput, InteractionPage } from "../types";
 
 const PAGE_SIZE = 50;
 
+type LoggedToolCall = {
+  id?: string;
+  function?: { name?: string; arguments?: string };
+  execution?: { status?: string; ok?: boolean; output?: string };
+};
+
+function ToolCallResponse({ toolCalls }: { toolCalls: unknown }) {
+  const calls = Array.isArray(toolCalls) ? toolCalls as LoggedToolCall[] : [];
+  if (!calls.length) return null;
+  return (
+    <div className="space-y-3 text-sm">
+      <p className="font-medium">The model requested tool execution.</p>
+      {calls.map((call, index) => {
+        const name = call.function?.name || "unknown tool";
+        const args = call.function?.arguments || "{}";
+        const execution = call.execution;
+        return (
+          <div key={call.id || `${name}-${index}`} className="rounded-lg border border-white/10 bg-black/15 p-3">
+            <p><span className="font-medium">Called:</span> <code>{name}</code></p>
+            <details className="mt-2"><summary className="cursor-pointer text-muted">Arguments</summary><pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap text-xs">{args}</pre></details>
+            {execution ? <>
+              <p className={`mt-3 font-medium ${execution.ok ? "text-emerald-300" : "text-amber-300"}`}>{execution.status === "awaiting_approval" ? "Awaiting approval" : execution.ok ? "Tool completed" : "Tool returned an error"}</p>
+              <pre className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap text-xs">{execution.output || "No tool output was returned."}</pre>
+            </> : <p className="mt-2 italic text-muted">Tool call was requested; its execution result was not recorded.</p>}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 export function InteractionsPage() {
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
@@ -56,7 +87,8 @@ export function InteractionsPage() {
       <div className="space-y-5">
         {interactions.data?.items.map((interaction) => {
           const input = revealed[interaction.interaction_id] || interaction.input;
-          const status = interaction.error_text ? "Failed" : interaction.response_text ? "Completed" : "Incomplete";
+          const hasToolCalls = Array.isArray(interaction.tool_calls) && interaction.tool_calls.length > 0;
+          const status = interaction.error_text ? "Failed" : interaction.response_text ? "Completed" : hasToolCalls ? "Tool activity" : "Incomplete";
           return (
             <article key={interaction.interaction_id} className="interaction-card">
               <header className="interaction-head">
@@ -89,13 +121,16 @@ export function InteractionsPage() {
                 <div className="response-wrap">
                   <p className="bubble-label">Ambient AI</p>
                   <div className={`response-bubble ${interaction.error_text ? "failed" : ""}`}>
-                    {interaction.response_text ? <Markdown>{interaction.response_text}</Markdown> : <p className="italic text-muted">{interaction.error_text || "No response was recorded."}</p>}
+                    {interaction.response_text ? <Markdown>{interaction.response_text}</Markdown>
+                      : hasToolCalls ? <ToolCallResponse toolCalls={interaction.tool_calls} />
+                      : <p className="italic text-muted">{interaction.error_text || "No response was recorded."}</p>}
                   </div>
                 </div>
               </div>
 
               <div className="mt-4 space-y-2">
                 {input.context_messages.length > 0 && <JsonDetails label={`Request context (${input.context_messages.length} messages)`} value={input.context_messages} />}
+                {(input.rag_context?.length || 0) > 0 && <JsonDetails label={`Injected RAG context (${input.rag_context!.length} blocks)`} value={input.rag_context} open />}
                 <JsonDetails label="Reasoning" value={interaction.reasoning_text} />
                 <JsonDetails label="Tools offered" value={interaction.tools} />
                 <JsonDetails label="Tool calls" value={interaction.tool_calls} />

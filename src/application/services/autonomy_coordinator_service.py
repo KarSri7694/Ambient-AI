@@ -31,6 +31,9 @@ Requirements:
 - Verify important facts, especially dates and deadlines, from authoritative sources.
 - For an inferred reminder, call add_task only with an exact due_datetime plus source_url and source_verified=true.
 - Use relevant user memory only to personalize recommendations; say which facts affected the result.
+- Treat temporal context as an ordered record of what the user has already explored, implemented, completed, or left unresolved.
+- Do not research or report work the timeline shows the user is already doing or has completed. Act only on a concrete unresolved gap.
+- Create a durable artifact only when the outcome is substantive: a verified recommendation, comparison, decision record, integration assessment, plan, or useful draft.
 - Produce a detailed result with: Why now, Key facts, Personalized options, Recommended plan,
   Ideas or next steps, Sources, and Actions taken or awaiting approval.
 - Do not send, submit, purchase, delete, publish, change credentials, or broaden the task.
@@ -60,6 +63,8 @@ Do not repeat an action already reported as performed.
         deep_visual_observer: Optional[Any] = None,
         visual_model: str = "",
         user_context_service: Optional[Any] = None,
+        temporal_memory_service: Optional[Any] = None,
+        temporal_vlm_context_chars: int = 1800,
         chat_store: Optional[Any] = None,
         chat_event_broker: Optional[Any] = None,
         task_store: Optional[Any] = None,
@@ -80,6 +85,8 @@ Do not repeat an action already reported as performed.
         self.deep_visual_observer = deep_visual_observer
         self.visual_model = str(visual_model or "")
         self.user_context_service = user_context_service
+        self.temporal_memory_service = temporal_memory_service
+        self.temporal_vlm_context_chars = max(0, int(temporal_vlm_context_chars))
         self.chat_store = chat_store
         self.chat_event_broker = chat_event_broker
         self.task_store = task_store
@@ -310,10 +317,36 @@ Do not repeat an action already reported as performed.
                 )
             if event.event_type == "visual_context_batch_pending":
                 event = self._flush_pending_visual_batch(event)
+            temporal_event = None
+            temporal_context: dict[str, Any] = {}
+            temporal_prompt = ""
+            if self.temporal_memory_service is not None:
+                temporal_event = self.temporal_memory_service.record_ambient_event(event)
+                temporal_query = self._event_query_text(event)
+                if temporal_query:
+                    temporal_context = self.temporal_memory_service.build_context(
+                        query_text=temporal_query,
+                        current_event=temporal_event,
+                    )
+                    temporal_prompt = self.temporal_memory_service.build_prompt_context(
+                        query_text=temporal_query,
+                        current_event=temporal_event,
+                        max_chars=(
+                            self.temporal_vlm_context_chars
+                            if event.event_type == "lightweight_visual_capture"
+                            else 6000
+                        ),
+                    )
+                    if temporal_prompt and event.event_type != "lightweight_visual_capture":
+                        personalization_context = "\n\n".join(
+                            part for part in [personalization_context, temporal_prompt] if part
+                        )
             if event.event_type == "lightweight_visual_capture":
                 event = await self._enrich_lightweight_visual(
                     event,
                     personalization_context=personalization_context,
+                    temporal_context=temporal_prompt,
+                    temporal_thread_id=str((temporal_context.get("active_thread") or {}).get("thread_id") or ""),
                 )
                 enriched_payload = self._safe_json(event.payload_json)
                 if enriched_payload.get("capture_processing_skipped"):
@@ -337,6 +370,11 @@ Do not repeat an action already reported as performed.
                 )
                 self.store.complete_event(event.event_id)
                 enriched_payload = self._safe_json(event.payload_json)
+                if self.temporal_memory_service is not None:
+                    self.temporal_memory_service.record_ambient_event(
+                        event,
+                        outcome="perception completed",
+                    )
                 return event_result(
                     {
                         "processed": True,
@@ -452,6 +490,7 @@ Do not repeat an action already reported as performed.
                 },
                 "ambient_evidence": self._safe_json(event.payload_json),
                 "personalization_context": personalization_context[:8000],
+                "temporal_context": temporal_context,
             }
             with interaction_trace(
                 "autonomy_investigation",
@@ -554,6 +593,11 @@ Do not repeat an action already reported as performed.
             self.store.complete_run(run.run_id, summary=item.summary, output_text=result)
             self.store.update_opportunity_status(candidate.opportunity_id, inbox_status)
             self.store.complete_event(event.event_id)
+            if self.temporal_memory_service is not None:
+                self.temporal_memory_service.record_ambient_event(
+                    event,
+                    outcome=f"{inbox_status}: {result[:10000]}",
+                )
             return event_result({"processed": True, "outcome": "completed", "inbox_id": item.inbox_id})
         except ResourceUnavailableError as exc:
             self.store.defer_event(event.event_id, reason=exc.decision.reason, delay_seconds=30)
@@ -691,6 +735,8 @@ Do not repeat an action already reported as performed.
         event: AmbientEvent,
         *,
         personalization_context: str,
+        temporal_context: str = "",
+        temporal_thread_id: str = "",
     ) -> AmbientEvent:
         if self.visual_observer is None or self.capture_store is None or not self.visual_model:
             return event
@@ -720,6 +766,7 @@ Do not repeat an action already reported as performed.
                 archive_source=False,
                 model=self.visual_model,
                 recent_context=personalization_context,
+                temporal_context=temporal_context,
                 captured_at=event.occurred_at,
                 similarity_score=payload.get("similarity_score"),
                 uiat_context_override=uiat_context,
@@ -771,6 +818,8 @@ Do not repeat an action already reported as performed.
             "downstream_event_id": downstream_event.event_id,
             "batch_status": downstream_event.event_type,
             "batch_flush_reason": self._safe_json(downstream_event.payload_json).get("flush_reason"),
+            "temporal_context_applied": bool(temporal_context),
+            "temporal_thread_id": temporal_thread_id or None,
         }
         return replace(
             event,

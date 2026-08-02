@@ -1,4 +1,5 @@
 import sqlite3
+import json
 from contextlib import contextmanager
 from datetime import date, timedelta
 from pathlib import Path
@@ -127,6 +128,84 @@ class SQLiteInteractionLogAdapter:
                 """,
                 (report_json, interaction_run_id),
             )
+
+    def attach_tool_result(
+        self,
+        interaction_id: str,
+        tool_call_id: str,
+        *,
+        tool_name: str,
+        arguments_json: str,
+        output: str,
+        ok: bool,
+        status: str = "completed",
+    ) -> None:
+        """Attach an executed tool result to the model turn that requested it.
+
+        Tool calls are logged when the streaming model response ends, while the
+        tool itself runs immediately afterwards.  Keeping the result inside the
+        same JSON object lets the audit UI show one coherent model/tool turn.
+        """
+        with self._managed_connection() as conn:
+            row = conn.execute(
+                "SELECT tool_calls_json FROM interaction_logs WHERE interaction_id = ?",
+                (interaction_id,),
+            ).fetchone()
+            if row is None:
+                return
+            try:
+                calls = json.loads(row["tool_calls_json"] or "[]")
+            except (TypeError, json.JSONDecodeError):
+                calls = []
+            if not isinstance(calls, list):
+                return
+            changed = False
+            for call in calls:
+                if not isinstance(call, dict) or str(call.get("id") or "") != tool_call_id:
+                    continue
+                function = call.setdefault("function", {})
+                if isinstance(function, dict):
+                    function["name"] = str(function.get("name") or tool_name)
+                    function["arguments"] = str(function.get("arguments") or arguments_json)
+                call["execution"] = {
+                    "status": status,
+                    "ok": bool(ok),
+                    "output": str(output),
+                }
+                changed = True
+                break
+            if changed:
+                conn.execute(
+                    "UPDATE interaction_logs SET tool_calls_json = ? WHERE interaction_id = ?",
+                    (json.dumps(calls, ensure_ascii=False, indent=2), interaction_id),
+                )
+
+    def attach_tool_calls_to_latest_run(
+        self, interaction_run_id: str, tool_calls_json: str
+    ) -> Optional[str]:
+        """Persist text-recovered tool calls for the most recent model turn."""
+        if not interaction_run_id:
+            return None
+        with self._managed_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT interaction_id, tool_calls_json
+                FROM interaction_logs
+                WHERE interaction_run_id = ?
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT 1
+                """,
+                (interaction_run_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            existing = str(row["tool_calls_json"] or "").strip()
+            if not existing:
+                conn.execute(
+                    "UPDATE interaction_logs SET tool_calls_json = ? WHERE interaction_id = ?",
+                    (tool_calls_json, row["interaction_id"]),
+                )
+            return str(row["interaction_id"])
 
     def list_recent(self, limit: int = 50, source: Optional[str] = None) -> List[InteractionLogEntry]:
         query = "SELECT * FROM interaction_logs"

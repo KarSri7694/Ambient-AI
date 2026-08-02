@@ -56,6 +56,22 @@ class LlamaCppSemanticAdapter:
                 vectors.append([])
         return vectors
 
+    def embed_query(self, query: str, *, instruction: str = "") -> List[float]:
+        """Embed a retrieval query using Qwen's optional instruction template.
+
+        Stored documents intentionally remain plain factual text.  Applying the
+        instruction only on the query side preserves Qwen3 Embedding's intended
+        asymmetric retrieval behaviour.
+        """
+        text = str(query or "").strip()
+        if not text:
+            return []
+        directive = str(instruction or "").strip()
+        if directive:
+            text = f"Instruct: {directive}\nQuery: {text}"
+        vectors = self.embed_texts([text])
+        return vectors[0] if vectors else []
+
     def rerank(
         self,
         *,

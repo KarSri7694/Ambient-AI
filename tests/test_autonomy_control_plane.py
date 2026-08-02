@@ -69,6 +69,23 @@ class _UserContext:
         return "User profile: user is building Ambient AI for ROCm hackathon."
 
 
+class _TemporalVLMContext:
+    def __init__(self):
+        self.recorded = []
+        self.queries = []
+
+    def record_ambient_event(self, event, outcome=""):
+        self.recorded.append((event, outcome))
+        return SimpleNamespace(thread_id="temporal-thread")
+
+    def build_context(self, *, query_text, current_event=None):
+        self.queries.append(query_text)
+        return {"active_thread": {"thread_id": "temporal-thread"}}
+
+    def build_prompt_context(self, **_kwargs):
+        return "## Temporal work context\n- The user is comparing local embedding models."
+
+
 class _SuspendingInvestigationService:
     def reset_context(self):
         return None
@@ -296,6 +313,7 @@ def test_visual_perception_completes_capture_before_judgment(tmp_path):
     screenshot_ref = capture_store.store_file(str(screenshot), kind="screenshot", delete_source=False)
     observer = _FastVisualObserver()
     user_context = _UserContext()
+    temporal_context = _TemporalVLMContext()
     coordinator = AutonomyCoordinatorService(
         store=store,
         judgment=_CapturingJudgment(),
@@ -305,6 +323,7 @@ def test_visual_perception_completes_capture_before_judgment(tmp_path):
         visual_observer=observer,
         visual_model="fast-vlm",
         user_context_service=user_context,
+        temporal_memory_service=temporal_context,
     )
     captured_at = datetime.now(timezone.utc).isoformat()
     capture_event = coordinator.enqueue_lightweight_visual(
@@ -319,6 +338,8 @@ def test_visual_perception_completes_capture_before_judgment(tmp_path):
     assert result["outcome"] == "perception_completed"
     assert result["analysis_latency_ms"] == 4200
     assert observer.calls[0]["source_capture_event_id"] == capture_event.event_id
+    assert "comparing local embedding models" in observer.calls[0]["temporal_context"]
+    assert temporal_context.queries
     assert user_context.queries == []
     counts = store.event_counts()
     assert counts["processed"] == 1

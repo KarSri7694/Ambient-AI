@@ -177,6 +177,77 @@ def _normalize_messages(messages: Any) -> dict[str, Any]:
     }
 
 
+_RAG_CONTEXT_KEYS = {
+    "personalization_context",
+    "temporal_context",
+    "temporal_work_context",
+    "recent_context",
+    "relevant_user_context",
+    "relevant_user_memory",
+    "user_context",
+}
+
+
+def _json_object_from_content(content: Any) -> dict[str, Any] | None:
+    """Best-effort extraction of the JSON payload actually sent to the model."""
+    if isinstance(content, dict):
+        return content
+    if not isinstance(content, str):
+        return None
+    text = content.strip()
+    if not text:
+        return None
+    try:
+        value = json.loads(text)
+        return value if isinstance(value, dict) else None
+    except json.JSONDecodeError:
+        pass
+    start = text.find("{")
+    if start < 0:
+        return None
+    try:
+        value, _ = json.JSONDecoder().raw_decode(text[start:])
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _extract_injected_rag_context(messages: Any) -> list[dict[str, Any]]:
+    """Return retrieval/personalization blocks that were truly present in a prompt.
+
+    This deliberately reads the saved request instead of reconstructing RAG from
+    current memory.  The audit trail therefore remains accurate after memory
+    changes, reranking changes, or a runtime restart.
+    """
+    if not isinstance(messages, list):
+        return []
+    injected: list[dict[str, Any]] = []
+
+    def visit(value: Any, *, message_index: int, path: str = "") -> None:
+        if not isinstance(value, dict):
+            return
+        for key, child in value.items():
+            child_path = f"{path}.{key}" if path else str(key)
+            if key in _RAG_CONTEXT_KEYS and child not in (None, "", [], {}):
+                injected.append(
+                    {
+                        "message_index": message_index,
+                        "field": child_path,
+                        "value": child,
+                    }
+                )
+            if isinstance(child, dict):
+                visit(child, message_index=message_index, path=child_path)
+
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        parsed = _json_object_from_content(message.get("content"))
+        if parsed is not None:
+            visit(parsed, message_index=index)
+    return injected
+
+
 def _interaction_input(
     row: Any,
     *,
@@ -190,6 +261,7 @@ def _interaction_input(
             "protected": False,
             "request": None,
             "context_messages": [],
+            "rag_context": [],
             "malformed": True,
         }
     protected_ref = payload.get("protected_payload_ref") if isinstance(payload, dict) else None
@@ -199,6 +271,7 @@ def _interaction_input(
                 "protected": True,
                 "request": None,
                 "context_messages": [],
+                "rag_context": [],
                 "malformed": False,
             }
         if capture_store is None:
@@ -211,7 +284,12 @@ def _interaction_input(
         except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
             raise HTTPException(status_code=404, detail="protected_input_not_found") from exc
     normalized = _normalize_messages(payload)
-    return {"protected": bool(protected_ref), **normalized}
+    messages = payload if isinstance(payload, list) else []
+    return {
+        "protected": bool(protected_ref),
+        **normalized,
+        "rag_context": _extract_injected_rag_context(messages),
+    }
 
 
 def _serialize_interaction(row: Any) -> dict[str, Any]:

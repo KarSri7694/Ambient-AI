@@ -193,6 +193,7 @@ the screenshot and supplied accessibility text. Do not explain your reasoning.""
         screenshot_path: str,
         model: str,
         recent_context: str,
+        temporal_context: str = "",
         captured_at: str | None = None,
         similarity_score: float | None = None,
         persisted_screenshot_path: str | None = None,
@@ -211,6 +212,7 @@ the screenshot and supplied accessibility text. Do not explain your reasoning.""
                 interaction_image_path=stored_screenshot_path,
                 model=model,
                 recent_context=recent_context,
+                temporal_context=temporal_context,
                 captured_at=captured_at,
                 similarity_score=similarity_score,
                 uiat_context_override=uiat_context_override,
@@ -347,6 +349,7 @@ the screenshot and supplied accessibility text. Do not explain your reasoning.""
         interaction_image_path: str = "",
         model: str,
         recent_context: str,
+        temporal_context: str = "",
         captured_at: str | None = None,
         similarity_score: float | None = None,
         uiat_context_override: Optional[Dict[str, Any]] = None,
@@ -381,6 +384,7 @@ the screenshot and supplied accessibility text. Do not explain your reasoning.""
                 similarity_score=similarity_score,
                 previous_observation=previous_observation,
                 uiat_context=uiat_context,
+                temporal_context=temporal_context,
             )
         else:
             parsed = await self._run_full_model(
@@ -388,6 +392,7 @@ the screenshot and supplied accessibility text. Do not explain your reasoning.""
                 interaction_image_path=interaction_image_path,
                 model=model,
                 recent_context=recent_context,
+                temporal_context=temporal_context,
                 captured_at=captured_at,
                 similarity_score=similarity_score,
                 previous_observation=previous_observation,
@@ -592,10 +597,12 @@ the screenshot and supplied accessibility text. Do not explain your reasoning.""
         similarity_score: float | None,
         previous_observation: Optional[VisualObservation],
         uiat_context: Dict[str, Any],
+        temporal_context: str = "",
     ) -> dict:
         payload = {
             "screenshot_captured_at": captured_at or datetime.now().isoformat(),
             "similarity_score": similarity_score,
+            "temporal_work_context": str(temporal_context or "")[:1800],
             "previous_observation": (
                 {
                     "app_name": previous_observation.app_name,
@@ -658,11 +665,13 @@ the screenshot and supplied accessibility text. Do not explain your reasoning.""
         previous_observation: Optional[VisualObservation],
         recent_observations: List[VisualObservation],
         uiat_context: Dict[str, Any],
+        temporal_context: str = "",
     ) -> dict:
         payload = {
             "screenshot_captured_at": captured_at or datetime.now().isoformat(),
             "similarity_score": similarity_score,
             "recent_context": recent_context,
+            "temporal_work_context": str(temporal_context or "")[:4000],
             "visual_digest": self.memory.get_visual_digest(),
             "uiat_context": {
                 "window_title": uiat_context.get("window_title"),

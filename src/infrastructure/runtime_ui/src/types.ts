@@ -39,6 +39,7 @@ export interface InteractionInput {
   protected: boolean;
   request: NormalizedMessage | null;
   context_messages: NormalizedMessage[];
+  rag_context?: Array<{ message_index: number; field: string; value: unknown }>;
   malformed: boolean;
 }
 

@@ -445,6 +445,40 @@ class SemanticMemoryResult:
 
 
 @dataclass(frozen=True)
+class TemporalMemoryEvent:
+    """A factual, chronologically ordered record used to understand active work."""
+    temporal_event_id: str
+    source_type: str
+    source_ref: str
+    content: str
+    occurred_at: str
+    thread_id: Optional[str] = None
+    predecessor_event_id: Optional[str] = None
+    state: str = "active"
+    confidence: float = 0.0
+    entities: List[str] = field(default_factory=list)
+    metadata_json: str = "{}"
+    created_at: str = ""
+    updated_at: str = ""
+
+
+@dataclass(frozen=True)
+class TemporalWorkThread:
+    """A generic user work stream assembled from related temporal events."""
+    thread_id: str
+    topic_key: str
+    summary: str
+    state: str = "active"
+    started_at: str = ""
+    last_activity_at: str = ""
+    last_event_id: Optional[str] = None
+    completion_at: Optional[str] = None
+    entities: List[str] = field(default_factory=list)
+    open_loops: List[str] = field(default_factory=list)
+    metadata_json: str = "{}"
+
+
+@dataclass(frozen=True)
 class SemanticDeduplicationRecord:
     """One dedupe-tracked candidate or created item."""
     dedupe_item_id: str

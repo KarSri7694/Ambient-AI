@@ -25,6 +25,8 @@ from core.models import (
     SemanticMemoryResult,
     SpeakerRecord,
     TranscriptEvidence,
+    TemporalMemoryEvent,
+    TemporalWorkThread,
     UserProfileFacet,
     VisualObservation,
     VisualUserFact,
@@ -329,6 +331,49 @@ class SQLiteMemoryAdapter(MemoryPort):
             )
             cursor.execute(
                 """
+                CREATE TABLE IF NOT EXISTS temporal_work_threads (
+                    thread_id TEXT PRIMARY KEY,
+                    topic_key TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    last_activity_at TEXT NOT NULL,
+                    last_event_id TEXT,
+                    completion_at TEXT,
+                    entities TEXT NOT NULL DEFAULT '[]',
+                    open_loops TEXT NOT NULL DEFAULT '[]',
+                    metadata_json TEXT NOT NULL DEFAULT '{}'
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS temporal_memory_events (
+                    temporal_event_id TEXT PRIMARY KEY,
+                    source_type TEXT NOT NULL,
+                    source_ref TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL,
+                    thread_id TEXT,
+                    predecessor_event_id TEXT,
+                    state TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    entities TEXT NOT NULL DEFAULT '[]',
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (thread_id) REFERENCES temporal_work_threads(thread_id)
+                )
+                """
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_temporal_events_occurred_at ON temporal_memory_events(occurred_at)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_temporal_events_thread ON temporal_memory_events(thread_id, occurred_at)"
+            )
+            cursor.execute(
+                """
                 CREATE TABLE IF NOT EXISTS semantic_dedupe_items (
                     dedupe_item_id TEXT PRIMARY KEY,
                     entity_kind TEXT NOT NULL,
@@ -587,6 +632,38 @@ class SQLiteMemoryAdapter(MemoryPort):
             embedding=None,
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+        )
+
+    def _temporal_event_from_row(self, row: sqlite3.Row) -> TemporalMemoryEvent:
+        return TemporalMemoryEvent(
+            temporal_event_id=row["temporal_event_id"],
+            source_type=row["source_type"],
+            source_ref=row["source_ref"],
+            content=row["content"],
+            occurred_at=row["occurred_at"],
+            thread_id=row["thread_id"],
+            predecessor_event_id=row["predecessor_event_id"],
+            state=row["state"],
+            confidence=float(row["confidence"]),
+            entities=json.loads(row["entities"] or "[]"),
+            metadata_json=row["metadata_json"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def _temporal_thread_from_row(self, row: sqlite3.Row) -> TemporalWorkThread:
+        return TemporalWorkThread(
+            thread_id=row["thread_id"],
+            topic_key=row["topic_key"],
+            summary=row["summary"],
+            state=row["state"],
+            started_at=row["started_at"],
+            last_activity_at=row["last_activity_at"],
+            last_event_id=row["last_event_id"],
+            completion_at=row["completion_at"],
+            entities=json.loads(row["entities"] or "[]"),
+            open_loops=json.loads(row["open_loops"] or "[]"),
+            metadata_json=row["metadata_json"],
         )
 
     def _load_sqlite_vec_extension(self, conn: sqlite3.Connection) -> None:
@@ -852,6 +929,131 @@ class SQLiteMemoryAdapter(MemoryPort):
             )
             for row in rows
         ]
+
+    def append_temporal_event(self, event: TemporalMemoryEvent) -> TemporalMemoryEvent:
+        now = self._now()
+        content = " ".join(str(event.content or "").split()) or f"{event.source_type} {event.source_ref}"
+        with self._managed_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO temporal_memory_events (
+                    temporal_event_id, source_type, source_ref, content, occurred_at,
+                    thread_id, predecessor_event_id, state, confidence, entities,
+                    metadata_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(temporal_event_id) DO UPDATE SET
+                    source_type=excluded.source_type, source_ref=excluded.source_ref,
+                    content=excluded.content, occurred_at=excluded.occurred_at,
+                    thread_id=excluded.thread_id, predecessor_event_id=excluded.predecessor_event_id,
+                    state=excluded.state, confidence=excluded.confidence, entities=excluded.entities,
+                    metadata_json=excluded.metadata_json, updated_at=excluded.updated_at
+                """,
+                (
+                    event.temporal_event_id, event.source_type, event.source_ref, content,
+                    event.occurred_at or now, event.thread_id, event.predecessor_event_id,
+                    event.state, float(event.confidence), json.dumps(event.entities),
+                    event.metadata_json or "{}", event.created_at or now, now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM temporal_memory_events WHERE temporal_event_id = ?",
+                (event.temporal_event_id,),
+            ).fetchone()
+        persisted = self._temporal_event_from_row(row)
+        self.upsert_semantic_chunk(
+            source_type="temporal_event",
+            source_id=persisted.temporal_event_id,
+            source_ref=persisted.source_ref,
+            content=persisted.content,
+            metadata_json=json.dumps({
+                "temporal_event_id": persisted.temporal_event_id,
+                "thread_id": persisted.thread_id,
+                "occurred_at": persisted.occurred_at,
+                "state": persisted.state,
+                "entities": persisted.entities,
+                "source_type": persisted.source_type,
+            }, ensure_ascii=False),
+        )
+        return persisted
+
+    def get_temporal_events(
+        self,
+        *,
+        event_ids: Optional[List[str]] = None,
+        thread_ids: Optional[List[str]] = None,
+        occurred_after: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[TemporalMemoryEvent]:
+        query = "SELECT * FROM temporal_memory_events"
+        conditions: List[str] = []
+        params: List[object] = []
+        if event_ids:
+            placeholders = ", ".join("?" for _ in event_ids)
+            conditions.append(f"temporal_event_id IN ({placeholders})")
+            params.extend(event_ids)
+        if thread_ids:
+            placeholders = ", ".join("?" for _ in thread_ids)
+            conditions.append(f"thread_id IN ({placeholders})")
+            params.extend(thread_ids)
+        if occurred_after:
+            conditions.append("occurred_at >= ?")
+            params.append(occurred_after)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY occurred_at ASC LIMIT ?"
+        params.append(max(1, int(limit)))
+        with self._managed_connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [self._temporal_event_from_row(row) for row in rows]
+
+    def upsert_temporal_work_thread(self, thread: TemporalWorkThread) -> TemporalWorkThread:
+        with self._managed_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO temporal_work_threads (
+                    thread_id, topic_key, summary, state, started_at, last_activity_at,
+                    last_event_id, completion_at, entities, open_loops, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(thread_id) DO UPDATE SET
+                    topic_key=excluded.topic_key, summary=excluded.summary, state=excluded.state,
+                    last_activity_at=excluded.last_activity_at, last_event_id=excluded.last_event_id,
+                    completion_at=excluded.completion_at, entities=excluded.entities,
+                    open_loops=excluded.open_loops, metadata_json=excluded.metadata_json
+                """,
+                (
+                    thread.thread_id, thread.topic_key, thread.summary, thread.state,
+                    thread.started_at, thread.last_activity_at, thread.last_event_id,
+                    thread.completion_at, json.dumps(thread.entities), json.dumps(thread.open_loops),
+                    thread.metadata_json or "{}",
+                ),
+            )
+            row = conn.execute("SELECT * FROM temporal_work_threads WHERE thread_id = ?", (thread.thread_id,)).fetchone()
+        return self._temporal_thread_from_row(row)
+
+    def list_temporal_work_threads(
+        self,
+        *,
+        states: Optional[List[str]] = None,
+        active_after: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[TemporalWorkThread]:
+        query = "SELECT * FROM temporal_work_threads"
+        conditions: List[str] = []
+        params: List[object] = []
+        if states:
+            placeholders = ", ".join("?" for _ in states)
+            conditions.append(f"state IN ({placeholders})")
+            params.extend(states)
+        if active_after:
+            conditions.append("last_activity_at >= ?")
+            params.append(active_after)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY last_activity_at DESC LIMIT ?"
+        params.append(max(1, int(limit)))
+        with self._managed_connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [self._temporal_thread_from_row(row) for row in rows]
 
     def _write_index(self) -> None:
         speakers = [

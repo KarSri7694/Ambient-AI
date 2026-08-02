@@ -21,6 +21,7 @@ from application.services.scheduled_task_service import ScheduledTaskService
 from application.services.passive_observer_service import PassiveObserverService
 from application.services.semantic_deduplication_service import SemanticDeduplicationService
 from application.services.semantic_memory_service import SemanticMemoryService
+from application.services.temporal_memory_service import TemporalMemoryService
 from application.services.semantic_model_guard_service import SemanticModelGuardService
 from application.services.screenshot_queue_service import ScreenshotQueueService
 from application.services.system_idle_service import SystemIdleService
@@ -309,6 +310,18 @@ AUTONOMY_MAX_INBOX_ITEMS_PER_DAY = CONFIG.get_int("autonomy", "max_inbox_items_p
 AUTONOMY_APPROVAL_TTL_MINUTES = CONFIG.get_int("autonomy", "approval_ttl_minutes", 30)
 AUTONOMY_BROWSER_APPROVAL_DDGS_FALLBACK_ENABLED = CONFIG.get_bool(
     "autonomy", "browser_approval_ddgs_fallback_enabled", True
+)
+TEMPORAL_MEMORY_ENABLED = CONFIG.get_bool("temporal_memory", "enabled", True)
+TEMPORAL_MEMORY_RECENT_CONTEXT_HOURS = CONFIG.get_int("temporal_memory", "recent_context_hours", 6)
+TEMPORAL_MEMORY_RETENTION_DAYS = CONFIG.get_int("temporal_memory", "detailed_retention_days", 30)
+TEMPORAL_MEMORY_RETRIEVAL_LIMIT = CONFIG.get_int("temporal_memory", "retrieval_limit", 18)
+TEMPORAL_MEMORY_RERANK_LIMIT = CONFIG.get_int("temporal_memory", "rerank_limit", 8)
+TEMPORAL_MEMORY_THREAD_INACTIVITY_HOURS = CONFIG.get_int("temporal_memory", "thread_inactivity_hours", 8)
+TEMPORAL_MEMORY_VLM_CONTEXT_CHARS = CONFIG.get_int("temporal_memory", "vlm_context_chars", 1800)
+TEMPORAL_MEMORY_WORK_INSTRUCTION = CONFIG.get_str(
+    "temporal_memory",
+    "work_retrieval_instruction",
+    "Retrieve evidence related to the user's current work, task, project, or decision.",
 )
 AUTONOMY_BROWSER_APPROVAL_DDGS_FALLBACK_INTERVAL_SECONDS = CONFIG.get_float(
     "autonomy", "browser_approval_ddgs_fallback_check_seconds", 10.0
@@ -1006,6 +1019,29 @@ class AmbientRuntime:
             prompt_context_chars=PERSONALIZATION_PROMPT_CONTEXT_CHARS,
             include_recent_context_legacy=PERSONALIZATION_INCLUDE_RECENT_CONTEXT_LEGACY,
         )
+        temporal_memory_service = TemporalMemoryService(
+            memory=memory_store,
+            semantic_memory=semantic_memory,
+            enabled=TEMPORAL_MEMORY_ENABLED,
+            recent_context_hours=TEMPORAL_MEMORY_RECENT_CONTEXT_HOURS,
+            detailed_retention_days=TEMPORAL_MEMORY_RETENTION_DAYS,
+            retrieval_limit=TEMPORAL_MEMORY_RETRIEVAL_LIMIT,
+            rerank_limit=TEMPORAL_MEMORY_RERANK_LIMIT,
+            thread_inactivity_hours=TEMPORAL_MEMORY_THREAD_INACTIVITY_HOURS,
+            work_retrieval_instruction=TEMPORAL_MEMORY_WORK_INSTRUCTION,
+        )
+        if TEMPORAL_MEMORY_ENABLED:
+            try:
+                backfilled_temporal_events = temporal_memory_service.backfill_existing(max_items=500)
+                consolidated_temporal_events = temporal_memory_service.consolidate_expired(max_events=2000)
+                if backfilled_temporal_events or consolidated_temporal_events:
+                    logger.info(
+                        "Temporal memory prepared: backfilled=%s consolidated=%s.",
+                        backfilled_temporal_events,
+                        consolidated_temporal_events,
+                    )
+            except Exception:
+                logger.exception("Temporal memory preparation failed; continuing without startup backfill.")
         llm_service = LLMInteractionService(
             llm_provider=logged_llm,
             tool_bridge=tool_bridge,
@@ -1034,6 +1070,7 @@ class AmbientRuntime:
             artifact_full_candidate_limit=ARTIFACT_FULL_CANDIDATE_LIMIT,
             artifact_max_existing_chars=ARTIFACT_MAX_EXISTING_CHARS,
             semantic_memory=semantic_memory,
+            temporal_memory_service=temporal_memory_service,
             interrupt_checker=self.interrupt_controller.check,
             max_interaction_iterations=LLM_INTERACTION_MAX_ITERATIONS,
             final_turn_recovery_enabled=LLM_INTERACTION_FINAL_TURN_RECOVERY_ENABLED,
@@ -1212,6 +1249,8 @@ class AmbientRuntime:
                 deep_visual_observer=deep_visual_observer,
                 visual_model=PASSIVE_OBSERVER_MODEL,
                 user_context_service=user_context_service,
+                temporal_memory_service=temporal_memory_service,
+                temporal_vlm_context_chars=TEMPORAL_MEMORY_VLM_CONTEXT_CHARS,
                 chat_store=self.chat_store,
                 chat_event_broker=self.chat_event_broker,
                 task_store=task_queue,
@@ -1230,6 +1269,7 @@ class AmbientRuntime:
             semantic_dedupe_service=semantic_dedupe,
             user_context_service=user_context_service,
             memory=memory_store,
+            temporal_memory_service=temporal_memory_service,
             model=PROACTIVE_AUTONOMY_MODEL,
             enabled=PROACTIVE_AUTONOMY_ENABLED,
             global_grant=PROACTIVE_AUTONOMY_GLOBAL_GRANT,

@@ -5,6 +5,7 @@ import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any, Callable, Optional
 
 from application.services.capability_policy_service import CapabilityRegistry
@@ -113,6 +114,7 @@ Rules:
         semantic_dedupe_service: Any = None,
         user_context_service: Any = None,
         memory: Any = None,
+        temporal_memory_service: Any = None,
         model: str,
         enabled: bool = False,
         global_grant: bool = False,
@@ -134,6 +136,7 @@ Rules:
         self.semantic_dedupe = semantic_dedupe_service
         self.user_context_service = user_context_service
         self.memory = memory
+        self.temporal_memory_service = temporal_memory_service
         self.model = str(model or "").strip()
         self.enabled = bool(enabled)
         self.global_grant = bool(global_grant)
@@ -230,6 +233,7 @@ Rules:
                 created.append(item)
                 self._record_created(finding, item)
                 self._record_biodata_candidate(finding, item)
+                self._record_temporal_finding(finding, item)
 
             summary = f"Checked {len(self.enabled_sources)} source(s); surfaced {len(created)} finding(s)."
             if errors:
@@ -275,6 +279,33 @@ Rules:
 
     async def _scan_source_with_timeout(self, source: str) -> list[ProactiveFinding]:
         return await self._wait_for(self._scan_source(source), source=source)
+
+    def _record_temporal_finding(self, finding: ProactiveFinding, item: ProactiveInboxItem) -> None:
+        if self.temporal_memory_service is None:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        event = SimpleNamespace(
+            event_id=f"proactive:{item.inbox_id}",
+            event_type="proactive_finding",
+            source_kind="proactive_sweep",
+            source_ref=f"proactive://{item.inbox_id}",
+            occurred_at=now,
+            confidence=finding.confidence,
+            payload_json=json.dumps(
+                {
+                    "title": finding.title,
+                    "summary": finding.summary,
+                    "activity": finding.suggested_next_step,
+                    "entities": finding.evidence,
+                    "source": finding.source,
+                },
+                ensure_ascii=False,
+            ),
+        )
+        try:
+            self.temporal_memory_service.record_ambient_event(event, outcome="proactive finding surfaced")
+        except Exception:
+            self.logger.exception("Could not record proactive finding in temporal memory.")
 
     async def _scan_source(self, source: str) -> list[ProactiveFinding]:
         source = source.strip().lower()

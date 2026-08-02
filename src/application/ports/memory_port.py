@@ -17,6 +17,8 @@ from core.models import (
     VisualObservation,
     VisualUserFact,
     VisualSession,
+    TemporalMemoryEvent,
+    TemporalWorkThread,
 )
 
 
@@ -353,4 +355,34 @@ class MemoryPort(ABC):
 
     @abstractmethod
     def get_semantic_dedupe_item(self, dedupe_item_id: str) -> Optional[SemanticDeduplicationRecord]:
+        pass
+
+    @abstractmethod
+    def append_temporal_event(self, event: TemporalMemoryEvent) -> TemporalMemoryEvent:
+        """Persist a factual event and make it available to temporal retrieval."""
+        pass
+
+    @abstractmethod
+    def get_temporal_events(
+        self,
+        *,
+        event_ids: Optional[List[str]] = None,
+        thread_ids: Optional[List[str]] = None,
+        occurred_after: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[TemporalMemoryEvent]:
+        pass
+
+    @abstractmethod
+    def upsert_temporal_work_thread(self, thread: TemporalWorkThread) -> TemporalWorkThread:
+        pass
+
+    @abstractmethod
+    def list_temporal_work_threads(
+        self,
+        *,
+        states: Optional[List[str]] = None,
+        active_after: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[TemporalWorkThread]:
         pass

@@ -7,6 +7,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional
 
 from application.ports.LLMProvider import LLMProvider
@@ -203,6 +204,7 @@ class LLMInteractionService:
         "\n"
         "Return JSON only:\n"
         "{\n"
+        '  "substantive_outcome": true,\n'
         '  "title": "short clear title",\n'
         '  "summary": "short summary for dashboard display",\n'
         '  "detailed_report": "highly detailed markdown-ready report that misses nothing important"\n'
@@ -210,9 +212,11 @@ class LLMInteractionService:
         "\n"
         "Rules:\n"
         "- Write for the user, not for developers.\n"
+        "- substantive_outcome is false for routine observation, duplicated work, or a result that adds no durable value.\n"
+        "- Only mark it true for a verified recommendation, integration assessment, decision record, comparison, implementation plan, or useful draft.\n"
         "- summary must be concise and directly useful.\n"
         "- detailed_report must be highly detailed and miss nothing important from the task outcome.\n"
-        "- Do not add any keys other than title, summary, and detailed_report.\n"
+        "- Do not add any keys other than substantive_outcome, title, summary, and detailed_report.\n"
     )
     FILESYSTEM_AGENT_PROMPT = (
         "You are a dedicated read-only filesystem sub-agent working on one delegated task.\n"
@@ -295,6 +299,7 @@ class LLMInteractionService:
         artifact_full_candidate_limit: int = 3,
         artifact_max_existing_chars: int = 50_000,
         semantic_memory: Optional[Any] = None,
+        temporal_memory_service: Optional[Any] = None,
         interrupt_checker: Optional[Callable[[], None]] = None,
         max_interaction_iterations: int = MAX_ITERATIONS,
         final_turn_recovery_enabled: bool = True,
@@ -327,6 +332,7 @@ class LLMInteractionService:
         self.reporter_model = reporter_model
         self.capability_policy = capability_policy
         self.semantic_memory = semantic_memory
+        self.temporal_memory_service = temporal_memory_service
         self.interrupt_checker = interrupt_checker
         self.max_interaction_iterations = max(1, int(max_interaction_iterations or self.MAX_ITERATIONS))
         self.final_turn_recovery_enabled = bool(final_turn_recovery_enabled)
@@ -1493,6 +1499,8 @@ class LLMInteractionService:
                 event_callback=event_callback,
                 allow_text_tool_recovery=not is_final_turn,
             )
+            if tool_calls and hasattr(self.llm, "register_tool_calls"):
+                self.llm.register_tool_calls(tool_calls)
             self._check_interrupted()
             if is_final_turn and disable_tools_on_final_turn and tool_calls:
                 self.logger.warning(
@@ -1507,6 +1515,13 @@ class LLMInteractionService:
                     report_policy=report_policy, interaction_run_id=interaction_run_id,
                     model=model, user_input=user_input, final_response=assistant_text,
                     tools_used=tools_used, source_name=source_name,
+                )
+                self._record_temporal_interaction(
+                    interaction_run_id=interaction_run_id,
+                    source_name=source_name,
+                    user_input=user_input,
+                    final_response=assistant_text,
+                    tools_used=tools_used,
                 )
                 return assistant_text
 
@@ -1559,6 +1574,13 @@ class LLMInteractionService:
                     model=model, user_input=user_input, final_response=terminal_result,
                     tools_used=tools_used, source_name=source_name,
                 )
+                self._record_temporal_interaction(
+                    interaction_run_id=interaction_run_id,
+                    source_name=source_name,
+                    user_input=user_input,
+                    final_response=terminal_result,
+                    tools_used=tools_used,
+                )
                 return terminal_result
 
         self.logger.warning("Reached maximum iterations: (%s). Stopping.", loop_max)
@@ -1567,7 +1589,46 @@ class LLMInteractionService:
             model=model, user_input=user_input, final_response=assistant_text,
             tools_used=tools_used, source_name=source_name,
         )
+        self._record_temporal_interaction(
+            interaction_run_id=interaction_run_id,
+            source_name=source_name,
+            user_input=user_input,
+            final_response=assistant_text,
+            tools_used=tools_used,
+        )
         return assistant_text
+
+    def _record_temporal_interaction(
+        self,
+        *,
+        interaction_run_id: str,
+        source_name: str,
+        user_input: str,
+        final_response: str,
+        tools_used: List[str],
+    ) -> None:
+        if self.temporal_memory_service is None:
+            return
+        event = SimpleNamespace(
+            event_id=f"interaction:{interaction_run_id}",
+            event_type="llm_interaction",
+            source_kind=source_name,
+            source_ref=f"interaction://{interaction_run_id}",
+            occurred_at=datetime.now().isoformat(),
+            confidence=0.75,
+            payload_json=json.dumps(
+                {
+                    "task": user_input[:8000],
+                    "summary": final_response[:10000],
+                    "entities": list(dict.fromkeys(tools_used)),
+                },
+                ensure_ascii=False,
+            ),
+        )
+        try:
+            self.temporal_memory_service.record_ambient_event(event, outcome=final_response[:10000])
+        except Exception:
+            self.logger.exception("Could not record interaction in temporal memory.")
 
     def _append_deferred_sibling_tool_results(
         self, tool_calls: List[Dict[str, Any]], suspended_tool_call_id: str
@@ -1697,6 +1758,26 @@ class LLMInteractionService:
             Tuple of (tool_name, tool_result) for each executed tool.
         """
         tool_results: List[tuple[str, str]] = []
+
+        def record_tool_result(
+            *,
+            tool_id: str,
+            tool_name: str,
+            arguments_json: str,
+            output: str,
+            ok: bool,
+            status: str = "completed",
+        ) -> None:
+            if hasattr(self.llm, "attach_tool_result"):
+                self.llm.attach_tool_result(
+                    tool_id,
+                    tool_name=tool_name,
+                    arguments_json=arguments_json,
+                    output=output,
+                    ok=ok,
+                    status=status,
+                )
+
         for tool_call in tool_calls:
             tool_name = tool_call["function"]["name"]
             tool_args_str = tool_call["function"]["arguments"]
@@ -1730,6 +1811,10 @@ class LLMInteractionService:
                             "name": tool_name,
                             "content": response_content,
                         }
+                    )
+                    record_tool_result(
+                        tool_id=tool_id, tool_name=tool_name, arguments_json=tool_args_str,
+                        output=response_content, ok=False,
                     )
                     continue
                 if (
@@ -1774,6 +1859,10 @@ class LLMInteractionService:
                         tool_results.append((tool_name, response_content))
                         self._frame.messages.append(
                             {"role": "tool", "tool_call_id": tool_id, "name": tool_name, "content": response_content}
+                        )
+                        record_tool_result(
+                            tool_id=tool_id, tool_name=tool_name, arguments_json=tool_args_str,
+                            output=response_content, ok=True,
                         )
                         continue
                 elif (
@@ -1913,6 +2002,10 @@ class LLMInteractionService:
                                 "content": response_content,
                             }
                         )
+                        record_tool_result(
+                            tool_id=tool_id, tool_name=tool_name, arguments_json=tool_args_str,
+                            output=response_content, ok=False,
+                        )
                         continue
                     resident_model_name = self.llm.get_current_model()
                     parent_model_name = resident_model_name or self._frame.model
@@ -1932,6 +2025,10 @@ class LLMInteractionService:
                                 "name": tool_name,
                                 "content": response_content,
                             }
+                        )
+                        record_tool_result(
+                            tool_id=tool_id, tool_name=tool_name, arguments_json=tool_args_str,
+                            output=response_content, ok=False,
                         )
                         continue
                     if available_model_names and model_name not in available_model_names:
@@ -2027,6 +2124,11 @@ class LLMInteractionService:
                     )
             except InteractionSuspended as suspended:
                 suspended.tool_call_id = tool_id
+                record_tool_result(
+                    tool_id=tool_id, tool_name=tool_name, arguments_json=tool_args_str,
+                    output="Awaiting user approval before this tool can run.", ok=False,
+                    status="awaiting_approval",
+                )
                 self._emit_event(
                     event_callback,
                     {
@@ -2054,6 +2156,10 @@ class LLMInteractionService:
                     "result": response_content,
                     "ok": not response_content.startswith("Error:"),
                 },
+            )
+            record_tool_result(
+                tool_id=tool_id, tool_name=tool_name, arguments_json=tool_args_str,
+                output=response_content, ok=not response_content.startswith("Error:"),
             )
             tool_results.append((tool_name, response_content))
 
@@ -2130,18 +2236,29 @@ class LLMInteractionService:
         detailed_report = str(parsed.get("detailed_report") or "").strip()
         if not title or not summary or not detailed_report:
             return None
-        artifact = await self._save_or_merge_report_artifact(
-            model=report_model,
-            title=title,
-            summary=summary,
-            detailed_report=detailed_report,
-            source_name=source_name,
+        substantive_outcome = bool(parsed.get("substantive_outcome", True))
+        artifact = (
+            await self._save_or_merge_report_artifact(
+                model=report_model,
+                title=title,
+                summary=summary,
+                detailed_report=detailed_report,
+                source_name=source_name,
+            )
+            if substantive_outcome
+            else {
+                "artifact_path": "",
+                "artifact_id": None,
+                "artifact_action": "skipped",
+                "artifact_reason": "Outcome was routine, duplicate, or not durable enough for an artifact.",
+                "dedupe_notes": [],
+            }
         )
         report = {
             "title": title,
             "summary": summary,
             "artifact_path": str(artifact["artifact_path"]),
-            "artifact_filename": Path(str(artifact["artifact_path"])).name,
+            "artifact_filename": Path(str(artifact["artifact_path"])).name if artifact["artifact_path"] else "",
             "artifact_id": artifact.get("artifact_id"),
             "artifact_action": artifact.get("artifact_action"),
             "artifact_reason": artifact.get("artifact_reason"),
@@ -2150,6 +2267,7 @@ class LLMInteractionService:
             "tools_used": deduped_tools,
             "created_at": datetime.now().isoformat(),
             "status": "completed",
+            "substantive_outcome": substantive_outcome,
             "task_model": model,
             "report_model": report_model,
         }

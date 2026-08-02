@@ -33,6 +33,19 @@ class _FakeChunk:
         self.choices = [_FakeChoice(_FakeDelta(content=content, reasoning_content=reasoning_content, tool_calls=tool_calls))]
 
 
+class _FakeToolFunction:
+    def __init__(self, name=None, arguments=None):
+        self.name = name
+        self.arguments = arguments
+
+
+class _FakeToolCall:
+    def __init__(self, index, call_id=None, name=None, arguments=None):
+        self.index = index
+        self.id = call_id
+        self.function = _FakeToolFunction(name=name, arguments=arguments)
+
+
 class FakeLLMProvider:
     def generate_response(self, prompt: str, image: str = "") -> str:
         return "generated-response"
@@ -197,6 +210,48 @@ class InteractionLoggingTests(unittest.TestCase):
             self.assertIn("Latest Search Result", markdown)
             self.assertIn("## Report Summary", markdown)
             self.assertIn("Searched and found the latest result.", markdown)
+
+    def test_tool_execution_output_is_attached_to_its_tool_only_model_turn(self):
+        class ToolCallingProvider(FakeLLMProvider):
+            async def chat_completion_stream(self, *args, **kwargs):
+                async def _gen():
+                    yield _FakeChunk(
+                        tool_calls=[
+                            _FakeToolCall(
+                                0,
+                                call_id="call-weather",
+                                name="web_search",
+                                arguments='{"query":"weather"}',
+                            )
+                        ]
+                    )
+                return _gen()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SQLiteInteractionLogAdapter(str(Path(tmpdir) / "interaction_logs.db"))
+            provider = LoggingLLMProvider(ToolCallingProvider(), store)
+
+            async def _run():
+                stream = await provider.chat_completion_stream(
+                    model="test-model",
+                    messages=[{"role": "user", "content": "find the weather"}],
+                    tools=[{"type": "function", "function": {"name": "web_search"}}],
+                )
+                async for _ in stream:
+                    pass
+                provider.attach_tool_result(
+                    "call-weather",
+                    tool_name="web_search",
+                    arguments_json='{"query":"weather"}',
+                    output="Sunny, 28 C",
+                    ok=True,
+                )
+
+            asyncio.run(_run())
+            calls = json.loads(store.list_recent(limit=1)[0].tool_calls_json)
+            self.assertEqual(calls[0]["function"]["name"], "web_search")
+            self.assertEqual(calls[0]["execution"]["output"], "Sunny, 28 C")
+            self.assertTrue(calls[0]["execution"]["ok"])
 
 
 if __name__ == "__main__":

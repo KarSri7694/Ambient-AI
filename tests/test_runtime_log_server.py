@@ -334,6 +334,53 @@ class RuntimeLogServerTests(unittest.TestCase):
             self.assertEqual(payload["items"][0]["response_text"], "world")
             self.assertEqual(client.get("/api/interactions", params={"date_from": "2026-07-26", "date_to": "2026-07-24"}).status_code, 422)
 
+    def test_interaction_api_exposes_the_rag_blocks_present_in_saved_prompt(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SQLiteInteractionLogAdapter(str(Path(tmpdir) / "interaction_logs.db"))
+            store.insert(
+                InteractionLogEntry(
+                    interaction_id="rag-1",
+                    interaction_run_id="run-rag-1",
+                    created_at="2026-07-24T10:00:00",
+                    completed_at="2026-07-24T10:00:01",
+                    source="autonomy_investigation",
+                    model="model-a",
+                    messages_json=json.dumps(
+                        [
+                            {"role": "system", "content": "Investigate safely."},
+                            {
+                                "role": "user",
+                                "content": json.dumps(
+                                    {
+                                        "opportunity": {"title": "Model integration"},
+                                        "personalization_context": "User is working on Ambient AI.",
+                                        "temporal_context": {
+                                            "active_thread": {"title": "ROCm model evaluation"},
+                                            "retrieved_events": [{"summary": "Benchmarked Qwen."}],
+                                        },
+                                    }
+                                ),
+                            },
+                        ]
+                    ),
+                    tool_calls_json=json.dumps(
+                        [
+                            {
+                                "id": "call-1",
+                                "function": {"name": "web_search", "arguments": "{}"},
+                                "execution": {"status": "completed", "ok": True, "output": "found sources"},
+                            }
+                        ]
+                    ),
+                )
+            )
+            client = TestClient(create_runtime_log_app(RuntimeLogBuffer(), report_store=store))
+            item = client.get("/api/interactions").json()["items"][0]
+
+            fields = {entry["field"] for entry in item["input"]["rag_context"]}
+            self.assertEqual(fields, {"personalization_context", "temporal_context"})
+            self.assertEqual(item["tool_calls"][0]["execution"]["output"], "found sources")
+
     def test_protected_interaction_input_and_capture_image_are_audited(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
