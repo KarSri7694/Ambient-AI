@@ -13,6 +13,8 @@ class _FakeMemory:
     def __init__(self):
         self.missing_batches = []
         self.updated = []
+        self.deleted = []
+        self.upserted = []
         self.vector_search_calls = []
 
     def get_chunks_missing_embeddings(self, limit=100):
@@ -22,6 +24,12 @@ class _FakeMemory:
 
     def update_embedding(self, chunk_id, embedding):
         self.updated.append((chunk_id, embedding))
+
+    def delete_semantic_chunk(self, chunk_id):
+        self.deleted.append(chunk_id)
+
+    def upsert_semantic_chunk(self, **kwargs):
+        self.upserted.append(kwargs)
 
     def vector_search(self, query_embedding, *, limit=30, speaker_ids=None, source_types=None):
         self.vector_search_calls.append(
@@ -107,3 +115,18 @@ def test_retrieve_passes_source_types_into_vector_search_and_uses_bounded_sync()
     assert len(memory.updated) == 1
     assert len(memory.missing_batches) == 1
     assert adapter.rerank_calls[-1]["top_n"] == 1
+
+
+def test_sync_removes_tool_payloads_and_persists_compact_factual_documents():
+    memory = _FakeMemory()
+    unsafe = _chunk("artifact:unsafe", '<function=fs_read>{"path":"secret"}')
+    oversized = _chunk("artifact:oversized", "fact " * 500)
+    memory.missing_batches = [[unsafe, oversized]]
+    adapter = _FakeAdapter()
+    service = SemanticMemoryService(memory=memory, semantic_adapter=adapter, sync_batch_size=2)
+
+    assert service.ensure_embeddings_synced() == 1
+    assert memory.deleted == ["artifact:unsafe"]
+    assert len(memory.upserted) == 1
+    assert len(memory.upserted[0]["content"]) <= service.MAX_DOCUMENT_CHARS
+    assert adapter.embed_calls == [[memory.upserted[0]["content"]]]

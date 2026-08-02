@@ -8,7 +8,11 @@ SRC_ROOT = REPO_ROOT / "src"
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(SRC_ROOT))
 
-from application.services.runtime_interrupt_service import RuntimeInterruptController, WorkInterrupted
+from application.services.runtime_interrupt_service import (
+    RuntimeInterruptController,
+    RuntimeShutdownController,
+    WorkInterrupted,
+)
 
 
 def test_runtime_interrupt_controller_marks_active_work_interrupted():
@@ -40,3 +44,18 @@ def test_runtime_interrupt_controller_clears_request_when_work_scope_consumes_in
     assert status["requested"] is False
     assert status["active_work"] is None
     assert status["last_interrupted"]["kind"] == "autonomy_backlog"
+
+
+def test_shutdown_controller_drains_first_interrupt_and_forces_second():
+    controller = RuntimeShutdownController()
+    controller.stream_started()
+
+    assert controller.request_interrupt() == "graceful"
+    assert controller.is_graceful_requested() is True
+    assert controller.permits_new_model_request() is False
+    assert controller.is_force_requested() is False
+
+    assert controller.request_interrupt() == "forced"
+    assert controller.is_force_requested() is True
+    controller.stream_finished()
+    assert controller.active_stream_count() == 0

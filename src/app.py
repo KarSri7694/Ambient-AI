@@ -43,7 +43,11 @@ from application.services.resource_governor_service import (
     ResourceGovernorService,
     ResourceUnavailableError,
 )
-from application.services.runtime_interrupt_service import RuntimeInterruptController, WorkInterrupted
+from application.services.runtime_interrupt_service import (
+    RuntimeInterruptController,
+    RuntimeShutdownController,
+    WorkInterrupted,
+)
 from core.models import InferenceRequest
 from audio_agent import AudioAgentService
 from infrastructure.adapter.LlamaCppSemanticAdapter import LlamaCppSemanticAdapter
@@ -562,6 +566,8 @@ class AmbientRuntime:
         self._artifact_maintenance_retry_after = 0.0
         self._daily_briefing_service: DailyBriefingService | None = None
         self.interrupt_controller = RuntimeInterruptController()
+        self.shutdown_controller = RuntimeShutdownController()
+        self._shutdown_llm_adapters: list[LlamaCppAdapter] = []
         if self.chat_event_broker is not None:
             self.chat_event_broker.set_turn_enqueued_callback(self._notify_chat_queued)
 
@@ -578,6 +584,28 @@ class AmbientRuntime:
         self.stop_event.set()
         self._screenshot_capture_stop_event.set()
         self._notify_chat_queued()
+
+    def request_graceful_shutdown(self) -> None:
+        """Stop accepting work while allowing an already-open model stream to drain."""
+        self.stop_event.set()
+        self._screenshot_capture_stop_event.set()
+        self._notify_chat_queued()
+
+    def force_stop_service(self) -> None:
+        """Abort active model HTTP streams from the runtime loop, then stop immediately."""
+        self.stop_event.set()
+        self._screenshot_capture_stop_event.set()
+        self._notify_chat_queued()
+        loop = self._loop
+        if loop is not None and loop.is_running():
+            asyncio.run_coroutine_threadsafe(self._close_llama_connections(), loop)
+
+    async def _close_llama_connections(self) -> None:
+        for adapter in list(self._shutdown_llm_adapters):
+            try:
+                await adapter.close_active_connections()
+            except Exception:
+                logger.debug("Failed to close llama.cpp client during shutdown.", exc_info=True)
 
     def request_interrupt(self, reason: str = "Interrupted by local user") -> dict:
         status = self.interrupt_controller.request_interrupt(reason)
@@ -911,7 +939,9 @@ class AmbientRuntime:
             model_load_timeout_seconds=MODEL_LOAD_TIMEOUT_SECONDS,
             isolated_model_tracking=True,
             default_max_tokens=MAX_GENERATION_TOKENS,
+            shutdown_controller=self.shutdown_controller,
         )
+        self._shutdown_llm_adapters = [raw_llm_adapter]
         autonomy_store = SQLiteAutonomyAdapter(str(AUTONOMY_DB_PATH))
         if self.resource_governor.audit is None:
             self.resource_governor.audit = autonomy_store.audit
@@ -945,7 +975,9 @@ class AmbientRuntime:
                 model_load_timeout_seconds=VISION_MODEL_LOAD_TIMEOUT_SECONDS,
                 isolated_model_tracking=True,
                 default_max_tokens=MAX_GENERATION_TOKENS,
+                shutdown_controller=self.shutdown_controller,
             )
+            self._shutdown_llm_adapters.append(vision_raw_llm)
             vision_llm = LoggingLLMProvider(
                 provider=vision_raw_llm,
                 log_store=interaction_log_store,
@@ -1100,6 +1132,7 @@ class AmbientRuntime:
             semantic_memory=semantic_memory,
             temporal_memory_service=temporal_memory_service,
             interrupt_checker=self.interrupt_controller.check,
+            shutdown_controller=self.shutdown_controller,
             max_interaction_iterations=LLM_INTERACTION_MAX_ITERATIONS,
             final_turn_recovery_enabled=LLM_INTERACTION_FINAL_TURN_RECOVERY_ENABLED,
         )
@@ -3154,13 +3187,17 @@ class AmbientRuntime:
         finally:
             self._stop_screenshot_capture_loop()
             llm_service.reset_context()
-            if services_initialized:
+            shutdown_requested = self.shutdown_controller.is_graceful_requested()
+            if shutdown_requested:
+                logger.info("Disconnecting Ambient AI from llama-server without unloading resident models.")
+                await self._close_llama_connections()
+            elif services_initialized:
                 await self._release_runtime(
                     llm_adapter=llm_adapter,
                     services_initialized=services_initialized,
                     reason="application shutdown",
                 )
-            if self._vision_llm is not None and not VISION_KEEP_RESIDENT:
+            if self._vision_llm is not None and not VISION_KEEP_RESIDENT and not shutdown_requested:
                 try:
                     await self._vision_llm.unload_model()
                 except Exception:
@@ -3310,16 +3347,41 @@ if __name__ == "__main__":
     audio_thread.start()
     runtime_thread.start()
 
+    shutdown_forced = False
     try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        logger.info("Keyboard interrupt received. Stopping Ambient AI services.")
+        while runtime_thread.is_alive():
+            try:
+                time.sleep(0.25)
+            except KeyboardInterrupt:
+                stage = ambient_runtime.shutdown_controller.request_interrupt()
+                if stage == "graceful":
+                    active_streams = ambient_runtime.shutdown_controller.active_stream_count()
+                    if active_streams:
+                        logger.info(
+                            "Keyboard interrupt received. Ambient AI will exit after the current llama-server prompt finishes; no new messages, tools, or follow-up prompts will be sent."
+                        )
+                    else:
+                        logger.info(
+                            "Keyboard interrupt received with no active llama-server prompt. Ambient AI is exiting cleanly."
+                        )
+                    ambient_runtime.request_graceful_shutdown()
+                    audio_agent.stop_service()
+                else:
+                    shutdown_forced = True
+                    logger.warning(
+                        "Second keyboard interrupt received. Closing the active llama-server connection and forcing immediate clean shutdown."
+                    )
+                    ambient_runtime.force_stop_service()
+                    audio_agent.stop_service()
+                    break
     finally:
-        ambient_runtime.stop_service()
+        if shutdown_forced:
+            ambient_runtime.force_stop_service()
+        else:
+            ambient_runtime.request_graceful_shutdown()
         audio_agent.stop_service()
-        runtime_thread.join(timeout=15.0)
-        audio_thread.join(timeout=15.0)
+        runtime_thread.join(timeout=5.0 if shutdown_forced else 30.0)
+        audio_thread.join(timeout=5.0 if shutdown_forced else 15.0)
         if runtime_thread.is_alive():
             logger.warning("Ambient runtime thread did not exit cleanly before timeout.")
         if audio_thread.is_alive():

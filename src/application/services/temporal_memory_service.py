@@ -52,7 +52,13 @@ class TemporalMemoryService:
             str(work_retrieval_instruction).strip() or self.WORK_RETRIEVAL_INSTRUCTION
         )
 
-    def record_ambient_event(self, event: Any, *, outcome: str = "") -> TemporalMemoryEvent | None:
+    def record_ambient_event(
+        self,
+        event: Any,
+        *,
+        outcome: str = "",
+        semantic_index: bool = False,
+    ) -> TemporalMemoryEvent | None:
         """Persist one factual record for a processed Ambient event without model inference."""
         if not self.enabled or not hasattr(self.memory, "append_temporal_event"):
             return None
@@ -115,6 +121,7 @@ class TemporalMemoryService:
                     },
                     ensure_ascii=False,
                 ),
+                semantic_index=bool(semantic_index),
             )
         )
         self.memory.upsert_temporal_work_thread(

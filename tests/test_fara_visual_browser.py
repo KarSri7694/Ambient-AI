@@ -77,14 +77,26 @@ def test_browser_policy_allows_transactional_public_navigation(url):
     assert BrowserSafetyPolicy().validate_navigation(url) == url
 
 
-def test_fara_launch_args_start_maximized_with_configured_window_size(tmp_path):
+def test_fara_headless_launch_uses_configured_fixed_viewport(tmp_path):
     session = _session(tmp_path)
 
     kwargs = session._launch_kwargs()
 
     assert kwargs["viewport"] == {"width": 1440, "height": 900}
+    assert "--start-maximized" not in kwargs["args"]
+    assert kwargs["chromium_sandbox"] is True
+
+
+def test_fara_visible_launch_uses_real_maximized_viewport(tmp_path):
+    session = _session(tmp_path)
+    session.headless = False
+
+    kwargs = session._launch_kwargs()
+
+    assert kwargs["viewport"] is None
     assert "--start-maximized" in kwargs["args"]
-    assert "--window-size=1440,900" in kwargs["args"]
+    assert not any(arg.startswith("--window-size=") for arg in kwargs["args"])
+    assert kwargs["chromium_sandbox"] is True
 
 
 def test_fara_action_parser_accepts_official_xml_shape(tmp_path):

@@ -21,6 +21,8 @@ from core.models import AmbientEvent, DelegatedTask, OpportunityCandidate, Proac
 class AutonomyCoordinatorService:
     """Continuously turns context events into judged, policy-bounded proactive work."""
 
+    APPROVED_BROWSER_IDLE_RETRY_SECONDS = 5
+
     INVESTIGATION_PROMPT = """You are Ambient AI's proactive investigator.
 
 The opportunity was inferred from ambient context; it is not a literal command.
@@ -316,6 +318,20 @@ Do not repeat an action already reported as performed.
             return payload
 
         try:
+            # Browser automation visibly takes over a real local browser. An
+            # approval grants the task but does not authorize interrupting an
+            # actively used desktop, so retain it until an idle window opens.
+            if self._is_browser_use_approval(event) and not self._user_is_idle_for_browser_control():
+                self.store.defer_event(
+                    event.event_id,
+                    reason="approved browser task is waiting for the local user to become idle",
+                    delay_seconds=self.APPROVED_BROWSER_IDLE_RETRY_SECONDS,
+                )
+                self.logger.info(
+                    "Deferred approved browser task %s because the local user is active.",
+                    event.event_id,
+                )
+                return event_result({"processed": True, "outcome": "deferred_until_user_idle"})
             if event.event_type != "lightweight_visual_capture":
                 personalization_context = self._personalization_for_event(
                     event,
@@ -1377,23 +1393,28 @@ Do not repeat an action already reported as performed.
                     result_json=json.dumps(stored_payload, ensure_ascii=False),
                 )
 
+        # Browser/computer tools can return an entire scraped page or other
+        # transient payload.  Those raw results must stay in the interaction
+        # trace, not enter durable vector retrieval. Only the continuation's
+        # completed JSON is an LLM-curated semantic record.
         semantic_memory = getattr(llm_service, "semantic_memory", None)
         memory = getattr(semantic_memory, "memory", None)
-        if memory is not None and hasattr(memory, "upsert_semantic_chunk"):
+        if (
+            memory is not None
+            and hasattr(memory, "upsert_semantic_chunk")
+            and self._is_json_object_or_array(continuation_response)
+        ):
             memory.upsert_semantic_chunk(
-                source_type="delegated_task_result",
+                source_type="delegated_task_final_json",
                 source_id=delegation_id,
                 source_ref=f"delegation://{delegation_id}",
-                content="\n".join(
-                    part for part in [
-                        str(payload.get("task") or ""),
-                        str(result_payload.get("summary") or ""),
-                        str(result_payload.get("details") or ""),
-                        continuation_response,
-                    ] if part
-                )[:50000],
+                content=continuation_response,
                 metadata_json=json.dumps(
-                    {"origin_kind": origin_kind, "status": result_payload.get("status")},
+                    {
+                        "origin_kind": origin_kind,
+                        "status": result_payload.get("status"),
+                        "semantic_origin": "final_llm_json",
+                    },
                     ensure_ascii=False,
                 ),
             )
@@ -1610,6 +1631,18 @@ Do not repeat an action already reported as performed.
             and str(payload.get("tool_name") or "") == "use_browser"
         )
 
+    def _user_is_idle_for_browser_control(self) -> bool:
+        """Fail closed when the platform's idle state cannot be determined."""
+        if self.user_idle_checker is None:
+            # Preserve explicit/unit-test deployments that do not wire the
+            # desktop idle service; production always supplies one.
+            return True
+        try:
+            return bool(self.user_idle_checker())
+        except Exception:
+            self.logger.exception("Unable to determine user idle state; keeping browser task deferred.")
+            return False
+
     @staticmethod
     def _summary(result: str) -> str:
         text = re.sub(r"\s+", " ", result or "").strip()
@@ -1628,6 +1661,19 @@ Do not repeat an action already reported as performed.
             return parsed if isinstance(parsed, dict) else {"value": parsed}
         except json.JSONDecodeError:
             return {"text": value or ""}
+
+    @staticmethod
+    def _is_json_object_or_array(value: str) -> bool:
+        text = str(value or "").strip()
+        if text.startswith("```") and text.endswith("```"):
+            lines = text.splitlines()
+            text = "\n".join(lines[1:-1]).strip() if len(lines) >= 2 else ""
+        if not text:
+            return False
+        try:
+            return isinstance(json.loads(text), (dict, list))
+        except (TypeError, json.JSONDecodeError):
+            return False
 
     @staticmethod
     def _now() -> str:

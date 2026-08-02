@@ -303,6 +303,7 @@ class LLMInteractionService:
         semantic_memory: Optional[Any] = None,
         temporal_memory_service: Optional[Any] = None,
         interrupt_checker: Optional[Callable[[], None]] = None,
+        shutdown_controller: Optional[Any] = None,
         max_interaction_iterations: int = MAX_ITERATIONS,
         final_turn_recovery_enabled: bool = True,
     ):
@@ -337,6 +338,7 @@ class LLMInteractionService:
         self.semantic_memory = semantic_memory
         self.temporal_memory_service = temporal_memory_service
         self.interrupt_checker = interrupt_checker
+        self.shutdown_controller = shutdown_controller
         self.max_interaction_iterations = max(1, int(max_interaction_iterations or self.MAX_ITERATIONS))
         self.final_turn_recovery_enabled = bool(final_turn_recovery_enabled)
         self.artifact_root = Path(artifact_root) if artifact_root else (self.PARENT_DIR / "artifacts")
@@ -1502,6 +1504,18 @@ class LLMInteractionService:
                 event_callback=event_callback,
                 allow_text_tool_recovery=not is_final_turn,
             )
+            if (
+                self.shutdown_controller is not None
+                and self.shutdown_controller.is_graceful_requested()
+            ):
+                # First Ctrl+C intentionally drains only the already-open
+                # completion. Never turn its tool calls into more real-world
+                # actions or another llama.cpp request.
+                self._frame.messages.append({"role": "assistant", "content": assistant_text})
+                self.logger.info(
+                    "Graceful shutdown: current llama.cpp response finished; skipping tools and follow-up turns."
+                )
+                return assistant_text
             if tool_calls and hasattr(self.llm, "register_tool_calls"):
                 self.llm.register_tool_calls(tool_calls)
             self._check_interrupted()
@@ -1525,6 +1539,7 @@ class LLMInteractionService:
                     user_input=user_input,
                     final_response=assistant_text,
                     tools_used=tools_used,
+                    semantic_index=self._is_final_json_response(assistant_text),
                 )
                 return assistant_text
 
@@ -1583,6 +1598,7 @@ class LLMInteractionService:
                     user_input=user_input,
                     final_response=terminal_result,
                     tools_used=tools_used,
+                    semantic_index=False,
                 )
                 return terminal_result
 
@@ -1598,6 +1614,7 @@ class LLMInteractionService:
             user_input=user_input,
             final_response=assistant_text,
             tools_used=tools_used,
+            semantic_index=False,
         )
         return assistant_text
 
@@ -1609,6 +1626,7 @@ class LLMInteractionService:
         user_input: str,
         final_response: str,
         tools_used: List[str],
+        semantic_index: bool = False,
     ) -> None:
         if self.temporal_memory_service is None:
             return
@@ -1629,9 +1647,28 @@ class LLMInteractionService:
             ),
         )
         try:
-            self.temporal_memory_service.record_ambient_event(event, outcome=final_response[:10000])
+            self.temporal_memory_service.record_ambient_event(
+                event,
+                outcome=final_response[:10000],
+                semantic_index=semantic_index,
+            )
         except Exception:
             self.logger.exception("Could not record interaction in temporal memory.")
+
+    @staticmethod
+    def _is_final_json_response(value: str) -> bool:
+        """Return true only for a complete model-produced JSON object or array."""
+        text = str(value or "").strip()
+        if text.startswith("```") and text.endswith("```"):
+            lines = text.splitlines()
+            text = "\n".join(lines[1:-1]).strip() if len(lines) >= 2 else ""
+        if not text:
+            return False
+        try:
+            parsed = json.loads(text)
+        except (TypeError, json.JSONDecodeError):
+            return False
+        return isinstance(parsed, (dict, list))
 
     def _append_deferred_sibling_tool_results(
         self, tool_calls: List[Dict[str, Any]], suspended_tool_call_id: str

@@ -960,20 +960,22 @@ class SQLiteMemoryAdapter(MemoryPort):
                 (event.temporal_event_id,),
             ).fetchone()
         persisted = self._temporal_event_from_row(row)
-        self.upsert_semantic_chunk(
-            source_type="temporal_event",
-            source_id=persisted.temporal_event_id,
-            source_ref=persisted.source_ref,
-            content=persisted.content,
-            metadata_json=json.dumps({
-                "temporal_event_id": persisted.temporal_event_id,
-                "thread_id": persisted.thread_id,
-                "occurred_at": persisted.occurred_at,
-                "state": persisted.state,
-                "entities": persisted.entities,
-                "source_type": persisted.source_type,
-            }, ensure_ascii=False),
-        )
+        if event.semantic_index:
+            self.upsert_semantic_chunk(
+                source_type="temporal_event",
+                source_id=persisted.temporal_event_id,
+                source_ref=persisted.source_ref,
+                content=persisted.content,
+                metadata_json=json.dumps({
+                    "temporal_event_id": persisted.temporal_event_id,
+                    "thread_id": persisted.thread_id,
+                    "occurred_at": persisted.occurred_at,
+                    "state": persisted.state,
+                    "entities": persisted.entities,
+                    "source_type": persisted.source_type,
+                    "semantic_origin": "final_llm_json",
+                }, ensure_ascii=False),
+            )
         return persisted
 
     def get_temporal_events(

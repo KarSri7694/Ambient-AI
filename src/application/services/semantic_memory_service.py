@@ -1,15 +1,27 @@
 import json
 import logging
 import math
+import re
+from dataclasses import replace
 from typing import List, Optional
 
 from application.ports.memory_port import MemoryPort
-from core.models import SemanticMemoryResult
+from core.models import SemanticMemoryChunk, SemanticMemoryResult
 from infrastructure.adapter.LlamaCppSemanticAdapter import LlamaCppSemanticAdapter
 
 
 class SemanticMemoryService:
     """Keeps semantic embeddings in sync and retrieves relevant memory snippets."""
+
+    # A reranker must receive compact factual passages, never an entire tool
+    # transcript or a system message. This is a storage-boundary guard; it
+    # does not silently truncate a request at rerank time.
+    MAX_DOCUMENT_CHARS = 1200
+    _UNSAFE_DOCUMENT_MARKERS = (
+        "<function=", "<tool_call", "</tool_call>", '"tool_calls"',
+        '"tool_call_id"', '"role": "system"', '"role":"system"',
+        "system prompt",
+    )
 
     def __init__(
         self,
@@ -43,6 +55,9 @@ class SemanticMemoryService:
             if not chunks:
                 break
             batches += 1
+            chunks = self._prepare_chunks_for_embedding(chunks)
+            if not chunks:
+                continue
             texts = [chunk.content for chunk in chunks]
             try:
                 embeddings = self.semantic_adapter.embed_texts(texts)
@@ -77,6 +92,43 @@ class SemanticMemoryService:
                     continue
                 synced += 1
         return synced
+
+    def _prepare_chunks_for_embedding(self, chunks: List[SemanticMemoryChunk]) -> List[SemanticMemoryChunk]:
+        prepared: List[SemanticMemoryChunk] = []
+        for chunk in chunks:
+            compacted = self._canonical_document(chunk.content)
+            if compacted is None:
+                if hasattr(self.memory, "delete_semantic_chunk"):
+                    self.memory.delete_semantic_chunk(chunk.chunk_id)
+                self.logger.warning("Removed unsafe semantic chunk before embedding: %s", chunk.chunk_id)
+                continue
+            if compacted != chunk.content:
+                metadata = self._parse_metadata(chunk.metadata_json)
+                metadata["semantic_document_kind"] = "canonical_factual"
+                if hasattr(self.memory, "upsert_semantic_chunk"):
+                    self.memory.upsert_semantic_chunk(
+                        source_type=chunk.source_type,
+                        source_id=chunk.source_id,
+                        source_ref=chunk.source_ref,
+                        speaker_id=chunk.speaker_id,
+                        content=compacted,
+                        metadata_json=json.dumps(metadata, ensure_ascii=False),
+                    )
+                chunk = replace(chunk, content=compacted, metadata_json=json.dumps(metadata, ensure_ascii=False))
+            prepared.append(chunk)
+        return prepared
+
+    def _canonical_document(self, value: str) -> Optional[str]:
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        lowered = text.lower()
+        if any(marker in lowered for marker in self._UNSAFE_DOCUMENT_MARKERS):
+            return None
+        if len(text) <= self.MAX_DOCUMENT_CHARS:
+            return text
+        content_limit = self.MAX_DOCUMENT_CHARS - 4
+        cutoff = text.rfind(" ", 0, content_limit)
+        cutoff = cutoff if cutoff >= content_limit // 2 else content_limit
+        return text[:cutoff].rstrip(" ,;:-") + " ..."
 
     def retrieve(
         self,

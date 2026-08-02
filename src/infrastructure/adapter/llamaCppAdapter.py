@@ -7,6 +7,7 @@ import copy
 import json
 import time
 import re
+import inspect
 from datetime import datetime
 
 from application.ports.LLMProvider import LLMProvider
@@ -14,6 +15,11 @@ from application.ports.modelManager import ModelManager
 from pathlib import Path
 from urllib.parse import urlparse
 from utils.kv_state_handling import KVStateControl
+from application.services.runtime_interrupt_service import (
+    ForcedShutdown,
+    RuntimeShutdownController,
+    ShutdownInProgress,
+)
 
 class LlamaCppAdapter(LLMProvider, ModelManager):
     """Adapter for llama.cpp server — implements both LLMProvider and ModelManager."""
@@ -25,6 +31,7 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         model_load_timeout_seconds: float = 600.0,
         isolated_model_tracking: bool = False,
         default_max_tokens: Optional[int] = None,
+        shutdown_controller: Optional[RuntimeShutdownController] = None,
     ):
         """Create an adapter for a llama.cpp-compatible OpenAI API server."""
         self.logger = logging.getLogger(self.__class__.__name__)
@@ -42,6 +49,8 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         self.currently_loaded_model: Optional[str] = None
         self._ready_model: Optional[str] = None
         self.kv_state = KVStateControl(self)
+        self.shutdown_controller = shutdown_controller
+        self._active_streams: set[Any] = set()
 
     # ── ModelManager ──────────────────────────────────────────
 
@@ -637,6 +646,8 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         If `image` is provided, it is attached to the final user message as a
         base64 data URL for multimodal models.
         """
+        if self.shutdown_controller is not None and not self.shutdown_controller.permits_new_model_request():
+            raise ShutdownInProgress("Shutdown is in progress; no new llama.cpp request will be sent.")
         await asyncio.to_thread(self._require_model_ready, model)
         copy_messages = copy.deepcopy(messages)
         if image and copy_messages:
@@ -691,4 +702,44 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         if tools:
             kwargs["tools"] = tools
 
-        return await self.client.chat.completions.create(**kwargs)
+        completion = await self.client.chat.completions.create(**kwargs)
+        if self.shutdown_controller is None:
+            return completion
+        self._active_streams.add(completion)
+        self.shutdown_controller.stream_started()
+
+        async def _tracked_stream():
+            try:
+                async for chunk in completion:
+                    if self.shutdown_controller is not None and self.shutdown_controller.is_force_requested():
+                        raise ForcedShutdown("Forced shutdown requested during llama.cpp stream.")
+                    yield chunk
+            except Exception as exc:
+                if self.shutdown_controller is not None and self.shutdown_controller.is_force_requested():
+                    raise ForcedShutdown("Forced shutdown closed the llama.cpp stream.") from exc
+                raise
+            finally:
+                self._active_streams.discard(completion)
+                self.shutdown_controller.stream_finished()
+
+        return _tracked_stream()
+
+    async def close_active_connections(self) -> None:
+        """Close open streaming responses and the HTTP client without unloading models."""
+        streams = list(self._active_streams)
+        for stream in streams:
+            closer = getattr(stream, "close", None)
+            if closer is None:
+                continue
+            try:
+                result = closer()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                self.logger.debug("Failed to close an active llama.cpp stream during shutdown.", exc_info=True)
+        self._active_streams.clear()
+        client_close = getattr(self.client, "close", None)
+        if client_close is not None:
+            result = client_close()
+            if inspect.isawaitable(result):
+                await result

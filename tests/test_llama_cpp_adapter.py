@@ -11,6 +11,7 @@ import requests
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from infrastructure.adapter.llamaCppAdapter import LlamaCppAdapter
+from application.services.runtime_interrupt_service import RuntimeShutdownController, ShutdownInProgress
 from utils.kv_state_handling import KVStateControl
 
 
@@ -452,6 +453,76 @@ def test_default_max_tokens_is_applied_when_request_does_not_override():
 
     assert result == "stream"
     assert captured["max_tokens"] == 60000
+
+
+def test_shutdown_controller_allows_existing_stream_to_finish_but_blocks_next_request():
+    controller = RuntimeShutdownController()
+    adapter = LlamaCppAdapter("http://localhost:8080", shutdown_controller=controller)
+
+    class _Stream:
+        def __init__(self):
+            self.items = ["first", "last"]
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not self.items:
+                raise StopAsyncIteration
+            return self.items.pop(0)
+
+        async def close(self):
+            return None
+
+    class _Completions:
+        async def create(self, **_kwargs):
+            return _Stream()
+
+    adapter.client = SimpleNamespace(chat=SimpleNamespace(completions=_Completions()))
+    adapter._require_model_ready = lambda _model: None
+
+    async def exercise():
+        stream = await adapter.chat_completion_stream(model="main", messages=[])
+        assert controller.active_stream_count() == 1
+        assert controller.request_interrupt() == "graceful"
+        assert [item async for item in stream] == ["first", "last"]
+        assert controller.active_stream_count() == 0
+        with pytest.raises(ShutdownInProgress):
+            await adapter.chat_completion_stream(model="main", messages=[])
+
+    asyncio.run(exercise())
+
+
+def test_force_shutdown_closes_active_llama_stream_and_http_client():
+    controller = RuntimeShutdownController()
+    adapter = LlamaCppAdapter("http://localhost:8080", shutdown_controller=controller)
+    closed = {"stream": False, "client": False}
+
+    class _Stream:
+        async def close(self):
+            closed["stream"] = True
+
+    class _Completions:
+        async def create(self, **_kwargs):
+            return _Stream()
+
+    class _Client:
+        chat = SimpleNamespace(completions=_Completions())
+
+        async def close(self):
+            closed["client"] = True
+
+    adapter.client = _Client()
+    adapter._require_model_ready = lambda _model: None
+
+    async def exercise():
+        await adapter.chat_completion_stream(model="main", messages=[])
+        controller.request_interrupt()
+        controller.request_interrupt()
+        await adapter.close_active_connections()
+
+    asyncio.run(exercise())
+    assert closed == {"stream": True, "client": True}
 
 
 def test_per_request_max_tokens_overrides_adapter_default():

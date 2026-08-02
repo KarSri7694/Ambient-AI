@@ -413,6 +413,50 @@ def test_browser_approval_event_deploys_browser_agent_once(tmp_path):
     ]
 
 
+def test_approved_browser_task_waits_without_controlling_an_active_desktop(tmp_path):
+    store = SQLiteAutonomyAdapter(str(tmp_path / "autonomy.db"))
+    browser_bridge = _BrowserBridge()
+    service = LLMInteractionService(
+        llm_provider=_BrowserFlowProvider(),
+        tool_bridge=_MainToolBridge(),
+        browser_tool_bridge=browser_bridge,
+        browser_agent_model="browser-model",
+        capability_policy=CapabilityPolicyService(store=store),
+    )
+    coordinator = AutonomyCoordinatorService(
+        store=store,
+        judgment=_Judgment(),
+        policy=CapabilityPolicyService(store=store),
+        mode="active",
+        user_idle_checker=lambda: False,
+    )
+    store.enqueue_event(AmbientEvent(
+        event_id="active-user-browser-approval",
+        event_type="approval_granted",
+        source_kind="local_approval",
+        source_ref="approval-active-user",
+        occurred_at="2026-07-28T12:00:00+00:00",
+        payload_json=json.dumps({
+            "tool_name": "use_browser",
+            "approval_kind": "browser_use_deployment",
+            "arguments": {"task": "Open example.com", "reason": "User asked"},
+        }),
+        confidence=1.0,
+        privacy_label="private",
+        fingerprint="active-user-browser-approval",
+        priority=1.0,
+        available_at="2026-07-28T12:00:00+00:00",
+    ))
+
+    result = asyncio.run(coordinator.process_next(
+        model="main-model", llm_service=service, personalization_context=""
+    ))
+
+    assert result["outcome"] == "deferred_until_user_idle"
+    assert browser_bridge.sessions == []
+    assert store.event_counts().get("resource_deferred") == 1
+
+
 def test_finish_browser_task_can_return_without_closing_browser():
     provider = _BrowserFlowProvider(exit_browser=False)
     browser_bridge = _BrowserBridge()

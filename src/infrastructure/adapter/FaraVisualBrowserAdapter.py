@@ -229,21 +229,33 @@ Only stop at a critical point if (1) required information is missing, (2) the ta
             raise
 
     def _launch_kwargs(self) -> dict[str, Any]:
+        # A headed browser must use its real maximized desktop viewport. Forcing
+        # an emulated 2560x1440 viewport while also maximizing Chrome breaks on
+        # scaled Windows displays and can render the page off-screen.
+        viewport = (
+            {"width": self.viewport_width, "height": self.viewport_height}
+            if self.headless
+            else None
+        )
+        args = [
+            "--disable-extensions",
+            "--disable-features=AutofillServerCommunication,PasswordManagerOnboarding",
+            "--disable-notifications",
+            "--no-first-run",
+            "--no-default-browser-check",
+        ]
+        if not self.headless:
+            args.append("--start-maximized")
         launch_kwargs: dict[str, Any] = {
             "user_data_dir": str(self.profile_dir.resolve()),
             "headless": self.headless,
-            "viewport": {"width": self.viewport_width, "height": self.viewport_height},
+            "viewport": viewport,
+            # Playwright otherwise appends --no-sandbox by default. Windows
+            # Chrome supports the sandbox and this local browser should retain it.
+            "chromium_sandbox": True,
             "accept_downloads": False,
             "service_workers": "block",
-            "args": [
-                "--disable-extensions",
-                "--disable-features=AutofillServerCommunication,PasswordManagerOnboarding",
-                "--disable-notifications",
-                f"--window-size={self.viewport_width},{self.viewport_height}",
-                "--start-maximized",
-                "--no-first-run",
-                "--no-default-browser-check",
-            ],
+            "args": args,
         }
         return launch_kwargs
 
@@ -704,9 +716,25 @@ Only stop at a critical point if (1) required information is missing, (2) the ta
         page = await self._active_page()
         path = self.screenshot_dir / f"step-{step:04d}.png"
         await page.screenshot(path=str(path), full_page=False)
+        self._update_viewport_from_screenshot(path)
         self._screenshot_paths.append(path)
         self._last_screenshot_path = path
         return path
+
+    def _update_viewport_from_screenshot(self, path: Path) -> None:
+        """Keep coordinate bounds aligned with the visible screenshot, without DOM access."""
+        try:
+            with path.open("rb") as image_file:
+                header = image_file.read(24)
+            if header[:8] != b"\x89PNG\r\n\x1a\n" or header[12:16] != b"IHDR":
+                return
+            width = int.from_bytes(header[16:20], "big")
+            height = int.from_bytes(header[20:24], "big")
+            if width >= 640 and height >= 480:
+                self.viewport_width = width
+                self.viewport_height = height
+        except OSError:
+            self.logger.warning("Could not read browser screenshot dimensions: %s", path)
 
     @staticmethod
     def _emit(callback: Optional[Callable[[Dict[str, Any]], None]], event: Dict[str, Any]) -> None:

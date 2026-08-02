@@ -114,3 +114,20 @@ def test_qwen_instruction_is_applied_to_query_not_document():
 
     assert result == [0.1, 0.2]
     assert captured == [["Instruct: Retrieve relevant work evidence\nQuery: current task"]]
+
+
+def test_temporal_records_are_not_embedded_unless_explicitly_promoted(tmp_path):
+    memory = SQLiteMemoryAdapter(str(tmp_path / "memory.db"), str(tmp_path / "memory"))
+    service = TemporalMemoryService(memory=memory)
+
+    service.record_ambient_event(_event("tool", "2026-08-02T09:00:00", {"summary": "raw scraped page"}))
+    assert memory.get_chunks_missing_embeddings(limit=20) == []
+
+    service.record_ambient_event(
+        _event("final", "2026-08-02T10:00:00", {"summary": "structured final result"}),
+        semantic_index=True,
+    )
+    chunks = memory.get_chunks_missing_embeddings(limit=20)
+    assert len(chunks) == 1
+    assert chunks[0].source_type == "temporal_event"
+    assert "structured final result" in chunks[0].content

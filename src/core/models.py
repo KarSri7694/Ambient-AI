@@ -482,6 +482,9 @@ class TemporalMemoryEvent:
     confidence: float = 0.0
     entities: List[str] = field(default_factory=list)
     metadata_json: str = "{}"
+    # Temporal records remain available chronologically by default. Only
+    # explicitly approved final model outputs are promoted into vector search.
+    semantic_index: bool = False
     created_at: str = ""
     updated_at: str = ""
 
