@@ -5,7 +5,7 @@ import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from application.services.capability_policy_service import CapabilityRegistry
 from application.services.interaction_trace import interaction_trace
@@ -73,13 +73,15 @@ Rules:
 
     SOURCE_TASKS = {
         "gmail": (
-            "Check Gmail for important recent emails, unread messages, replies needed, "
-            "deadlines, bills, meetings, travel, account/security notices, recruiter/work "
-            "messages, or anything the user should not miss. Use read/search/list Gmail tools only. "
-            "Required Gmail workflow: first call search_gmail_messages with a Gmail search query; "
-            "then extract the returned Gmail message IDs; only then call get_gmail_messages_content_batch "
-            "with those exact message IDs. Never call get_gmail_messages_content_batch with an empty "
-            "message_ids list, and never use 'me' as a message_id."
+            "Check Gmail proactively. Start by searching unread mail with query is:unread. "
+            "Then look for important or urgent messages, messages with deadlines, bills, meetings, "
+            "travel, account/security notices, recruiter/work messages, and emails that require the "
+            "user to reply. Use read/search/list Gmail tools only. Required workflow: first call "
+            "search_gmail_messages with a Gmail search query; then extract the returned Gmail message "
+            "IDs; only then call get_gmail_messages_content_batch with those exact message IDs. "
+            "Never call get_gmail_messages_content_batch with an empty message_ids list, and never use "
+            "'me' as a message_id. If an email requires a reply, do not send anything; include a concise "
+            "draft reply in suggested_next_step or evidence so the user can review it."
         ),
         "calendar": (
             "Check Google Calendar for today and the next 7 days. Find upcoming events, "
@@ -120,7 +122,10 @@ Rules:
         max_findings_per_sweep: int = 10,
         minimum_importance: str = "medium",
         max_source_seconds: float = 180.0,
+        max_tool_iterations: int = 25,
         filesystem_paths: Optional[list[str]] = None,
+        user_google_email: str = "",
+        user_idle_checker: Optional[Callable[[], bool]] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self.autonomy_store = autonomy_store
@@ -142,7 +147,10 @@ Rules:
         self.max_findings_per_sweep = max(1, int(max_findings_per_sweep))
         self.minimum_importance = str(minimum_importance or "medium").strip().lower()
         self.max_source_seconds = max(10.0, float(max_source_seconds))
+        self.max_tool_iterations = max(1, int(max_tool_iterations or 25))
         self.filesystem_paths = [str(path).strip() for path in (filesystem_paths or []) if str(path).strip()]
+        self.user_google_email = str(user_google_email or "").strip()
+        self.user_idle_checker = user_idle_checker
         self.registry = CapabilityRegistry()
         self.logger = logger or logging.getLogger(self.__class__.__name__)
 
@@ -271,6 +279,11 @@ Rules:
     async def _scan_source(self, source: str) -> list[ProactiveFinding]:
         source = source.strip().lower()
         if source == "whatsapp":
+            if not self._user_is_idle():
+                self.logger.info(
+                    "Skipping proactive WhatsApp/computer check because the user is active."
+                )
+                return []
             return await self._wait_for(self._scan_whatsapp(), source=source)
         if source == "filesystem":
             return await self._wait_for(self._scan_filesystem(), source=source)
@@ -283,6 +296,7 @@ Rules:
         user_input = (
             f"Approved proactive source: {source}\n"
             f"Task: {prompt}\n\n"
+            f"{self._source_config_context(source)}"
             f"User context:\n{context or '(none)'}"
         )
         with interaction_trace(
@@ -300,10 +314,23 @@ Rules:
                     model=self.model,
                     allowed_tool_names=allowed,
                     report_policy="silent",
+                    max_iterations=self.max_tool_iterations,
+                    turn_status_instructions=True,
+                    final_turn_response_format="json",
+                    disable_tools_on_final_turn=True,
                 )
             finally:
                 self.llm_service.reset_context()
         return self._parse_findings(text, fallback_source=source)
+
+    def _user_is_idle(self) -> bool:
+        if self.user_idle_checker is None:
+            return True
+        try:
+            return bool(self.user_idle_checker())
+        except Exception:
+            self.logger.exception("User idle check failed; treating user as active for proactive computer use.")
+            return False
 
     async def _wait_for(self, awaitable: Any, *, source: str) -> Any:
         try:
@@ -355,6 +382,10 @@ Rules:
                     model=self.model,
                     allowed_tool_names=allowed,
                     report_policy="silent",
+                    max_iterations=self.max_tool_iterations,
+                    turn_status_instructions=True,
+                    final_turn_response_format="json",
+                    disable_tools_on_final_turn=True,
                 )
             finally:
                 self.llm_service.reset_context()
@@ -378,6 +409,19 @@ Rules:
                 if descriptor.capability == "research.web" and name != "use_browser":
                     names.add(name)
         return names
+
+    def _source_config_context(self, source: str) -> str:
+        if source != "gmail":
+            return ""
+        if not self.user_google_email:
+            return (
+                "Configured Gmail account: (not set)\n"
+                "If Gmail tools require user_google_email and it is missing, report that blocker instead of guessing.\n\n"
+            )
+        return (
+            f"Configured Gmail account: {self.user_google_email}\n"
+            "Use this exact value for every Gmail tool argument named user_google_email. Do not use 'me'.\n\n"
+        )
 
     def _apply_global_read_policy(self) -> None:
         if not self.global_grant or self.capability_policy is None:

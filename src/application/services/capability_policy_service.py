@@ -86,6 +86,10 @@ class CapabilityRegistry:
             if mutating:
                 return self._d(name, "browser.mutate", "communication", "write", True, False, "high", ("browser", "web"), "screen_state", 3)
             return self._d(name, "research.web", "research", "read", False, True, "low", ("web",), "sources", 3)
+        if any(word in lowered for word in ("email", "gmail", "message", "slack", "teams", "outlook")):
+            if self._looks_read_only_tool(lowered):
+                return self._d(name, "communication.read", "communication", "read", False, True, "medium", ("communications",), "result", 1)
+            return self._d(name, "communication.send", "communication", "write", True, False, "high", ("communications",), "provider_readback", 2, True)
         if lowered in {"google_search", "tavily_search"} or lowered.startswith("search"):
             return self._d(name, "research.web", "research", "read", False, True, "low", ("web",), "sources", 2)
         if lowered in {"add_task", "queue_night_task", "schedule_task_at"} or "reminder" in lowered:
@@ -94,10 +98,6 @@ class CapabilityRegistry:
             return self._d(name, "assistance.calendar.read", "personal_assistance", "read", False, True, "low", ("calendar",), "result", 1)
         if lowered in {"schedule_meeting", "create_event", "update_event", "delete_event"} or "calendar" in lowered:
             return self._d(name, "communication.calendar.write", "communication", "write", True, lowered.startswith("delete") is False, "high", ("calendar",), "provider_readback", 2, True)
-        if any(word in lowered for word in ("email", "gmail", "message", "slack", "teams", "outlook")):
-            if self._looks_read_only_tool(lowered):
-                return self._d(name, "communication.read", "communication", "read", False, True, "medium", ("communications",), "result", 1)
-            return self._d(name, "communication.send", "communication", "write", True, False, "high", ("communications",), "provider_readback", 2, True)
         if lowered == "powershell_terminal" or any(word in lowered for word in ("terminal", "shell", "command")):
             return self._d(name, "system.shell", "system_operations", "write", True, False, "critical", ("filesystem", "processes"), "explicit", 4)
         if "transaction" in lowered or "finance" in lowered or "payment" in lowered:

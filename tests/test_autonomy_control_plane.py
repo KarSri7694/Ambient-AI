@@ -328,6 +328,112 @@ def test_visual_perception_completes_capture_before_judgment(tmp_path):
     assert json.loads(downstream.payload_json)["analysis_model"] == "fast-vlm"
 
 
+def test_visual_observations_batch_until_configured_size(tmp_path):
+    store = SQLiteAutonomyAdapter(str(tmp_path / "autonomy.db"))
+    coordinator = AutonomyCoordinatorService(
+        store=store,
+        judgment=_CapturingJudgment(),
+        policy=CapabilityPolicyService(store=store),
+        mode="shadow",
+        visual_context_batch_size=3,
+        visual_context_batch_max_wait_seconds=60,
+    )
+    now = datetime.now(timezone.utc).isoformat()
+    for index in range(2):
+        observation = VisualObservation(
+            observation_id=f"obs-{index}",
+            screenshot_path=f"capture://{index}",
+            created_at=now,
+            app_name="Browser",
+            summary=f"Screen {index}",
+            detailed_description="A useful page is visible.",
+            inferred_user_activity="Researching",
+            confidence=0.7,
+            raw_payload_json=json.dumps({"salience": "medium"}),
+            analysis_model="fast-vlm",
+        )
+        event = coordinator._enqueue_visual_batch_or_single(observation, {})
+        assert event.event_type == "visual_context_batch_pending"
+
+    assert store.claim_next_event(event_types=["visual_context_batch_changed"]) is None
+
+    observation = VisualObservation(
+        observation_id="obs-2",
+        screenshot_path="capture://2",
+        created_at=now,
+        app_name="Browser",
+        summary="Screen 2",
+        detailed_description="A useful page is visible.",
+        inferred_user_activity="Researching",
+        confidence=0.7,
+        raw_payload_json=json.dumps({"salience": "medium"}),
+        analysis_model="fast-vlm",
+    )
+    event = coordinator._enqueue_visual_batch_or_single(observation, {})
+
+    assert event.event_type == "visual_context_batch_changed"
+    payload = json.loads(event.payload_json)
+    assert payload["flush_reason"] == "size"
+    assert payload["observation_ids"] == ["obs-0", "obs-1", "obs-2"]
+
+
+def test_visual_batch_timeout_is_processed_as_batch_event(tmp_path):
+    store = SQLiteAutonomyAdapter(str(tmp_path / "autonomy.db"))
+    coordinator = AutonomyCoordinatorService(
+        store=store,
+        judgment=_CapturingJudgment(),
+        policy=CapabilityPolicyService(store=store),
+        mode="shadow",
+        visual_context_batch_size=5,
+        visual_context_batch_max_wait_seconds=60,
+    )
+    old = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
+    observation = VisualObservation(
+        observation_id="old-obs",
+        screenshot_path="capture://old",
+        created_at=old,
+        app_name="Browser",
+        summary="Old screen",
+        confidence=0.7,
+        raw_payload_json=json.dumps({"salience": "medium"}),
+        analysis_model="fast-vlm",
+    )
+    event = coordinator._enqueue_visual_batch_or_single(observation, {})
+
+    result = asyncio.run(
+        coordinator.process_next(model="model", llm_service=None, personalization_context="")
+    )
+
+    assert result["event_type"] == "visual_context_batch_changed"
+    assert result["processed"] is True
+
+
+def test_high_salience_visual_flushes_batch_immediately(tmp_path):
+    store = SQLiteAutonomyAdapter(str(tmp_path / "autonomy.db"))
+    coordinator = AutonomyCoordinatorService(
+        store=store,
+        judgment=_CapturingJudgment(),
+        policy=CapabilityPolicyService(store=store),
+        mode="shadow",
+        visual_context_batch_size=5,
+        visual_context_batch_flush_high_salience=True,
+    )
+    observation = VisualObservation(
+        observation_id="urgent-obs",
+        screenshot_path="capture://urgent",
+        created_at=datetime.now(timezone.utc).isoformat(),
+        app_name="Browser",
+        summary="Urgent deadline visible",
+        confidence=0.8,
+        raw_payload_json=json.dumps({"salience": "high"}),
+        analysis_model="fast-vlm",
+    )
+    event = coordinator._enqueue_visual_batch_or_single(observation, {})
+
+    assert event.event_type == "visual_context_batch_changed"
+    assert json.loads(event.payload_json)["flush_reason"] == "high_salience"
+
+
 def test_high_salience_visual_is_deep_enriched_asynchronously(tmp_path):
     store = SQLiteAutonomyAdapter(str(tmp_path / "autonomy.db"))
     capture_store = PlainCaptureStore(str(tmp_path / "captures"))

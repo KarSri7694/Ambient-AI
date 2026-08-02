@@ -1,3 +1,4 @@
+import hashlib
 import json
 import sqlite3
 import threading
@@ -37,6 +38,17 @@ def _normalize_utciso(value: str | None, *, fallback: str | None = None) -> str 
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc).isoformat()
+
+
+def _parse_utc(value: str | None, *, fallback: datetime | None = None) -> datetime:
+    normalized = _normalize_utciso(value, fallback=_utciso(fallback or _utcnow()))
+    try:
+        parsed = datetime.fromisoformat(str(normalized).replace("Z", "+00:00"))
+    except ValueError:
+        return fallback or _utcnow()
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 class SQLiteAutonomyAdapter(AutonomyStorePort):
@@ -386,6 +398,148 @@ class SQLiteAutonomyAdapter(AutonomyStorePort):
                     [_utciso(), *stale],
                 )
         return len(stale)
+
+    def append_visual_context_to_batch(
+        self,
+        *,
+        observation: dict[str, Any],
+        batch_size: int = 5,
+        max_wait_seconds: int = 60,
+        flush_now: bool = False,
+        flush_reason: str = "",
+    ) -> AmbientEvent:
+        now = _utcnow()
+        now_iso = _utciso(now)
+        safe_batch_size = max(1, int(batch_size))
+        safe_max_wait = max(1, int(max_wait_seconds))
+        obs_id = str(observation.get("observation_id") or "").strip()
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """SELECT * FROM ambient_events
+                   WHERE event_type='visual_context_batch_pending'
+                     AND status IN ('pending', 'resource_deferred')
+                   ORDER BY julianday(occurred_at) ASC, rowid ASC
+                   LIMIT 1"""
+            ).fetchone()
+            if row is None:
+                batch_id = uuid.uuid4().hex
+                first_at = str(observation.get("captured_at") or now_iso)
+                flush_after_dt = _parse_utc(first_at, fallback=now) + timedelta(seconds=safe_max_wait)
+                flush_after = _utciso(flush_after_dt)
+                observations = [observation]
+                payload = {
+                    "batch_id": batch_id,
+                    "observation_ids": [obs_id] if obs_id else [],
+                    "observations": observations,
+                    "first_captured_at": first_at,
+                    "last_captured_at": first_at,
+                    "batch_size": safe_batch_size,
+                    "max_wait_seconds": safe_max_wait,
+                    "flush_after": flush_after,
+                    "flush_reason": "",
+                }
+                event_type = "visual_context_batch_pending"
+                available_at = flush_after
+                priority = 0.62
+                if flush_now or len(observations) >= safe_batch_size:
+                    event_type = "visual_context_batch_changed"
+                    available_at = now_iso
+                    payload["flush_reason"] = flush_reason or ("high_salience" if flush_now else "size")
+                    priority = 0.72
+                event = AmbientEvent(
+                    event_id=batch_id,
+                    event_type=event_type,
+                    source_kind="passive_observer_batch",
+                    source_ref=batch_id,
+                    occurred_at=first_at,
+                    payload_json=json.dumps(payload, ensure_ascii=False),
+                    confidence=float(observation.get("confidence") or 0.65),
+                    privacy_label="sensitive_visual",
+                    fingerprint=hashlib.sha256(
+                        json.dumps({"event_type": "visual_context_batch", "batch_id": batch_id}, sort_keys=True).encode("utf-8")
+                    ).hexdigest(),
+                    status="pending",
+                    priority=priority,
+                    available_at=available_at,
+                )
+                conn.execute(
+                    """
+                    INSERT INTO ambient_events (
+                        event_id, event_type, source_kind, source_ref, occurred_at,
+                        payload_json, confidence, privacy_label, fingerprint, status,
+                        priority, attempt_count, available_at, leased_at,
+                        lease_expires_at, processed_at, error_text
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event.event_id, event.event_type, event.source_kind, event.source_ref,
+                        _normalize_utciso(event.occurred_at), event.payload_json, event.confidence,
+                        event.privacy_label, event.fingerprint, event.status, event.priority,
+                        event.attempt_count, _normalize_utciso(event.available_at),
+                        None, None, None, None,
+                    ),
+                )
+                stored = conn.execute("SELECT * FROM ambient_events WHERE event_id=?", (batch_id,)).fetchone()
+                conn.commit()
+                return self._event_from_row(stored)
+
+            payload = json.loads(row["payload_json"] or "{}")
+            observations = payload.get("observations")
+            observations = observations if isinstance(observations, list) else []
+            existing_ids = {
+                str(item.get("observation_id") or "")
+                for item in observations
+                if isinstance(item, dict)
+            }
+            if not obs_id or obs_id not in existing_ids:
+                observations.append(observation)
+            observation_ids = [
+                str(item.get("observation_id") or "").strip()
+                for item in observations
+                if isinstance(item, dict) and str(item.get("observation_id") or "").strip()
+            ]
+            first_at = str(payload.get("first_captured_at") or row["occurred_at"] or now_iso)
+            last_at = str(observation.get("captured_at") or payload.get("last_captured_at") or now_iso)
+            flush_after = str(payload.get("flush_after") or row["available_at"] or now_iso)
+            should_flush = flush_now or len(observations) >= safe_batch_size or now >= _parse_utc(flush_after, fallback=now)
+            reason = (
+                flush_reason
+                or ("high_salience" if flush_now else "size" if len(observations) >= safe_batch_size else "timeout")
+            )
+            payload.update(
+                {
+                    "observation_ids": observation_ids,
+                    "observations": observations,
+                    "first_captured_at": first_at,
+                    "last_captured_at": last_at,
+                    "batch_size": safe_batch_size,
+                    "max_wait_seconds": safe_max_wait,
+                    "flush_after": flush_after,
+                    "flush_reason": reason if should_flush else "",
+                }
+            )
+            event_type = "visual_context_batch_changed" if should_flush else "visual_context_batch_pending"
+            available_at = now_iso if should_flush else flush_after
+            priority = 0.72 if should_flush else max(float(row["priority"] or 0.62), float(observation.get("confidence") or 0.62))
+            conn.execute(
+                """UPDATE ambient_events
+                   SET event_type=?, payload_json=?, confidence=MAX(confidence, ?),
+                       priority=?, available_at=?, leased_at=NULL, lease_expires_at=NULL,
+                       status='pending'
+                   WHERE event_id=?""",
+                (
+                    event_type,
+                    json.dumps(payload, ensure_ascii=False),
+                    float(observation.get("confidence") or 0.65),
+                    priority,
+                    _normalize_utciso(available_at),
+                    row["event_id"],
+                ),
+            )
+            stored = conn.execute("SELECT * FROM ambient_events WHERE event_id=?", (row["event_id"],)).fetchone()
+            conn.commit()
+        return self._event_from_row(stored)
 
     def claim_next_event(
         self,

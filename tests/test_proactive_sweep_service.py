@@ -28,10 +28,15 @@ def _tool(name: str) -> dict:
 class _LlmService:
     def __init__(self):
         self.allowed_tool_names = None
+        self.user_input = ""
+        self.run_kwargs = {}
+        self.computer_enabled = True
+        self.computer_calls = []
 
     def available_tool_definitions(self):
         return [
             _tool("gmail_search"),
+            _tool("search_gmail_messages"),
             _tool("gmail_send"),
             _tool("calendar_list_events"),
             _tool("calendar_create_event"),
@@ -42,7 +47,9 @@ class _LlmService:
         return None
 
     async def run_interaction(self, **kwargs):
+        self.run_kwargs = dict(kwargs)
         self.allowed_tool_names = set(kwargs["allowed_tool_names"])
+        self.user_input = kwargs["user_input"]
         return json.dumps(
             {
                 "findings": [
@@ -60,6 +67,10 @@ class _LlmService:
                 ]
             }
         )
+
+    async def deploy_computer_agent(self, **kwargs):
+        self.computer_calls.append(dict(kwargs))
+        return "visible WhatsApp messages inspected"
 
 
 class _Memory:
@@ -106,6 +117,7 @@ def test_proactive_sweep_filters_read_tools_and_surfaces_finding(tmp_path):
     assert result["ran"] is True
     assert result["created_findings"] == 1
     assert "gmail_search" in llm_service.allowed_tool_names
+    assert "search_gmail_messages" in llm_service.allowed_tool_names
     assert "gmail_send" not in llm_service.allowed_tool_names
     inbox = store.list_inbox_items()
     assert len(inbox) == 1
@@ -115,6 +127,91 @@ def test_proactive_sweep_filters_read_tools_and_surfaces_finding(tmp_path):
     assert memory.observations[0].biodata_sent_at is None
     assert memory.observations[0].followup_sent_at
     assert "Important email needs review" in memory.observations[0].summary
+
+
+def test_proactive_sweep_injects_configured_gmail_email(tmp_path):
+    store = SQLiteAutonomyAdapter(str(tmp_path / "autonomy.db"))
+    llm_service = _LlmService()
+    service = ProactiveSweepService(
+        autonomy_store=store,
+        llm_service=llm_service,
+        capability_policy=CapabilityPolicyService(store=store),
+        model="model",
+        enabled=True,
+        global_grant=True,
+        enabled_sources=["gmail"],
+        user_google_email="user@example.com",
+    )
+
+    asyncio.run(service.run_if_due())
+
+    assert "Configured Gmail account: user@example.com" in llm_service.user_input
+    assert "Use this exact value for every Gmail tool argument named user_google_email" in llm_service.user_input
+
+
+def test_proactive_sweep_uses_json_final_turn_recovery(tmp_path):
+    store = SQLiteAutonomyAdapter(str(tmp_path / "autonomy.db"))
+    llm_service = _LlmService()
+    service = ProactiveSweepService(
+        autonomy_store=store,
+        llm_service=llm_service,
+        capability_policy=CapabilityPolicyService(store=store),
+        model="model",
+        enabled=True,
+        global_grant=True,
+        enabled_sources=["gmail"],
+        max_tool_iterations=7,
+    )
+
+    asyncio.run(service.run_if_due())
+
+    assert llm_service.run_kwargs["max_iterations"] == 7
+    assert llm_service.run_kwargs["turn_status_instructions"] is True
+    assert llm_service.run_kwargs["final_turn_response_format"] == "json"
+    assert llm_service.run_kwargs["disable_tools_on_final_turn"] is True
+
+
+def test_proactive_whatsapp_skips_computer_use_when_user_active(tmp_path):
+    store = SQLiteAutonomyAdapter(str(tmp_path / "autonomy.db"))
+    llm_service = _LlmService()
+    service = ProactiveSweepService(
+        autonomy_store=store,
+        llm_service=llm_service,
+        capability_policy=CapabilityPolicyService(store=store),
+        model="model",
+        enabled=True,
+        global_grant=True,
+        enabled_sources=["whatsapp"],
+        user_idle_checker=lambda: False,
+    )
+
+    result = asyncio.run(service.run_if_due())
+
+    assert result["ran"] is True
+    assert result["created_findings"] == 0
+    assert llm_service.computer_calls == []
+
+
+def test_proactive_whatsapp_can_use_computer_when_user_idle(tmp_path):
+    store = SQLiteAutonomyAdapter(str(tmp_path / "autonomy.db"))
+    llm_service = _LlmService()
+    service = ProactiveSweepService(
+        autonomy_store=store,
+        llm_service=llm_service,
+        capability_policy=CapabilityPolicyService(store=store),
+        model="model",
+        enabled=True,
+        global_grant=True,
+        enabled_sources=["whatsapp"],
+        user_idle_checker=lambda: True,
+    )
+
+    result = asyncio.run(service.run_if_due())
+
+    assert result["ran"] is True
+    assert result["created_findings"] == 1
+    assert llm_service.computer_calls
+    assert llm_service.computer_calls[0]["read_only"] is True
 
 
 def test_proactive_sweep_prompt_allows_multi_turn_tool_exploration():
@@ -129,10 +226,14 @@ def test_proactive_sweep_prompt_allows_multi_turn_tool_exploration():
 def test_proactive_gmail_task_explains_search_then_batch_workflow():
     task = ProactiveSweepService.SOURCE_TASKS["gmail"]
 
+    assert "is:unread" in task
+    assert "important or urgent" in task
+    assert "require the user to reply" in task
     assert "first call search_gmail_messages" in task
     assert "get_gmail_messages_content_batch" in task
     assert "Never call get_gmail_messages_content_batch with an empty" in task
     assert "never use 'me' as a message_id" in task
+    assert "draft reply" in task
 
 
 def test_proactive_inbox_lists_newest_created_items_first(tmp_path):

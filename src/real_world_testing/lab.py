@@ -34,6 +34,7 @@ MODEL_ROLE_NAMES = (
     "passive_observer_model", "full_passive_observer_model", "passive_followup_model",
     "user_biodata_model", "followup_execution_model", "reflection_model",
     "transcript_processing_model", "reporter_model", "browser_agent_model",
+    "computer_agent_model",
 )
 
 
@@ -267,8 +268,46 @@ class RealWorldLab:
         inline = payload.get("inline_scenario")
         if isinstance(inline, dict):
             modality = str(inline.get("modality") or "")
-            if modality not in {"image_sequence", "audio_sequence"}:
-                raise ValueError("inline_scenario modality must be image_sequence or audio_sequence")
+            if modality not in {"image_sequence", "audio_sequence", "agent_task_sequence"}:
+                raise ValueError("inline_scenario modality must be image_sequence, audio_sequence, or agent_task_sequence")
+            if modality == "agent_task_sequence":
+                from real_world_testing.case_loader import AgentTaskInput
+                tasks = []
+                for index, item in enumerate(inline.get("tasks", []), start=1):
+                    agent_kind = str(item.get("agent_kind") or "").strip().lower()
+                    if agent_kind not in {"browser", "computer"}:
+                        raise ValueError("Inline agent task agent_kind must be browser or computer")
+                    instruction = str(item.get("instruction") or "").strip()
+                    if not instruction:
+                        raise ValueError("Inline agent task requires instruction")
+                    tasks.append(AgentTaskInput(
+                        task_id=str(item.get("task_id") or f"task_{index}").strip() or f"task_{index}",
+                        agent_kind=agent_kind,
+                        title=str(item.get("title") or f"{agent_kind.title()} task {index}").strip(),
+                        instruction=instruction,
+                        start_url=str(item.get("start_url") or "").strip(),
+                        read_only=bool(item.get("read_only", True)),
+                        max_steps=int(item["max_steps"]) if item.get("max_steps") is not None else None,
+                        timeout_seconds=float(item["timeout_seconds"]) if item.get("timeout_seconds") is not None else None,
+                        success_criteria=str(item.get("success_criteria") or "").strip(),
+                        rubric_notes=str(item.get("rubric_notes") or "").strip(),
+                    ))
+                if not tasks:
+                    raise ValueError("Inline agent task scenario requires at least one task")
+                scenario = RealWorldScenario(
+                    scenario_id=f"ui_agent_{uuid.uuid4().hex[:12]}",
+                    title=str(inline.get("title") or "Uploaded agent task scenario"),
+                    modality=modality,
+                    events=[],
+                    tasks=tasks,
+                    rubric_notes=str(inline.get("rubric_notes") or ""),
+                    source_path="ui-agent-task",
+                )
+                suite = RealWorldSuite(
+                    schema_version=1, suite_id="ui-agent-task", title="UI agent tasks", description="",
+                    scenarios=[scenario], source_path="ui-agent-task",
+                )
+                return suite, [scenario]
             expected_kind = "image" if modality == "image_sequence" else "audio"
             events: list[ScheduledMediaInput] = []
             previous_offset = -1.0
@@ -408,6 +447,8 @@ class ProductionScenarioExecutor:
         from infrastructure.adapter.MCPToolAdapter import MCPToolAdapter
         from infrastructure.adapter.SQLiteAutonomyAdapter import SQLiteAutonomyAdapter
         from infrastructure.adapter.SQLiteMemoryAdapter import SQLiteMemoryAdapter
+        from infrastructure.adapter.FaraVisualBrowserAdapter import FaraVisualBrowserAdapter
+        from infrastructure.adapter.BrowserMCPToolAdapter import BrowserMCPToolAdapter
         from infrastructure.adapter.llamaCppAdapter import LlamaCppAdapter
         from infrastructure.plain_capture_store import PlainCaptureStore
         from real_world_testing.tracing_provider import RealWorldTracingLLMProvider
@@ -499,9 +540,45 @@ class ProductionScenarioExecutor:
         if not mcp_path.is_absolute():
             mcp_path = self.project_root / mcp_path
         await tools.start_servers(str(mcp_path))
+        browser_backend = parser.get("browser", "backend", fallback="fara_visual").strip().lower()
+        if browser_backend == "fara_visual":
+            browser_tool_bridge = FaraVisualBrowserAdapter(
+                llm_provider=llm,
+                profile_dir=str(self.workspace / "browser-profile"),
+                screenshot_dir=str(self.workspace / "browser-screenshots"),
+                viewport_width=parser.getint("browser", "viewport_width", fallback=1440),
+                viewport_height=parser.getint("browser", "viewport_height", fallback=900),
+                max_steps=parser.getint("browser", "max_steps", fallback=100),
+                settle_ms=parser.getint("browser", "settle_ms", fallback=700),
+                search_url_template=parser.get(
+                    "browser", "search_url_template", fallback="https://duckduckgo.com/?q={query}"
+                ),
+                browser_channel=parser.get("browser", "channel", fallback=""),
+                browser_executable_path=parser.get("browser", "executable_path", fallback=""),
+                screenshot_retention=parser.getboolean("browser", "retain_screenshots", fallback=True),
+                agent_family=parser.get("browser", "agent_family", fallback="fara"),
+            )
+        elif browser_backend == "playwright_mcp":
+            browser_tool_bridge = BrowserMCPToolAdapter(
+                config_path=str(mcp_path),
+                server_name=parser.get("browser", "server_name", fallback="playwright"),
+                profile_dir=str(self.workspace / "browser-profile"),
+                denied_tool_names=json.loads(parser.get("browser", "denied_tools_json", fallback="[]") or "[]"),
+            )
+        else:
+            browser_tool_bridge = None
         service = LLMInteractionService(
             llm_provider=llm, tool_bridge=tools,
+            browser_tool_bridge=browser_tool_bridge,
             browser_agent_model=self.model_roles.get("browser_agent_model"),
+            browser_task_timeout_seconds=parser.getfloat("browser", "task_timeout_seconds", fallback=900.0),
+            browser_headless=parser.getboolean("browser", "headless", fallback=False),
+            computer_agent_model=self.model_roles.get("computer_agent_model") or self.model_roles.get("browser_agent_model"),
+            computer_agent_family=parser.get("computer", "agent_family", fallback="gemma"),
+            computer_task_timeout_seconds=parser.getfloat("computer", "task_timeout_seconds", fallback=180.0),
+            computer_max_actions_per_task=parser.getint("computer", "max_actions_per_task", fallback=40),
+            computer_screenshot_dir=str(self.workspace / "computer-screenshots"),
+            computer_enabled=parser.getboolean("computer", "enabled", fallback=False),
             reporter_model=self.model_roles.get("reporter_model"),
             artifact_root=str(self.workspace / "artifacts"), capability_policy=policy,
             artifact_organizer_enabled=parser.getboolean("artifacts", "organizer_enabled", fallback=True),
@@ -575,7 +652,87 @@ class ProductionScenarioExecutor:
             "future_actions": [],
         }
         try:
-            if scenario.modality == "image_sequence":
+            if scenario.modality == "agent_task_sequence":
+                task_results: list[dict[str, Any]] = []
+                for task_index, task in enumerate(scenario.tasks):
+                    if self.should_cancel():
+                        raise RunCancelled("Run cancelled before next agent task")
+                    model = (
+                        self.model_roles.get("browser_agent_model")
+                        if task.agent_kind == "browser"
+                        else self.model_roles.get("computer_agent_model") or self.model_roles.get("browser_agent_model")
+                    )
+                    task_prompt = self._agent_task_prompt(task)
+                    self.emit(
+                        "agent_task",
+                        "agent_task_started",
+                        {
+                            "index": task_index,
+                            "task": asdict(task),
+                            "model": model,
+                        },
+                        model=model,
+                        status="running",
+                    )
+
+                    def emit_step(event: dict[str, Any], *, _task=task) -> None:
+                        self.emit(
+                            "agent_task",
+                            str(event.get("type") or "agent_task_step"),
+                            {"task_id": _task.task_id, **event},
+                            model=model,
+                        )
+
+                    started_task = time.monotonic()
+                    await llm.load_model(model)
+                    original_browser_timeout = service.browser_task_timeout_seconds
+                    original_computer_timeout = service.computer_task_timeout_seconds
+                    original_computer_actions = service.computer_max_actions_per_task
+                    try:
+                        if task.timeout_seconds is not None:
+                            if task.agent_kind == "browser":
+                                service.browser_task_timeout_seconds = task.timeout_seconds
+                            else:
+                                service.computer_task_timeout_seconds = task.timeout_seconds
+                        if task.max_steps is not None and task.agent_kind == "computer":
+                            service.computer_max_actions_per_task = task.max_steps
+                        if task.agent_kind == "browser":
+                            response = await service.deploy_browser_agent(
+                                task=task_prompt,
+                                approval_id=f"real_world_browser_{task.task_id}",
+                                event_callback=emit_step,
+                            )
+                        else:
+                            response = await service.deploy_computer_agent(
+                                task=task_prompt,
+                                approval_id=f"real_world_computer_{task.task_id}",
+                                read_only=task.read_only,
+                                event_callback=emit_step,
+                            )
+                    finally:
+                        service.browser_task_timeout_seconds = original_browser_timeout
+                        service.computer_task_timeout_seconds = original_computer_timeout
+                        service.computer_max_actions_per_task = original_computer_actions
+                    elapsed_ms = int((time.monotonic() - started_task) * 1000)
+                    task_result = {
+                        "task_id": task.task_id,
+                        "agent_kind": task.agent_kind,
+                        "title": task.title,
+                        "status": "completed",
+                        "response": response,
+                        "duration_ms": elapsed_ms,
+                    }
+                    task_results.append(task_result)
+                    self.emit(
+                        "agent_task",
+                        "agent_task_completed",
+                        task_result,
+                        model=model,
+                        duration_ms=elapsed_ms,
+                    )
+                final_response = json.dumps(task_results, ensure_ascii=False, indent=2)
+                autonomy_results.extend(task_results)
+            elif scenario.modality == "image_sequence":
                 from application.services.passive_observer_service import PassiveObserverService
                 from application.services.screenshot_queue_service import ScreenshotQueueService
                 capture = _StaticScreenCapture()
@@ -750,7 +907,17 @@ class ProductionScenarioExecutor:
                     autonomy_results.append(result)
                     self.emit("autonomy", "autonomy_result", result)
 
-            if scenario.modality == "image_sequence":
+            if scenario.modality == "agent_task_sequence":
+                proactive_result = {
+                    "enabled": False,
+                    "reason": "agent_task_sequence_does_not_run_passive_tail",
+                    "semantic": {},
+                    "biodata": {},
+                    "reflection": {},
+                    "semantic_dedupe": {},
+                    "future_actions": [],
+                }
+            elif scenario.modality == "image_sequence":
                 proactive_result = await self._run_replay_idle_cycles(
                     parser=parser,
                     memory=memory,
@@ -806,11 +973,33 @@ class ProductionScenarioExecutor:
             "final_response": final_response or None,
             "summary": {
                 "event_count": len(scenario.events),
+                "task_count": len(scenario.tasks),
                 "modality": scenario.modality,
                 "autonomy_results": autonomy_results,
                 "proactive_loop": proactive_result,
             },
         }
+
+    def _agent_task_prompt(self, task) -> str:
+        parts = [
+            task.instruction.strip(),
+            "",
+            "Real-world test constraints:",
+            f"- Agent kind: {task.agent_kind}",
+            f"- Read-only mode: {'yes' if task.read_only else 'no'}",
+        ]
+        if task.start_url:
+            parts.append(f"- Start by opening this URL if not already there: {task.start_url}")
+        if task.success_criteria:
+            parts.append(f"- Success criteria: {task.success_criteria}")
+        if task.max_steps is not None:
+            parts.append(f"- Maximum action steps: {task.max_steps}")
+        if task.timeout_seconds is not None:
+            parts.append(f"- Timeout seconds: {task.timeout_seconds}")
+        if task.rubric_notes:
+            parts.append(f"- Evaluation notes: {task.rubric_notes}")
+        parts.append("- Stop before login, payment, sending messages, downloading files, or destructive actions unless explicitly requested in this task.")
+        return "\n".join(parts)
 
     def _screen_context_for_replay(self, screen_context: dict[str, Any] | None) -> dict[str, Any]:
         """Normalize manifest context to the lightweight UIAT payload used by app.py."""

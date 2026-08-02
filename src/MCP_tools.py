@@ -13,7 +13,6 @@ import datetime
 import uuid
 from google import genai
 from typing import Annotated
-import serpapi
 import night_mode
 from utils.threading_util import run_async
 import yt_dlp
@@ -31,7 +30,6 @@ mcp = FastMCP("My MCP Server")
 
 TODOIST_API_TOKEN = os.environ.get("TODOIST_API_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-SERPAPI_API_KEY = os.environ.get("SERPAPI_API_KEY")
 DDGS_PROXY = os.environ.get("DDGS_PROXY")
 DDGS_TIMEOUT_SECONDS = CONFIG.get_float("web_search", "ddgs_timeout_seconds", 10.0)
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
@@ -352,24 +350,6 @@ def schedule_meeting(title: Annotated[str, "Title of the meeting"] = None,
 @mcp.tool
 def add(a: int, b: int) -> int:
     return a + b
-
-@mcp.tool
-def google_search(query: Annotated[str, "The google search query"], 
-               num_results: Annotated[int, "Number of top results to return"] = 5) -> str:
-    """
-    Search the web using Google Search and return the top results.
-    """
-    params = {
-        "engine": "google",
-        "q": query,
-        "api_key": SERPAPI_API_KEY
-    }
-    
-    search = serpapi.search(params)
-    
-    organic_results = search['organic_results']
-    return organic_results
-
 
 @mcp.tool
 def search_web_ddgs(

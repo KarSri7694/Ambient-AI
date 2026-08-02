@@ -19,11 +19,26 @@ class ScheduledMediaInput:
 
 
 @dataclass(frozen=True)
+class AgentTaskInput:
+    task_id: str
+    agent_kind: str
+    title: str
+    instruction: str
+    start_url: str = ""
+    read_only: bool = True
+    max_steps: int | None = None
+    timeout_seconds: float | None = None
+    success_criteria: str = ""
+    rubric_notes: str = ""
+
+
+@dataclass(frozen=True)
 class RealWorldScenario:
     scenario_id: str
     title: str
     modality: str
     events: list[ScheduledMediaInput]
+    tasks: list[AgentTaskInput] = field(default_factory=list)
     rubric_notes: str = ""
     seed: dict[str, Any] = field(default_factory=dict)
     source_path: str = ""
@@ -75,33 +90,62 @@ def suite_to_dict(suite: RealWorldSuite) -> dict[str, Any]:
 def _parse_scenario(payload: dict[str, Any], suite_path: Path) -> RealWorldScenario:
     scenario_id = _identifier(payload.get("scenario_id"), "scenario_id", suite_path)
     modality = str(payload.get("modality") or "").strip()
-    if modality not in {"image_sequence", "audio_sequence"}:
+    if modality not in {"image_sequence", "audio_sequence", "agent_task_sequence"}:
         raise ValueError(f"{suite_path}: {scenario_id} has unsupported modality {modality!r}")
     events: list[ScheduledMediaInput] = []
-    previous_offset = -1.0
-    for index, item in enumerate(payload.get("events", []), start=1):
-        offset = float(item.get("offset_seconds", 0))
-        if offset < 0 or offset < previous_offset:
-            raise ValueError(f"{suite_path}: {scenario_id} event offsets must be non-negative and monotonic")
-        previous_offset = offset
-        raw_path = str(item.get("media_path") or "").strip()
-        if not raw_path:
-            raise ValueError(f"{suite_path}: {scenario_id} event {index} is missing media_path")
-        resolved = Path(raw_path).expanduser()
-        if not resolved.is_absolute():
-            resolved = (suite_path.parent / resolved).resolve()
-        suffixes = IMAGE_SUFFIXES if modality == "image_sequence" else AUDIO_SUFFIXES
-        if resolved.suffix.lower() not in suffixes:
-            raise ValueError(f"{suite_path}: unsupported {modality} media type: {resolved.suffix}")
-        events.append(
-            ScheduledMediaInput(
-                offset_seconds=offset,
-                media_path=str(resolved),
-                captured_at=str(item.get("captured_at") or "").strip() or None,
-                screen_context=dict(item.get("screen_context") or {}),
+    tasks: list[AgentTaskInput] = []
+    if modality in {"image_sequence", "audio_sequence"}:
+        previous_offset = -1.0
+        for index, item in enumerate(payload.get("events", []), start=1):
+            offset = float(item.get("offset_seconds", 0))
+            if offset < 0 or offset < previous_offset:
+                raise ValueError(f"{suite_path}: {scenario_id} event offsets must be non-negative and monotonic")
+            previous_offset = offset
+            raw_path = str(item.get("media_path") or "").strip()
+            if not raw_path:
+                raise ValueError(f"{suite_path}: {scenario_id} event {index} is missing media_path")
+            resolved = Path(raw_path).expanduser()
+            if not resolved.is_absolute():
+                resolved = (suite_path.parent / resolved).resolve()
+            suffixes = IMAGE_SUFFIXES if modality == "image_sequence" else AUDIO_SUFFIXES
+            if resolved.suffix.lower() not in suffixes:
+                raise ValueError(f"{suite_path}: unsupported {modality} media type: {resolved.suffix}")
+            events.append(
+                ScheduledMediaInput(
+                    offset_seconds=offset,
+                    media_path=str(resolved),
+                    captured_at=str(item.get("captured_at") or "").strip() or None,
+                    screen_context=dict(item.get("screen_context") or {}),
+                )
             )
-        )
-    if not events:
+        if not events:
+            raise ValueError(f"{suite_path}: {scenario_id} requires at least one event")
+    else:
+        for index, item in enumerate(payload.get("tasks", []), start=1):
+            task_id = _identifier(item.get("task_id") or f"task_{index}", "task_id", suite_path)
+            agent_kind = str(item.get("agent_kind") or "").strip().lower()
+            if agent_kind not in {"browser", "computer"}:
+                raise ValueError(f"{suite_path}: {scenario_id} task {task_id} has unsupported agent_kind {agent_kind!r}")
+            instruction = str(item.get("instruction") or "").strip()
+            if not instruction:
+                raise ValueError(f"{suite_path}: {scenario_id} task {task_id} is missing instruction")
+            tasks.append(
+                AgentTaskInput(
+                    task_id=task_id,
+                    agent_kind=agent_kind,
+                    title=str(item.get("title") or task_id).strip(),
+                    instruction=instruction,
+                    start_url=str(item.get("start_url") or "").strip(),
+                    read_only=bool(item.get("read_only", True)),
+                    max_steps=int(item["max_steps"]) if item.get("max_steps") is not None else None,
+                    timeout_seconds=float(item["timeout_seconds"]) if item.get("timeout_seconds") is not None else None,
+                    success_criteria=str(item.get("success_criteria") or "").strip(),
+                    rubric_notes=str(item.get("rubric_notes") or "").strip(),
+                )
+            )
+        if not tasks:
+            raise ValueError(f"{suite_path}: {scenario_id} requires at least one agent task")
+    if modality in {"image_sequence", "audio_sequence"} and not events:
         raise ValueError(f"{suite_path}: {scenario_id} requires at least one event")
     seed = dict(payload.get("seed") or {})
     for key, value in list(seed.items()):
@@ -113,6 +157,7 @@ def _parse_scenario(payload: dict[str, Any], suite_path: Path) -> RealWorldScena
         title=str(payload.get("title") or scenario_id).strip(),
         modality=modality,
         events=events,
+        tasks=tasks,
         rubric_notes=str(payload.get("rubric_notes") or "").strip(),
         seed=seed,
         source_path=str(suite_path),

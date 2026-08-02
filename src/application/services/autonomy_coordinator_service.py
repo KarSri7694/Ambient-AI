@@ -64,6 +64,9 @@ Do not repeat an action already reported as performed.
         chat_event_broker: Optional[Any] = None,
         task_store: Optional[Any] = None,
         max_pending_visual_per_context: int = 2,
+        visual_context_batch_size: int = 1,
+        visual_context_batch_max_wait_seconds: int = 60,
+        visual_context_batch_flush_high_salience: bool = True,
         logger: logging.Logger | None = None,
     ):
         self.store = store
@@ -81,6 +84,9 @@ Do not repeat an action already reported as performed.
         self.chat_event_broker = chat_event_broker
         self.task_store = task_store
         self.max_pending_visual_per_context = max(1, int(max_pending_visual_per_context))
+        self.visual_context_batch_size = max(1, int(visual_context_batch_size))
+        self.visual_context_batch_max_wait_seconds = max(1, int(visual_context_batch_max_wait_seconds))
+        self.visual_context_batch_flush_high_salience = bool(visual_context_batch_flush_high_salience)
         self.logger = logger or logging.getLogger(self.__class__.__name__)
 
     def enqueue_visual_observation(self, observation: VisualObservation) -> AmbientEvent:
@@ -302,6 +308,8 @@ Do not repeat an action already reported as performed.
                     event,
                     fallback=personalization_context,
                 )
+            if event.event_type == "visual_context_batch_pending":
+                event = self._flush_pending_visual_batch(event)
             if event.event_type == "lightweight_visual_capture":
                 event = await self._enrich_lightweight_visual(
                     event,
@@ -337,6 +345,8 @@ Do not repeat an action already reported as performed.
                         "analysis_status": enriched_payload.get("analysis_status"),
                         "analysis_latency_ms": enriched_payload.get("analysis_latency_ms"),
                         "downstream_event_id": enriched_payload.get("downstream_event_id"),
+                        "batch_status": enriched_payload.get("batch_status"),
+                        "batch_flush_reason": enriched_payload.get("batch_flush_reason"),
                     }
                 )
             if event.event_type == "delegated_action_completed":
@@ -629,6 +639,16 @@ Do not repeat an action already reported as performed.
             event_types=["lightweight_visual_capture"],
         )
 
+    def _flush_pending_visual_batch(self, event: AmbientEvent) -> AmbientEvent:
+        payload = self._safe_json(event.payload_json)
+        payload["flush_reason"] = payload.get("flush_reason") or "timeout"
+        return replace(
+            event,
+            event_type="visual_context_batch_changed",
+            payload_json=json.dumps(payload, ensure_ascii=False),
+            priority=max(event.priority, 0.72),
+        )
+
     def event_counts(self) -> dict[str, int]:
         return dict(getattr(self.store, "event_counts", lambda: {})())
 
@@ -733,7 +753,7 @@ Do not repeat an action already reported as performed.
                 priority=0.78,
             )
         else:
-            downstream_event = self.enqueue_visual_observation(observation)
+            downstream_event = self._enqueue_visual_batch_or_single(observation, payload)
         enriched = {
             **payload,
             "observation_id": observation.observation_id,
@@ -749,11 +769,78 @@ Do not repeat an action already reported as performed.
             "analysis_model": observation.analysis_model,
             "needs_deep_analysis": observation.needs_deep_analysis,
             "downstream_event_id": downstream_event.event_id,
+            "batch_status": downstream_event.event_type,
+            "batch_flush_reason": self._safe_json(downstream_event.payload_json).get("flush_reason"),
         }
         return replace(
             event,
             payload_json=json.dumps(enriched, ensure_ascii=False),
             confidence=max(event.confidence, observation.confidence or 0.65),
+        )
+
+    def _enqueue_visual_batch_or_single(
+        self,
+        observation: VisualObservation,
+        source_payload: dict[str, Any],
+    ) -> AmbientEvent:
+        if self.visual_context_batch_size <= 1:
+            return self.enqueue_visual_observation(observation)
+        append_batch = getattr(self.store, "append_visual_context_to_batch", None)
+        if append_batch is None:
+            return self.enqueue_visual_observation(observation)
+        item = self._visual_batch_item(observation, source_payload)
+        flush_now = self.visual_context_batch_flush_high_salience and self._is_high_salience_visual(observation)
+        return append_batch(
+            observation=item,
+            batch_size=self.visual_context_batch_size,
+            max_wait_seconds=self.visual_context_batch_max_wait_seconds,
+            flush_now=flush_now,
+            flush_reason="high_salience" if flush_now else "",
+        )
+
+    def _visual_batch_item(
+        self,
+        observation: VisualObservation,
+        source_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        raw_payload = self._safe_json(observation.raw_payload_json)
+        return {
+            "observation_id": observation.observation_id,
+            "session_id": observation.session_id,
+            "app_name": observation.app_name,
+            "window_title": observation.window_title or source_payload.get("window_title"),
+            "page_title": observation.page_hint,
+            "summary": observation.summary,
+            "detailed_description": observation.detailed_description,
+            "activity": observation.inferred_user_activity,
+            "url": raw_payload.get("_uiat_url") or source_payload.get("url"),
+            "domain": raw_payload.get("_uiat_domain") or source_payload.get("domain"),
+            "possible_next_task": observation.possible_next_task,
+            "suggested_research_topics": observation.suggested_research_topics,
+            "captured_at": observation.created_at,
+            "analysis_status": observation.analysis_status,
+            "analysis_latency_ms": observation.analysis_latency_ms,
+            "analysis_model": observation.analysis_model,
+            "needs_deep_analysis": observation.needs_deep_analysis,
+            "confidence": observation.confidence,
+            "salient_entities": observation.salient_entities,
+        }
+
+    @staticmethod
+    def _is_high_salience_visual(observation: VisualObservation) -> bool:
+        raw = {}
+        try:
+            raw = json.loads(observation.raw_payload_json or "{}")
+            raw = raw if isinstance(raw, dict) else {}
+        except json.JSONDecodeError:
+            raw = {}
+        salience = str(raw.get("salience") or "").strip().lower()
+        return bool(
+            observation.needs_deep_analysis
+            or salience == "high"
+            or observation.possible_next_task
+            or observation.open_loops
+            or raw.get("maybe_require_a_reminder")
         )
 
     async def _process_deep_visual(
@@ -818,13 +905,14 @@ Do not repeat an action already reported as performed.
         updated = replace(updated, analysis_status=status, needs_deep_analysis=False)
         if memory is not None and hasattr(memory, "append_visual_observation"):
             memory.append_visual_observation(updated)
-        downstream = self.enqueue_visual_observation(updated)
+        downstream = self._enqueue_visual_batch_or_single(updated, payload)
         self.store.complete_event(event.event_id)
         return {
             "processed": True,
             "outcome": status,
             "observation_id": updated.observation_id,
             "downstream_event_id": downstream.event_id,
+            "batch_status": downstream.event_type,
         }
 
     def _allowed_tool_names(self, llm_service, confidence: float) -> set[str]:

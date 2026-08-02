@@ -87,6 +87,46 @@ mode = active
             with self.assertRaisesRegex(ValueError, "monotonic"):
                 load_suite(suites / "bad.json")
 
+    def test_manifest_accepts_agent_task_sequence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            suite_dir = root / "suites"
+            suite_dir.mkdir()
+            (suite_dir / "agents.json").write_text(json.dumps({
+                "schema_version": 1,
+                "suite_id": "agent_suite",
+                "title": "Agent suite",
+                "scenarios": [{
+                    "scenario_id": "browser_and_computer",
+                    "title": "Browser and computer tasks",
+                    "modality": "agent_task_sequence",
+                    "tasks": [
+                        {
+                            "task_id": "browser_prices",
+                            "agent_kind": "browser",
+                            "title": "Find prices",
+                            "instruction": "Find three public links.",
+                            "start_url": "https://duckduckgo.com/",
+                            "success_criteria": "Three links returned.",
+                        },
+                        {
+                            "task_id": "desktop_read",
+                            "agent_kind": "computer",
+                            "title": "Read desktop",
+                            "instruction": "Inspect the visible desktop.",
+                            "read_only": True,
+                        },
+                    ],
+                }],
+            }), encoding="utf-8")
+
+            loaded = load_suite(suite_dir / "agents.json")
+
+            scenario = loaded.scenarios[0]
+            self.assertEqual(scenario.modality, "agent_task_sequence")
+            self.assertEqual([task.agent_kind for task in scenario.tasks], ["browser", "computer"])
+            self.assertEqual(scenario.events, [])
+
     def test_store_persists_trace_and_stage_review(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = SQLiteRealWorldTestStore(Path(tmp) / "lab.db")
@@ -174,6 +214,28 @@ mode = active
                 "inline_scenario": {"modality": "image_sequence", "events": [
                     {"media_id": media_id, "offset_seconds": 0}
                 ]},
+            })
+            self.assertEqual(started.status_code, 200)
+            self.assertTrue(lab.wait_for_idle(2))
+
+    def test_inline_agent_tasks_can_form_live_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            suites, config = self._fixture(root)
+            lab = RealWorldLab(project_root=root, config_path=config, data_root=root / "data",
+                               suites_root=suites, executor_factory=FakeExecutor)
+            client = TestClient(create_runtime_log_app(RuntimeLogBuffer(), real_world_lab=lab))
+            started = client.post("/api/real-world/runs", json={
+                "playback_speed": 1,
+                "live_tools_confirmation": "RUN LIVE TOOLS",
+                "inline_scenario": {
+                    "modality": "agent_task_sequence",
+                    "tasks": [{
+                        "task_id": "browser_one",
+                        "agent_kind": "browser",
+                        "instruction": "Find three public links.",
+                    }],
+                },
             })
             self.assertEqual(started.status_code, 200)
             self.assertTrue(lab.wait_for_idle(2))

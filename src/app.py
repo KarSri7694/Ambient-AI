@@ -31,6 +31,8 @@ from application.services.autonomy_coordinator_service import AutonomyCoordinato
 from application.services.artifact_maintenance_service import ArtifactMaintenanceService
 from application.services.daily_briefing_service import DailyBriefingService
 from application.services.proactive_sweep_service import ProactiveSweepService
+from application.services.browser_approval_fallback_service import BrowserApprovalFallbackService
+from application.services.ddgs_search_service import DdgsSearchService
 from application.services.capability_policy_service import AutonomyBudget, CapabilityPolicyService
 from application.services.opportunity_judgment_service import OpportunityJudgmentService
 from application.services.capture_control_service import CaptureControlService
@@ -181,6 +183,15 @@ PASSIVE_OBSERVER_DEEP_MAX_OUTPUT_TOKENS = CONFIG.get_int(
 PASSIVE_OBSERVER_MAX_PENDING_PER_CONTEXT = CONFIG.get_int(
     "passive_observer", "max_pending_per_context", 2
 )
+PASSIVE_OBSERVER_VISUAL_CONTEXT_BATCH_SIZE = CONFIG.get_int(
+    "passive_observer", "visual_context_batch_size", 5
+)
+PASSIVE_OBSERVER_VISUAL_CONTEXT_BATCH_MAX_WAIT_SECONDS = CONFIG.get_int(
+    "passive_observer", "visual_context_batch_max_wait_seconds", 60
+)
+PASSIVE_OBSERVER_VISUAL_CONTEXT_BATCH_FLUSH_HIGH_SALIENCE = CONFIG.get_bool(
+    "passive_observer", "visual_context_batch_flush_high_salience", True
+)
 PASSIVE_OBSERVER_UIAT_MODE = CONFIG.get_str("passive_observer", "uiat_mode", "screen_content")
 LOG_API_ENABLED = CONFIG.get_bool("log_api", "enabled", True)
 LOG_API_HOST = CONFIG.get_str("log_api", "host", "0.0.0.0")
@@ -189,6 +200,7 @@ LOG_API_BUFFER_SIZE = CONFIG.get_int("log_api", "buffer_size", 2000)
 MCP_CONFIG_PATH = CONFIG.get_str("runtime", "mcp_config_path", "mcp.json")
 BROWSER_MCP_SERVER_NAME = CONFIG.get_str("browser", "server_name", "playwright")
 BROWSER_BACKEND = CONFIG.get_str("browser", "backend", "fara_visual").strip().lower()
+BROWSER_AGENT_FAMILY = CONFIG.get_str("browser", "agent_family", "fara").strip().lower()
 BROWSER_TASK_TIMEOUT_SECONDS = CONFIG.get_float("browser", "task_timeout_seconds", 180.0)
 BROWSER_HEADLESS = CONFIG.get_bool("browser", "headless", False)
 BROWSER_PROFILE_DIR = CONFIG.get_str(
@@ -213,6 +225,7 @@ FILESYSTEM_TASK_TIMEOUT_SECONDS = CONFIG.get_float("filesystem", "task_timeout_s
 FILESYSTEM_MAX_READ_BYTES = CONFIG.get_int("filesystem", "max_read_bytes", 256000)
 FILESYSTEM_MAX_LIST_ENTRIES = CONFIG.get_int("filesystem", "max_list_entries", 200)
 COMPUTER_ENABLED = CONFIG.get_bool("computer", "enabled", False)
+COMPUTER_AGENT_FAMILY = CONFIG.get_str("computer", "agent_family", "gemma").strip().lower()
 COMPUTER_TASK_TIMEOUT_SECONDS = CONFIG.get_float("computer", "task_timeout_seconds", 180.0)
 COMPUTER_MAX_ACTIONS_PER_TASK = CONFIG.get_int("computer", "max_actions_per_task", 40)
 COMPUTER_SCREENSHOT_DIR = CONFIG.get_str(
@@ -294,6 +307,24 @@ AUTONOMY_MAX_TOOL_CALLS_PER_HOUR = CONFIG.get_int("autonomy", "max_tool_calls_pe
 AUTONOMY_MAX_WEB_QUERIES_PER_DAY = CONFIG.get_int("autonomy", "max_web_queries_per_day", 60)
 AUTONOMY_MAX_INBOX_ITEMS_PER_DAY = CONFIG.get_int("autonomy", "max_inbox_items_per_day", 30)
 AUTONOMY_APPROVAL_TTL_MINUTES = CONFIG.get_int("autonomy", "approval_ttl_minutes", 30)
+AUTONOMY_BROWSER_APPROVAL_DDGS_FALLBACK_ENABLED = CONFIG.get_bool(
+    "autonomy", "browser_approval_ddgs_fallback_enabled", True
+)
+AUTONOMY_BROWSER_APPROVAL_DDGS_FALLBACK_INTERVAL_SECONDS = CONFIG.get_float(
+    "autonomy", "browser_approval_ddgs_fallback_check_seconds", 10.0
+)
+AUTONOMY_BROWSER_APPROVAL_DDGS_FALLBACK_MAX_RESULTS = CONFIG.get_int(
+    "autonomy", "browser_approval_ddgs_fallback_max_results", 8
+)
+WEB_SEARCH_DDGS_TIMEOUT_SECONDS = CONFIG.get_float("web_search", "ddgs_timeout_seconds", 10.0)
+WEB_SEARCH_DDGS_PROXY = CONFIG.get_str("web_search", "ddgs_proxy", "")
+WEB_SEARCH_DDGS_REGION = CONFIG.get_str("web_search", "ddgs_region", "us-en")
+WEB_SEARCH_DDGS_SAFESEARCH = CONFIG.get_str("web_search", "ddgs_safesearch", "moderate")
+WEB_SEARCH_DDGS_BACKEND = CONFIG.get_str("web_search", "ddgs_backend", "auto")
+LLM_INTERACTION_MAX_ITERATIONS = CONFIG.get_int("llm_interaction", "max_iterations", 25)
+LLM_INTERACTION_FINAL_TURN_RECOVERY_ENABLED = CONFIG.get_bool(
+    "llm_interaction", "final_turn_recovery_enabled", True
+)
 PROACTIVE_AUTONOMY_ENABLED = CONFIG.get_bool("proactive_autonomy", "enabled", False)
 PROACTIVE_AUTONOMY_GLOBAL_GRANT = CONFIG.get_bool("proactive_autonomy", "global_grant", False)
 PROACTIVE_AUTONOMY_MODEL = CONFIG.get_model("model", FOLLOWUP_EXECUTION_MODEL, section="proactive_autonomy")
@@ -302,6 +333,8 @@ PROACTIVE_AUTONOMY_MAX_SWEEPS_PER_DAY = CONFIG.get_int("proactive_autonomy", "ma
 PROACTIVE_AUTONOMY_MAX_FINDINGS = CONFIG.get_int("proactive_autonomy", "max_findings_per_sweep", 10)
 PROACTIVE_AUTONOMY_MINIMUM_IMPORTANCE = CONFIG.get_str("proactive_autonomy", "minimum_importance", "medium")
 PROACTIVE_AUTONOMY_MAX_SOURCE_SECONDS = CONFIG.get_float("proactive_autonomy", "max_source_seconds", 180.0)
+PROACTIVE_AUTONOMY_MAX_TOOL_ITERATIONS = CONFIG.get_int("proactive_autonomy", "max_tool_iterations", 25)
+PROACTIVE_AUTONOMY_USER_GOOGLE_EMAIL = CONFIG.get_str("proactive_autonomy", "user_google_email", "")
 CAPTURE_STORAGE_ROOT = Path(
     CONFIG.get_str("privacy", "capture_root", str(USER_DATA_DIR / "captures"))
 )
@@ -921,6 +954,7 @@ class AmbientRuntime:
                 blocked_path_markers=BROWSER_BLOCKED_PATH_MARKERS,
                 screenshot_retention=BROWSER_SCREENSHOT_RETENTION,
                 interrupt_checker=self.interrupt_controller.check,
+                agent_family=BROWSER_AGENT_FAMILY,
             )
         elif BROWSER_BACKEND == "playwright_mcp":
             browser_tool_bridge = BrowserMCPToolAdapter(
@@ -984,6 +1018,7 @@ class AmbientRuntime:
             filesystem_max_read_bytes=FILESYSTEM_MAX_READ_BYTES,
             filesystem_max_list_entries=FILESYSTEM_MAX_LIST_ENTRIES,
             computer_agent_model=COMPUTER_AGENT_MODEL,
+            computer_agent_family=COMPUTER_AGENT_FAMILY,
             computer_task_timeout_seconds=COMPUTER_TASK_TIMEOUT_SECONDS,
             computer_max_actions_per_task=COMPUTER_MAX_ACTIONS_PER_TASK,
             computer_screenshot_dir=COMPUTER_SCREENSHOT_DIR,
@@ -1000,6 +1035,8 @@ class AmbientRuntime:
             artifact_max_existing_chars=ARTIFACT_MAX_EXISTING_CHARS,
             semantic_memory=semantic_memory,
             interrupt_checker=self.interrupt_controller.check,
+            max_interaction_iterations=LLM_INTERACTION_MAX_ITERATIONS,
+            final_turn_recovery_enabled=LLM_INTERACTION_FINAL_TURN_RECOVERY_ENABLED,
         )
         self._artifact_maintenance_service = (
             ArtifactMaintenanceService(
@@ -1179,6 +1216,9 @@ class AmbientRuntime:
                 chat_event_broker=self.chat_event_broker,
                 task_store=task_queue,
                 max_pending_visual_per_context=PASSIVE_OBSERVER_MAX_PENDING_PER_CONTEXT,
+                visual_context_batch_size=PASSIVE_OBSERVER_VISUAL_CONTEXT_BATCH_SIZE,
+                visual_context_batch_max_wait_seconds=PASSIVE_OBSERVER_VISUAL_CONTEXT_BATCH_MAX_WAIT_SECONDS,
+                visual_context_batch_flush_high_salience=PASSIVE_OBSERVER_VISUAL_CONTEXT_BATCH_FLUSH_HIGH_SALIENCE,
             )
             if AUTONOMY_COORDINATOR_ENABLED
             else None
@@ -1199,7 +1239,22 @@ class AmbientRuntime:
             max_findings_per_sweep=PROACTIVE_AUTONOMY_MAX_FINDINGS,
             minimum_importance=PROACTIVE_AUTONOMY_MINIMUM_IMPORTANCE,
             max_source_seconds=PROACTIVE_AUTONOMY_MAX_SOURCE_SECONDS,
+            max_tool_iterations=PROACTIVE_AUTONOMY_MAX_TOOL_ITERATIONS,
             filesystem_paths=PROACTIVE_AUTONOMY_FILESYSTEM_PATHS,
+            user_google_email=PROACTIVE_AUTONOMY_USER_GOOGLE_EMAIL,
+            user_idle_checker=system_idle_service.is_user_idle,
+        )
+        browser_approval_fallback_service = BrowserApprovalFallbackService(
+            autonomy_store=autonomy_store,
+            search_service=DdgsSearchService(
+                timeout_seconds=WEB_SEARCH_DDGS_TIMEOUT_SECONDS,
+                proxy=WEB_SEARCH_DDGS_PROXY,
+            ),
+            enabled=AUTONOMY_BROWSER_APPROVAL_DDGS_FALLBACK_ENABLED,
+            max_results=AUTONOMY_BROWSER_APPROVAL_DDGS_FALLBACK_MAX_RESULTS,
+            region=WEB_SEARCH_DDGS_REGION,
+            safesearch=WEB_SEARCH_DDGS_SAFESEARCH,
+            backend=WEB_SEARCH_DDGS_BACKEND,
         )
         self._passive_observer = passive_observer
         return (
@@ -1220,6 +1275,7 @@ class AmbientRuntime:
             autonomy_coordinator,
             user_context_service,
             proactive_sweep_service,
+            browser_approval_fallback_service,
         )
 
     def _start_screenshot_capture_loop(
@@ -2006,6 +2062,7 @@ class AmbientRuntime:
             autonomy_coordinator,
             user_context_service,
             proactive_sweep_service,
+            browser_approval_fallback_service,
         ) = self._build_services()
         idle_cycle_interval = 30
         passive_observer_interval = PASSIVE_OBSERVER_CAPTURE_INTERVAL_SECONDS
@@ -2014,6 +2071,7 @@ class AmbientRuntime:
         biodata_ran_in_idle_window = False
         user_idle_now = False
         services_initialized = False
+        last_browser_approval_fallback_check_at = 0.0
 
         try:
             self.stop_event.clear()
@@ -2080,6 +2138,21 @@ class AmbientRuntime:
                         reason="ASR pipeline finished",
                     )
                     biodata_ran_in_idle_window = False
+
+                now_for_approval_fallback = time.monotonic()
+                if (
+                    browser_approval_fallback_service is not None
+                    and now_for_approval_fallback - last_browser_approval_fallback_check_at
+                    >= AUTONOMY_BROWSER_APPROVAL_DDGS_FALLBACK_INTERVAL_SECONDS
+                ):
+                    last_browser_approval_fallback_check_at = now_for_approval_fallback
+                    fallback_result = browser_approval_fallback_service.run_once()
+                    processed_fallbacks = fallback_result.get("processed") or []
+                    if processed_fallbacks:
+                        logger.info(
+                            "Browser approval timeout fallback produced DDGS results for %s approval(s).",
+                            len(processed_fallbacks),
+                        )
 
                 manual_reflection_handled, services_initialized = await self._run_manual_reflection(
                     llm_adapter=llm_adapter,
@@ -2501,6 +2574,8 @@ class AmbientRuntime:
                                         "transcript_available",
                                         "lightweight_visual_capture",
                                         "visual_context_changed",
+                                        "visual_context_batch_changed",
+                                        "visual_context_batch_pending",
                                     }
                                 )
                                 if context_event_count:

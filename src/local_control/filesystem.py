@@ -56,25 +56,25 @@ class FilesystemControlSession:
         return [
             self._tool(
                 "fs_list",
-                "List files and folders inside a user-granted directory.",
+                "List files and folders inside a user-granted directory. The path must be an absolute path returned in root_grants or a child path from a previous filesystem tool result.",
                 {"path": {"type": "string"}},
                 ["path"],
             ),
             self._tool(
                 "fs_stat",
-                "Return metadata for a user-granted file or folder.",
+                "Return metadata for a user-granted file or folder. The path must be an absolute path returned in root_grants or a child path from a previous filesystem tool result.",
                 {"path": {"type": "string"}},
                 ["path"],
             ),
             self._tool(
                 "fs_read_text",
-                "Read a UTF-8 text file inside the user-granted scope, capped by configuration.",
+                "Read a UTF-8 text file inside the user-granted scope, capped by configuration. The path must be an absolute path returned by a previous filesystem tool result.",
                 {"path": {"type": "string"}},
                 ["path"],
             ),
             self._tool(
                 "fs_search_text",
-                "Search text files under a user-granted folder with capped results.",
+                "Search text files under a user-granted folder with capped results. The path must be an absolute path returned in root_grants or a child path from a previous filesystem tool result.",
                 {
                     "path": {"type": "string"},
                     "query": {"type": "string"},

@@ -119,6 +119,24 @@ class _ComputerToolProvider(_Provider):
         return stream()
 
 
+class _FilesystemPromptProvider(_Provider):
+    async def chat_completion_stream(self, *, model, messages, tools, image="", **kwargs):
+        self.calls.append({"model": model, "messages": json.loads(json.dumps(messages)), "tools": tools})
+        call = SimpleNamespace(
+            index=0,
+            id="finish-fs-1",
+            function=SimpleNamespace(
+                name="finish_filesystem_task",
+                arguments=json.dumps({"status": "completed", "summary": "filesystem checked"}),
+            ),
+        )
+
+        async def stream():
+            yield _Chunk(tool_calls=[call])
+
+        return stream()
+
+
 class _DelegationProvider(_Provider):
     async def chat_completion_stream(self, *, model, messages, tools, image="", **kwargs):
         self.calls.append({"model": model, "messages": json.loads(json.dumps(messages)), "tools": tools})
@@ -221,7 +239,35 @@ def test_filesystem_session_rejects_ungranted_paths(tmp_path):
 
     assert asyncio.run(session.execute_tool("fs_read_text", {"path": str(granted / "note.txt")})) == "hello"
     with pytest.raises(PathGrantError):
-        asyncio.run(session.execute_tool("fs_read_text", {"path": str(outside / "secret.txt")}))
+        asyncio.run(session.execute_tool("fs_read_text", {"path": str(outside / "secret.txt")})) 
+
+
+def test_filesystem_agent_resolves_relative_grants_before_prompting(tmp_path, monkeypatch):
+    provider = _FilesystemPromptProvider()
+    service = LLMInteractionService(
+        llm_provider=provider,
+        tool_bridge=_Bridge(),
+        filesystem_agent_model="main-model",
+    )
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "note.txt").write_text("proactive sweep gmail", encoding="utf-8")
+
+    result = asyncio.run(
+        service._run_filesystem_agent(
+            task="Search for proactive sweep files.",
+            granted_paths=["."],
+            agent_depth=0,
+        )
+    )
+
+    assert "filesystem checked" in result
+    user_messages = [
+        message["content"]
+        for message in provider.calls[-1]["messages"]
+        if message["role"] == "user"
+    ]
+    assert json.dumps(str(tmp_path.resolve()))[1:-1] in user_messages[-1]
+    assert '"."' not in user_messages[-1]
 
 
 def test_computer_session_allows_single_win_key_but_blocks_dangerous_chords(monkeypatch):
@@ -263,6 +309,31 @@ def test_computer_mouse_coordinates_are_scaled_from_gemma_1000_grid(monkeypatch)
         ("click", (2559, 1439)),
         ("click", (2559, 0)),
     ]
+
+
+def test_computer_session_exposes_visual_desktop_actions(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "local_control.computer.ComputerControlSession._screen_size",
+        staticmethod(lambda: (1000, 1000)),
+    )
+    monkeypatch.setattr(
+        "local_control.computer.ComputerControlSession._pyautogui_call",
+        lambda _self, method, *args, **kwargs: calls.append((method, args, kwargs)) or "ok",
+    )
+    session = ComputerControlSession(max_actions=5)
+    try:
+        tool_names = {tool["function"]["name"] for tool in asyncio.run(session.get_all_tools())}
+        assert {"computer_double_click", "computer_right_click", "computer_drag", "computer_wait"} <= tool_names
+        assert asyncio.run(session.execute_tool("computer_double_click", {"x": 100, "y": 200})) == "ok"
+        assert asyncio.run(session.execute_tool("computer_right_click", {"x": 300, "y": 400})) == "ok"
+        assert asyncio.run(session.execute_tool("computer_drag", {"start_x": 10, "start_y": 20, "end_x": 30, "end_y": 40})) == "ok"
+    finally:
+        asyncio.run(session.cleanup())
+
+    assert calls[0][0] == "doubleClick"
+    assert calls[1][0] == "rightClick"
+    assert [item[0] for item in calls[2:]] == ["moveTo", "dragTo"]
 
 
 def test_request_computer_use_creates_pending_approval(tmp_path):

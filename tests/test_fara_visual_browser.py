@@ -152,11 +152,73 @@ async def _exercise_reasoning_content_action(tmp_path):
     assert action == {"action": "web_search", "query": "Fara 1.5 27B GGUF"}
 
 
+def test_fara_final_step_instructs_terminate(tmp_path):
+    asyncio.run(_exercise_final_step_instruction(tmp_path))
+
+
+async def _exercise_final_step_instruction(tmp_path):
+    class _FinalStepLLM:
+        async def chat_completion_stream(self, **kwargs):
+            state = json.loads(kwargs["messages"][1]["content"])
+            assert state["is_final_step"] is True
+            assert state["remaining_steps_after_this"] == 0
+            assert "Return a terminate action now" in state["instruction"]
+
+            async def _stream():
+                tool_call = SimpleNamespace(
+                    index=0,
+                    id="finish",
+                    function=SimpleNamespace(
+                        name="computer_use",
+                        arguments=json.dumps(
+                            {
+                                "action": "terminate",
+                                "status": "completed",
+                                "answer": "Final browser result.",
+                            }
+                        ),
+                    ),
+                )
+                yield SimpleNamespace(
+                    choices=[SimpleNamespace(delta=SimpleNamespace(
+                        content=None,
+                        reasoning_content=None,
+                        tool_calls=[tool_call],
+                    ))]
+                )
+
+            return _stream()
+
+    screenshot = tmp_path / "screen.png"
+    screenshot.write_bytes(b"not-a-real-png")
+    session = _session(tmp_path)
+    session.llm = _FinalStepLLM()
+
+    action = await session._request_action(
+        task="Find options.",
+        model="Qwen3.6-35B",
+        screenshot_path=screenshot,
+        current_url="https://duckduckgo.com/",
+        step=session.max_steps,
+    )
+
+    assert action["action"] == "terminate"
+    assert action["answer"] == "Final browser result."
+
+
 def test_fara_action_validation_is_coordinate_bounded(tmp_path):
     session = _session(tmp_path)
     assert session._validate_action(
         {"action": "left_click", "coordinate": [100, 200]}
     )["coordinate"] == [100.0, 200.0]
+    assert session._validate_action(
+        {"action": "triple_click", "coordinate": [100, 200]}
+    )["coordinate"] == [100.0, 200.0]
+    drag = session._validate_action(
+        {"action": "left_click_drag", "start_coordinate": [100, 200], "end_coordinate": [300, 400]}
+    )
+    assert drag["start_coordinate"] == [100.0, 200.0]
+    assert drag["end_coordinate"] == [300.0, 400.0]
     with pytest.raises(ValueError, match="outside the viewport"):
         session._validate_action(
             {"action": "left_click", "coordinate": [2000, 200]}

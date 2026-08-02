@@ -63,6 +63,58 @@ class _StreamingProvider:
         return _stream()
 
 
+class _LoopBudgetProvider:
+    def __init__(self):
+        self.calls = []
+
+    async def chat_completion_stream(self, **kwargs):
+        self.calls.append(kwargs)
+
+        async def _stream():
+            if kwargs.get("tools"):
+                tool_call = SimpleNamespace(
+                    index=0,
+                    id="call-1",
+                    function=SimpleNamespace(
+                        name="echo_tool",
+                        arguments=json.dumps({"value": "first"}),
+                    ),
+                )
+                yield SimpleNamespace(
+                    choices=[SimpleNamespace(delta=SimpleNamespace(
+                        content=None,
+                        reasoning_content=None,
+                        tool_calls=[tool_call],
+                    ))]
+                )
+            else:
+                yield SimpleNamespace(
+                    choices=[SimpleNamespace(delta=SimpleNamespace(
+                        content="final answer from existing context",
+                        reasoning_content=(
+                            "<function=echo_tool><parameter=value>ignored</parameter></function>"
+                        ),
+                        tool_calls=None,
+                    ))]
+                )
+
+        return _stream()
+
+
+class _EchoToolBridge(_FakeToolBridge):
+    async def get_all_tools(self):
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "echo_tool",
+                    "description": "Echo test tool.",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+
+
 def test_chat_store_persists_resumable_sessions_and_turns(tmp_path):
     db_path = tmp_path / "chat.db"
     store = SQLiteChatAdapter(str(db_path))
@@ -91,6 +143,30 @@ def test_chat_store_persists_resumable_sessions_and_turns(tmp_path):
 def test_chat_store_rejects_directory_as_database_path(tmp_path):
     with pytest.raises(ValueError, match="must point to a SQLite database file"):
         SQLiteChatAdapter(str(tmp_path))
+
+
+def test_llm_interaction_final_turn_disables_tools_and_returns_answer():
+    provider = _LoopBudgetProvider()
+    service = LLMInteractionService(provider, _EchoToolBridge())
+    asyncio.run(service.initialize_tools())
+
+    result = asyncio.run(
+        service.run_interaction(
+            user_input="Use a tool then answer.",
+            system_prompt="System",
+            model="model",
+            max_iterations=2,
+            allowed_tool_names={"echo_tool"},
+        )
+    )
+
+    assert result == "final answer from existing context"
+    assert len(provider.calls) == 2
+    assert provider.calls[0]["tools"]
+    assert provider.calls[1]["tools"] is None
+    final_messages = provider.calls[1]["messages"]
+    assert "final allowed model turn" in final_messages[0]["content"]
+    assert "model turn 2 of 2" in final_messages[0]["content"]
 
 
 def test_chat_store_marks_interrupted_responses_failed(tmp_path):

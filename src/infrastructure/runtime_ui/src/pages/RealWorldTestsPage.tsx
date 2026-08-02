@@ -12,8 +12,19 @@ import {
 } from "../components/ui";
 
 type Uploaded = { media_id: string; kind: "image" | "audio"; original_name: string };
-type SourceMode = "suite" | "upload";
+type SourceMode = "suite" | "upload" | "agent";
 type TraceFilter = "all" | "model" | "tools" | "pipeline";
+type AgentTaskDraft = {
+  id: string;
+  agent_kind: "browser" | "computer";
+  title: string;
+  instruction: string;
+  start_url: string;
+  read_only: boolean;
+  max_steps: string;
+  timeout_seconds: string;
+  success_criteria: string;
+};
 
 const SPEEDS = [1, 2, 5, 10];
 const ACCEPTED_MEDIA = {
@@ -49,6 +60,10 @@ export function RealWorldTestsPage() {
   const [dropzoneActive, setDropzoneActive] = useState(false);
   const [draggedUploadId, setDraggedUploadId] = useState<string | null>(null);
   const [traceFilter, setTraceFilter] = useState<TraceFilter>("all");
+  const [agentTasks, setAgentTasks] = useState<AgentTaskDraft[]>([
+    defaultAgentTask("browser", 1),
+    defaultAgentTask("computer", 2),
+  ]);
   const selectedSuite = useMemo(
     () => suites.data?.suites?.find((item: any) => item.suite_id === suiteId),
     [suites.data, suiteId],
@@ -73,7 +88,24 @@ export function RealWorldTestsPage() {
     queryFn: () => getJson<any>(`/api/real-world/runs/${selectedRun}/trace?limit=5000`), refetchInterval: 1000,
   });
   const start = useMutation({
-    mutationFn: () => sendJson<any>("/api/real-world/runs", "POST", sourceMode === "upload" ? {
+    mutationFn: () => sendJson<any>("/api/real-world/runs", "POST", sourceMode === "agent" ? {
+      playback_speed: Number(speed), model_overrides: overrides, live_tools_confirmation: confirmation,
+      inline_scenario: {
+        title: "Live browser and computer agent tasks",
+        modality: "agent_task_sequence",
+        tasks: agentTasks.filter((item) => item.instruction.trim()).map((item, index) => ({
+          task_id: item.id || `task_${index + 1}`,
+          agent_kind: item.agent_kind,
+          title: item.title || `${item.agent_kind === "browser" ? "Browser" : "Computer"} task ${index + 1}`,
+          instruction: item.instruction,
+          start_url: item.start_url,
+          read_only: item.read_only,
+          max_steps: item.max_steps ? Number(item.max_steps) : undefined,
+          timeout_seconds: item.timeout_seconds ? Number(item.timeout_seconds) : undefined,
+          success_criteria: item.success_criteria,
+        })),
+      },
+    } : sourceMode === "upload" ? {
       playback_speed: Number(speed), model_overrides: overrides, live_tools_confirmation: confirmation,
       inline_scenario: {
         title: "Uploaded media scenario",
@@ -148,6 +180,14 @@ export function RealWorldTestsPage() {
     });
   };
 
+  const updateAgentTask = (id: string, patch: Partial<AgentTaskDraft>) => {
+    setAgentTasks((current) => current.map((item) => item.id === id ? { ...item, ...patch } : item));
+  };
+
+  const addAgentTask = (kind: "browser" | "computer") => {
+    setAgentTasks((current) => [...current, defaultAgentTask(kind, current.length + 1)]);
+  };
+
   const run = detail.data?.run;
   const events = trace.data?.events || [];
   const active = run && ["queued", "running"].includes(run.status);
@@ -165,7 +205,9 @@ export function RealWorldTestsPage() {
     if (traceFilter === "pipeline") return !["model", "agent"].includes(event.stage);
     return true;
   });
-  const validSource = sourceMode === "upload" ? uploads.length > 0 : scenarioIds.length > 0;
+  const validSource = sourceMode === "agent"
+    ? agentTasks.some((item) => item.instruction.trim())
+    : sourceMode === "upload" ? uploads.length > 0 : scenarioIds.length > 0;
   const armed = confirmation === "RUN LIVE TOOLS";
   const labAvailable = suites.data?.available === true;
 
@@ -193,10 +235,11 @@ export function RealWorldTestsPage() {
 
     <section className="rw-launch-card">
       <div className="rw-section-head">
-        <div><p className="rw-step">01 · Configure replay</p><h2>Choose what the agent should experience</h2><p>Select a reusable suite or assemble a private ad-hoc media sequence.</p></div>
+        <div><p className="rw-step">01 · Configure replay</p><h2>Choose what the agent should experience</h2><p>Select a reusable suite, assemble media, or run live browser/computer agent tasks.</p></div>
         <div className="segmented" aria-label="Input source">
           <button type="button" className={sourceMode === "suite" ? "active" : ""} onClick={() => setSourceMode("suite")}><Layers3 size={15} />Suite</button>
           <button type="button" className={sourceMode === "upload" ? "active" : ""} onClick={() => setSourceMode("upload")}><UploadCloud size={15} />Upload</button>
+          <button type="button" className={sourceMode === "agent" ? "active" : ""} onClick={() => setSourceMode("agent")}><Wrench size={15} />Agent tasks</button>
         </div>
       </div>
 
@@ -209,13 +252,18 @@ export function RealWorldTestsPage() {
                 const selected = scenarioIds.includes(item.scenario_id);
                 return <button type="button" key={item.scenario_id} className={`rw-scenario ${selected ? "selected" : ""}`} onClick={() => setScenarioIds((current) => selected ? current.filter((id) => id !== item.scenario_id) : [...current, item.scenario_id])}>
                   <span className="rw-check">{selected && <Check size={14} />}</span>
-                  <span className="rw-scenario-icon">{item.modality === "audio_sequence" ? <AudioLines size={19} /> : <ImageIcon size={19} />}</span>
-                  <span className="min-w-0 flex-1 text-left"><strong>{item.title}</strong><small>{item.events.length} input{item.events.length === 1 ? "" : "s"} · {item.modality.replace("_sequence", "")}</small></span>
+                  <span className="rw-scenario-icon">{item.modality === "agent_task_sequence" ? <Wrench size={19} /> : item.modality === "audio_sequence" ? <AudioLines size={19} /> : <ImageIcon size={19} />}</span>
+                  <span className="min-w-0 flex-1 text-left"><strong>{item.title}</strong><small>{scenarioCountLabel(item)}</small></span>
                   <ChevronRight size={17} className="text-muted" />
                 </button>;
               })}
             </div>}
-          </> : <>
+          </> : sourceMode === "agent" ? <AgentTaskEditor
+            tasks={agentTasks}
+            updateTask={updateAgentTask}
+            addTask={addAgentTask}
+            removeTask={(id) => setAgentTasks((current) => current.filter((item) => item.id !== id))}
+          /> : <>
             <div className="segmented mb-3"><button type="button" className={uploadKind === "image" ? "active" : ""} onClick={() => { setUploadKind("image"); setUploads([]); }}><FileImage size={15} />Images</button><button type="button" className={uploadKind === "audio" ? "active" : ""} onClick={() => { setUploadKind("audio"); setUploads([]); }}><FileAudio size={15} />Audio</button></div>
             <label
               className={`rw-dropzone ${dropzoneActive ? "active" : ""} ${!labAvailable ? "unavailable" : ""}`}
@@ -325,6 +373,64 @@ export function RealWorldTestsPage() {
   </div>;
 }
 
+function AgentTaskEditor({
+  tasks,
+  updateTask,
+  addTask,
+  removeTask,
+}: {
+  tasks: AgentTaskDraft[];
+  updateTask: (id: string, patch: Partial<AgentTaskDraft>) => void;
+  addTask: (kind: "browser" | "computer") => void;
+  removeTask: (id: string) => void;
+}) {
+  return <div className="space-y-3">
+    <div className="rw-sequence-head">
+      <div><strong>Live delegated agent tasks</strong><span>Add 2–3 browser or computer-use tasks. These run on live sites/apps after confirmation.</span></div>
+      <div className="flex gap-2"><Button variant="secondary" onClick={() => addTask("browser")}>Browser task</Button><Button variant="secondary" onClick={() => addTask("computer")}>Computer task</Button></div>
+    </div>
+    {tasks.map((task, index) => <div className="rw-agent-task" key={task.id}>
+      <div className="rw-agent-task-head">
+        <Badge>{index + 1}</Badge>
+        <select value={task.agent_kind} onChange={(event) => {
+          const kind = event.target.value as "browser" | "computer";
+          updateTask(task.id, { agent_kind: kind, read_only: kind === "computer" });
+        }}>
+          <option value="browser">Browser</option>
+          <option value="computer">Computer</option>
+        </select>
+        <button type="button" onClick={() => removeTask(task.id)} aria-label={`Remove task ${index + 1}`}><X size={15} /></button>
+      </div>
+      <label className="rw-field">Title<input value={task.title} onChange={(event) => updateTask(task.id, { title: event.target.value })} placeholder="Compare running shoes" /></label>
+      <label className="rw-field">Instruction<textarea rows={4} value={task.instruction} onChange={(event) => updateTask(task.id, { instruction: event.target.value })} placeholder="Find 3 similar products and return links. Do not log in, add to cart, or download files." /></label>
+      {task.agent_kind === "browser" && <label className="rw-field">Start URL<input value={task.start_url} onChange={(event) => updateTask(task.id, { start_url: event.target.value })} placeholder="https://duckduckgo.com/" /></label>}
+      <div className="grid gap-3 md:grid-cols-3">
+        <label className="rw-field">Max steps<input type="number" min="1" max="200" value={task.max_steps} onChange={(event) => updateTask(task.id, { max_steps: event.target.value })} /></label>
+        <label className="rw-field">Timeout seconds<input type="number" min="10" max="1800" value={task.timeout_seconds} onChange={(event) => updateTask(task.id, { timeout_seconds: event.target.value })} /></label>
+        <label className="rw-field">Mode<select value={task.read_only ? "read" : "write"} onChange={(event) => updateTask(task.id, { read_only: event.target.value === "read" })}><option value="read">Read-only</option><option value="write">Allow typing/clicking</option></select></label>
+      </div>
+      <label className="rw-field">Success criteria<input value={task.success_criteria} onChange={(event) => updateTask(task.id, { success_criteria: event.target.value })} placeholder="Returns links, actions taken, and blockers clearly." /></label>
+    </div>)}
+  </div>;
+}
+
+function defaultAgentTask(kind: "browser" | "computer", index: number): AgentTaskDraft {
+  const browser = kind === "browser";
+  return {
+    id: `${kind}_${Date.now()}_${index}`,
+    agent_kind: kind,
+    title: browser ? "Browser research task" : "Computer-use desktop task",
+    instruction: browser
+      ? "Find 3 public web results for a product or topic and return the links with short reasons. Do not log in, add to cart, or download files."
+      : "Inspect the current desktop or a safe local app and complete a simple read-only task. Do not type credentials, send messages, delete files, or download files.",
+    start_url: browser ? "https://duckduckgo.com/" : "",
+    read_only: true,
+    max_steps: browser ? "40" : "25",
+    timeout_seconds: browser ? "900" : "300",
+    success_criteria: browser ? "Returns 3 useful links with reasons." : "Reports visible result, actions taken, and blockers.",
+  };
+}
+
 function Metric({ icon, value, label }: { icon: React.ReactNode; value: number; label: string }) {
   return <div className="rw-stat"><span>{icon}</span><strong>{value}</strong><small>{label}</small></div>;
 }
@@ -347,6 +453,15 @@ function tunedFlags(candidate: any) {
   return `ctx ${candidate.context_size} | ngl ${candidate.gpu_layers} | fa ${candidate.flash_attention ? "on" : "off"} | ${candidate.cache_type_k}/${candidate.cache_type_v}`;
 }
 
+function scenarioCountLabel(item: any) {
+  if (item.modality === "agent_task_sequence") {
+    const count = item.tasks?.length || 0;
+    return `${count} agent task${count === 1 ? "" : "s"}`;
+  }
+  const count = item.events?.length || 0;
+  return `${count} input${count === 1 ? "" : "s"} · ${String(item.modality || "").replace("_sequence", "")}`;
+}
+
 function TraceEventCard({ event }: { event: any }) {
   const toolEvent = event.event_type.includes("tool");
   const Icon = toolEvent ? Wrench : event.stage === "model" ? Sparkles : event.stage === "input" ? UploadCloud : Activity;
@@ -367,7 +482,7 @@ function ResultReview({ result, runId, onSaved }: { result: any; runId: string; 
   });
   const save = useMutation({ mutationFn: () => sendJson(`/api/real-world/results/${result.result_id}/review`, "POST", form), onSuccess: onSaved });
   return <article className="rw-result-card">
-    <header><span className="rw-result-icon">{result.modality === "audio_sequence" ? <AudioLines size={19} /> : <ImageIcon size={19} />}</span><div className="min-w-0 flex-1"><h3>{result.title}</h3><p>{result.modality.replace("_sequence", "")} evaluation</p></div><Badge tone={statusTone(result.status)}>{humanStatus(result.status)}</Badge></header>
+    <header><span className="rw-result-icon">{result.modality === "agent_task_sequence" ? <Wrench size={19} /> : result.modality === "audio_sequence" ? <AudioLines size={19} /> : <ImageIcon size={19} />}</span><div className="min-w-0 flex-1"><h3>{result.title}</h3><p>{result.modality.replace("_sequence", "")} evaluation</p></div><Badge tone={statusTone(result.status)}>{humanStatus(result.status)}</Badge></header>
     <div className="rw-media-strip">{result.media?.map((_: any, index: number) => result.modality === "audio_sequence" ? <div className="rw-audio" key={index}><FileAudio size={18} /><audio controls src={`/api/real-world/runs/${runId}/results/${result.result_id}/media/${index}`} /></div> : <figure key={index}><img src={`/api/real-world/runs/${runId}/results/${result.result_id}/media/${index}`} alt={`Scenario input ${index + 1}`} /><figcaption>Frame {index + 1}</figcaption></figure>)}</div>
     {result.transcript_text && <div className="rw-output-block"><span>Transcript</span><p>{result.transcript_text}</p></div>}
     {result.final_response && <div className="rw-output-block"><span>Final response</span><Markdown>{result.final_response}</Markdown></div>}

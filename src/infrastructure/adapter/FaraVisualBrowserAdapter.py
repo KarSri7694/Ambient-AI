@@ -60,14 +60,17 @@ class FaraVisualBrowserSession(BrowserToolSessionPort):
         "keypress": "key",
         "input_text": "type",
         "back": "history_back",
+        "drag": "left_click_drag",
     }
     ALLOWED_ACTIONS = {
         "key",
         "type",
         "mouse_move",
         "left_click",
+        "triple_click",
         "double_click",
         "right_click",
+        "left_click_drag",
         "scroll",
         "hscroll",
         "visit_url",
@@ -99,6 +102,18 @@ class FaraVisualBrowserSession(BrowserToolSessionPort):
                     "text": {"type": "string"},
                     "keys": {"type": "array", "items": {"type": "string"}},
                     "pixels": {"type": "number"},
+                    "start_coordinate": {
+                        "type": "array",
+                        "items": {"type": "number"},
+                        "minItems": 2,
+                        "maxItems": 2,
+                    },
+                    "end_coordinate": {
+                        "type": "array",
+                        "items": {"type": "number"},
+                        "minItems": 2,
+                        "maxItems": 2,
+                    },
                     "url": {"type": "string"},
                     "query": {"type": "string"},
                     "fact": {"type": "string"},
@@ -150,6 +165,7 @@ Only stop at a critical point if (1) required information is missing, (2) the ta
         screenshot_retention: bool,
         logger: logging.Logger,
         interrupt_checker: Optional[Callable[[], None]] = None,
+        agent_family: str = "fara",
     ) -> None:
         self.llm = llm_provider
         self.profile_dir = profile_dir
@@ -166,6 +182,7 @@ Only stop at a critical point if (1) required information is missing, (2) the ta
         self.screenshot_retention = screenshot_retention
         self.logger = logger
         self.interrupt_checker = interrupt_checker
+        self.agent_family = (agent_family or "fara").strip().lower()
         self._playwright: Any = None
         self._context: Any = None
         self._page: Any = None
@@ -336,7 +353,8 @@ Only stop at a critical point if (1) required information is missing, (2) the ta
                 "mode": "host_read_only_visual",
                 "dom_access": False,
                 "uia_access": False,
-                "mutating_http_requests_allowed": False,
+                "mutating_http_requests_allowed": True,
+                "downloads_allowed": False,
                 "dedicated_profile": str(self.profile_dir),
             },
         }
@@ -355,16 +373,37 @@ Only stop at a critical point if (1) required information is missing, (2) the ta
         state = {
             "approved_task": task,
             "step": step,
+            "max_steps": self.max_steps,
+            "remaining_steps_after_this": max(0, self.max_steps - step),
+            "is_final_step": step >= self.max_steps,
             "current_url": current_url,
             "viewport": [self.viewport_width, self.viewport_height],
             "memorized_facts": self._facts[-12:],
             "recent_actions": self._history[-12:],
-            "instruction": "Inspect the screenshot and choose exactly one next action.",
+            "instruction": (
+                "Inspect the screenshot and choose exactly one next action. "
+                "If a previous action did not visibly change the page, replan instead of repeating it."
+            ),
         }
+        if step >= self.max_steps:
+            state["instruction"] = (
+                "This is the final allowed browser step. Do not click, type, navigate, scroll, "
+                "or issue another exploratory action. Return a terminate action now with status, "
+                "answer, facts found, links found, blockers, and what the user should do next."
+            )
+        system_prompt = self.SYSTEM_PROMPT
+        if self.agent_family != "fara":
+            system_prompt = (
+                "You are a visual browser-control agent. Use the attached browser screenshot, "
+                "current URL, recent actions, and memorized facts to choose exactly one browser action. "
+                "Return one computer_use tool call only. Do not browse outside the approved task. "
+                "Stop with terminate when the requested result is complete, or ask_user_question only "
+                "when required information is missing."
+            )
         completion = await self.llm.chat_completion_stream(
             model=model,
             messages=[
-                {"role": "system", "content": self.SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": json.dumps(state, ensure_ascii=False, indent=2)},
             ],
             tools=[self.FARA_TOOL],
@@ -521,19 +560,31 @@ Only stop at a critical point if (1) required information is missing, (2) the ta
             text_value = str(normalized.get("text") or "").strip()
             if text_value:
                 normalized["query"] = text_value
-        if action_name in {"mouse_move", "left_click", "double_click", "right_click"}:
+        if action_name in {"mouse_move", "left_click", "triple_click", "double_click", "right_click"}:
             coordinate = normalized.get("coordinate")
             if not isinstance(coordinate, list) or len(coordinate) != 2:
                 raise ValueError(f"{action_name} requires coordinate=[x, y].")
-            x, y = float(coordinate[0]), float(coordinate[1])
-            if not (0 <= x < self.viewport_width and 0 <= y < self.viewport_height):
-                raise ValueError(f"Browser coordinate is outside the viewport: {coordinate}")
-            normalized["coordinate"] = [x, y]
+            normalized["coordinate"] = self._bounded_coordinate(coordinate)
+        if action_name == "left_click_drag":
+            start = normalized.get("start_coordinate") or normalized.get("coordinate")
+            end = normalized.get("end_coordinate")
+            if not isinstance(start, list) or len(start) != 2:
+                raise ValueError("left_click_drag requires start_coordinate=[x, y].")
+            if not isinstance(end, list) or len(end) != 2:
+                raise ValueError("left_click_drag requires end_coordinate=[x, y].")
+            normalized["start_coordinate"] = self._bounded_coordinate(start)
+            normalized["end_coordinate"] = self._bounded_coordinate(end)
         if action_name == "type" and len(str(normalized.get("text") or "")) > 2000:
             raise ValueError("Browser text entry is capped at 2000 characters.")
         if action_name == "wait":
             normalized["time"] = min(10.0, max(0.0, float(normalized.get("time") or 1.0)))
         return normalized
+
+    def _bounded_coordinate(self, coordinate: list[Any]) -> list[float]:
+        x, y = float(coordinate[0]), float(coordinate[1])
+        if not (0 <= x < self.viewport_width and 0 <= y < self.viewport_height):
+            raise ValueError(f"Browser coordinate is outside the viewport: {coordinate}")
+        return [x, y]
 
     async def _execute_action(self, action: dict[str, Any]) -> str:
         self._check_interrupted()
@@ -544,10 +595,19 @@ Only stop at a critical point if (1) required information is missing, (2) the ta
             await page.mouse.move(*action["coordinate"])
         elif action_name == "left_click":
             await page.mouse.click(*action["coordinate"])
+        elif action_name == "triple_click":
+            await page.mouse.click(*action["coordinate"], click_count=3)
         elif action_name == "double_click":
             await page.mouse.dblclick(*action["coordinate"])
         elif action_name == "right_click":
             await page.mouse.click(*action["coordinate"], button="right")
+        elif action_name == "left_click_drag":
+            start = action["start_coordinate"]
+            end = action["end_coordinate"]
+            await page.mouse.move(start[0], start[1])
+            await page.mouse.down()
+            await page.mouse.move(end[0], end[1], steps=12)
+            await page.mouse.up()
         elif action_name == "type":
             coordinate = action.get("coordinate")
             if isinstance(coordinate, list) and len(coordinate) == 2:
@@ -705,6 +765,7 @@ class FaraVisualBrowserAdapter(BrowserToolBridgePort):
         blocked_path_markers: Optional[List[str]] = None,
         screenshot_retention: bool = True,
         interrupt_checker: Optional[Callable[[], None]] = None,
+        agent_family: str = "fara",
     ) -> None:
         self.llm = llm_provider
         self.profile_dir = Path(profile_dir)
@@ -722,6 +783,7 @@ class FaraVisualBrowserAdapter(BrowserToolBridgePort):
         )
         self.screenshot_retention = screenshot_retention
         self.interrupt_checker = interrupt_checker
+        self.agent_family = (agent_family or "fara").strip().lower()
         self.logger = logging.getLogger(self.__class__.__name__)
 
     async def open_session(self, *, headless: bool) -> FaraVisualBrowserSession:
@@ -741,6 +803,7 @@ class FaraVisualBrowserAdapter(BrowserToolBridgePort):
             screenshot_retention=self.screenshot_retention,
             logger=self.logger,
             interrupt_checker=self.interrupt_checker,
+            agent_family=self.agent_family,
         )
         await session.start()
         return session

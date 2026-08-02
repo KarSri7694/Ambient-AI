@@ -85,7 +85,11 @@ class ComputerControlSession:
             "computer_inspect",
             "computer_move_mouse",
             "computer_click",
+            "computer_double_click",
+            "computer_right_click",
+            "computer_drag",
             "computer_scroll",
+            "computer_wait",
         }
         if not self.read_only:
             self._allowed_tool_names.update({"computer_type_text", "computer_press_key"})
@@ -110,7 +114,31 @@ class ComputerControlSession:
                 {"x": {"type": "integer"}, "y": {"type": "integer"}},
                 ["x", "y"],
             ),
+            self._tool(
+                "computer_double_click",
+                "Double-click using Gemma-normalized screen coordinates.",
+                {"x": {"type": "integer"}, "y": {"type": "integer"}},
+                ["x", "y"],
+            ),
+            self._tool(
+                "computer_right_click",
+                "Right-click using Gemma-normalized screen coordinates.",
+                {"x": {"type": "integer"}, "y": {"type": "integer"}},
+                ["x", "y"],
+            ),
+            self._tool(
+                "computer_drag",
+                "Drag from one Gemma-normalized coordinate to another.",
+                {
+                    "start_x": {"type": "integer"},
+                    "start_y": {"type": "integer"},
+                    "end_x": {"type": "integer"},
+                    "end_y": {"type": "integer"},
+                },
+                ["start_x", "start_y", "end_x", "end_y"],
+            ),
             self._tool("computer_scroll", "Scroll the active view by a bounded amount.", {"amount": {"type": "integer"}}, ["amount"]),
+            self._tool("computer_wait", "Wait briefly for the desktop UI to settle.", {"seconds": {"type": "number"}}, []),
         ]
         if not self.read_only:
             tools.extend(
@@ -132,9 +160,28 @@ class ComputerControlSession:
             elif tool_name == "computer_click":
                 x, y = self._scale_normalized_coordinate(tool_args.get("x"), tool_args.get("y"))
                 result = self._pyautogui_call("click", x, y)
+            elif tool_name == "computer_double_click":
+                x, y = self._scale_normalized_coordinate(tool_args.get("x"), tool_args.get("y"))
+                result = self._pyautogui_call("doubleClick", x, y)
+            elif tool_name == "computer_right_click":
+                x, y = self._scale_normalized_coordinate(tool_args.get("x"), tool_args.get("y"))
+                result = self._pyautogui_call("rightClick", x, y)
+            elif tool_name == "computer_drag":
+                start_x, start_y = self._scale_normalized_coordinate(
+                    tool_args.get("start_x"), tool_args.get("start_y")
+                )
+                end_x, end_y = self._scale_normalized_coordinate(
+                    tool_args.get("end_x"), tool_args.get("end_y")
+                )
+                self._pyautogui_call("moveTo", start_x, start_y)
+                result = self._pyautogui_call("dragTo", end_x, end_y, 0.25, button="left")
             elif tool_name == "computer_scroll":
                 amount = max(-10, min(10, int(tool_args.get("amount"))))
                 result = self._pyautogui_call("scroll", amount)
+            elif tool_name == "computer_wait":
+                seconds = max(0.0, min(10.0, float(tool_args.get("seconds") or 1.0)))
+                time.sleep(seconds)
+                result = f"Waited {seconds:.1f} seconds."
             elif tool_name == "computer_type_text":
                 text = str(tool_args.get("text") or "")
                 if len(text) > 1000:
@@ -238,11 +285,11 @@ class ComputerControlSession:
             return ""
 
     @staticmethod
-    def _pyautogui_call(method_name: str, *args: Any) -> str:
+    def _pyautogui_call(method_name: str, *args: Any, **kwargs: Any) -> str:
         try:
             import pyautogui
         except Exception as exc:
             return f"Error: pyautogui is unavailable: {exc}"
-        getattr(pyautogui, method_name)(*args)
+        getattr(pyautogui, method_name)(*args, **kwargs)
         time.sleep(0.05)
         return f"Executed {method_name}."

@@ -219,6 +219,8 @@ class LLMInteractionService:
         "\n"
         "Rules:\n"
         "- Operate only inside the user-granted paths available to your tools.\n"
+        "- Filesystem tools require absolute paths. Start from the resolved granted roots in the task message; do not use '.', '/', '~', '/home', or guessed Linux paths.\n"
+        "- Prefer fs_search_text on a resolved granted root when the task asks to find files or text recursively.\n"
         "- Do not request shell commands, deletion, overwrites, moves, renames, chmod, or hidden path expansion.\n"
         "- Prefer listing and stat before reading unfamiliar files.\n"
         "- Stop when the requested information has been found or the grant is insufficient.\n"
@@ -277,6 +279,7 @@ class LLMInteractionService:
         filesystem_max_read_bytes: int = 256_000,
         filesystem_max_list_entries: int = 200,
         computer_agent_model: Optional[str] = None,
+        computer_agent_family: str = "gemma",
         computer_task_timeout_seconds: float = 180.0,
         computer_max_actions_per_task: int = 40,
         computer_screenshot_dir: str = ".ambient_data/computer/screenshots",
@@ -293,6 +296,8 @@ class LLMInteractionService:
         artifact_max_existing_chars: int = 50_000,
         semantic_memory: Optional[Any] = None,
         interrupt_checker: Optional[Callable[[], None]] = None,
+        max_interaction_iterations: int = MAX_ITERATIONS,
+        final_turn_recovery_enabled: bool = True,
     ):
         self.llm = llm_provider
         self.tool_bridge = tool_bridge
@@ -305,6 +310,7 @@ class LLMInteractionService:
         self.filesystem_max_read_bytes = filesystem_max_read_bytes
         self.filesystem_max_list_entries = filesystem_max_list_entries
         self.computer_agent_model = computer_agent_model
+        self.computer_agent_family = (computer_agent_family or "gemma").strip().lower()
         self.computer_task_timeout_seconds = computer_task_timeout_seconds
         self.computer_max_actions_per_task = computer_max_actions_per_task
         self.computer_screenshot_dir = computer_screenshot_dir
@@ -322,6 +328,8 @@ class LLMInteractionService:
         self.capability_policy = capability_policy
         self.semantic_memory = semantic_memory
         self.interrupt_checker = interrupt_checker
+        self.max_interaction_iterations = max(1, int(max_interaction_iterations or self.MAX_ITERATIONS))
+        self.final_turn_recovery_enabled = bool(final_turn_recovery_enabled)
         self.artifact_root = Path(artifact_root) if artifact_root else (self.PARENT_DIR / "artifacts")
         self.artifact_root.mkdir(parents=True, exist_ok=True)
         self.artifact_organizer = (
@@ -516,6 +524,67 @@ class LLMInteractionService:
         """Return a defensive copy of the currently initialized tool surface."""
         return copy.deepcopy(self._tools or [])
 
+    def _default_final_turn_instruction(self, response_format: str) -> str:
+        response_format = (response_format or "plain").strip().lower()
+        if response_format == "json":
+            return (
+                "This is the final allowed model turn for this tool loop. Do not call tools. "
+                "Return valid JSON only using the tool results and messages already in this conversation. "
+                "If the available evidence is incomplete, return the required JSON shape with no findings "
+                "or with a blocker/error item rather than inventing facts."
+            )
+        if response_format == "browser_result":
+            return (
+                "This is the final allowed model turn for this browser task. Do not call tools. "
+                "Return a concise browser task result now: status, concrete summary, useful facts or links found, "
+                "material actions taken, blockers, and whether the user needs to act next."
+            )
+        if response_format == "computer_result":
+            return (
+                "This is the final allowed model turn for this computer-use task. Do not call tools. "
+                "Return a concise computer task result now: status, concrete summary, visible/current context, "
+                "material actions taken, blockers, and the next action needed from the user if any."
+            )
+        if response_format == "filesystem_result":
+            return (
+                "This is the final allowed model turn for this filesystem task. Do not call tools. "
+                "Return a concise result now: status, files or folders inspected, concrete findings, blockers, "
+                "and next steps."
+            )
+        return (
+            "This is the final allowed model turn for this tool loop. Do not call tools. "
+            "Return the best final answer now using the context already collected. Include completed work, "
+            "partial results, blockers, and concrete next steps where relevant."
+        )
+
+    def _with_loop_budget_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        iteration: int,
+        max_iterations: int,
+        turn_status_instructions: bool,
+        is_final_turn: bool,
+        final_turn_instruction: str,
+    ) -> List[Dict[str, Any]]:
+        if not turn_status_instructions and not is_final_turn:
+            return messages
+        request_messages = copy.deepcopy(messages)
+        remaining = max(0, max_iterations - iteration)
+        content = (
+            f"Tool loop budget: this is model turn {iteration} of {max_iterations}; "
+            f"{remaining} model turn(s) remain after this response."
+        )
+        if is_final_turn:
+            content += "\n\n" + final_turn_instruction.strip()
+        for message in request_messages:
+            if message.get("role") == "system":
+                message["content"] = f"{message.get('content') or ''}\n\n{content}".strip()
+                break
+        else:
+            request_messages.insert(0, {"role": "system", "content": content})
+        return request_messages
+
     async def _run_browser_agent(
         self,
         *,
@@ -620,6 +689,7 @@ class LLMInteractionService:
                             allowed_tool_names=allowed_tool_names,
                             report_policy="silent",
                             event_callback=event_callback,
+                            final_turn_response_format="browser_result",
                         ),
                         timeout=self.browser_task_timeout_seconds,
                     )
@@ -864,6 +934,10 @@ class LLMInteractionService:
             raise ValueError("use_filesystem requires a non-empty task.")
         if not self.filesystem_agent_model:
             raise RuntimeError("No filesystem model is configured.")
+        resolved_grants = [
+            str(Path(path).expanduser().resolve(strict=False))
+            for path in granted_paths
+        ]
 
         async with self._filesystem_lock:
             resident_model_name = self.llm.get_current_model()
@@ -884,7 +958,7 @@ class LLMInteractionService:
                 )
 
             session = FilesystemControlSession(
-                granted_paths=granted_paths,
+                granted_paths=resolved_grants,
                 max_read_bytes=self.filesystem_max_read_bytes,
                 max_list_entries=self.filesystem_max_list_entries,
             )
@@ -912,12 +986,18 @@ class LLMInteractionService:
                 }
                 fs_result = await asyncio.wait_for(
                     self.run_interaction(
-                        user_input="You have been given this read-only filesystem task:\n" + task.strip(),
+                        user_input=(
+                            "You have been given this read-only filesystem task:\n"
+                            f"{task.strip()}\n\n"
+                            "Resolved granted filesystem roots. Use only these absolute roots or child paths returned by filesystem tools:\n"
+                            + json.dumps(resolved_grants, ensure_ascii=False, indent=2)
+                        ),
                         system_prompt=self.FILESYSTEM_AGENT_PROMPT,
                         model=self.filesystem_agent_model,
                         agent_depth=agent_depth + 1,
                         allowed_tool_names=allowed_tool_names,
                         report_policy="silent",
+                        final_turn_response_format="filesystem_result",
                     ),
                     timeout=self.filesystem_task_timeout_seconds,
                 )
@@ -1053,13 +1133,14 @@ class LLMInteractionService:
                 computer_result = await asyncio.wait_for(
                     self.run_interaction(
                         user_input="You have been approved for this computer-use task:\n" + task.strip(),
-                        system_prompt=self.COMPUTER_AGENT_PROMPT,
+                        system_prompt=self._computer_agent_prompt(),
                         model=self.computer_agent_model,
                         agent_depth=1,
                         allowed_tool_names=allowed_tool_names,
                         report_policy="silent",
                         event_callback=event_callback,
                         iteration_image_provider=session.capture_screenshot_for_model,
+                        final_turn_response_format="computer_result",
                     ),
                     timeout=self.computer_task_timeout_seconds,
                 )
@@ -1108,6 +1189,33 @@ class LLMInteractionService:
                 )
             return computer_result
 
+    def _computer_agent_prompt(self) -> str:
+        if self.computer_agent_family == "ui_tars":
+            return (
+                "You are a dedicated UI-TARS-style computer-use executor working on one user-approved desktop-control task.\n\n"
+                "Rules:\n"
+                "- Perform only the approved task supplied by Ambient AI.\n"
+                "- You receive a fresh full-screen screenshot before every model turn. Treat that screenshot as the current desktop state.\n"
+                "- Use the provided computer_* tools only; do not answer with raw coordinates unless calling a tool.\n"
+                "- Mouse coordinates must use normalized 0..1000 coordinates, where (0,0) is top-left and (1000,1000) is bottom-right.\n"
+                "- Prefer short action sequences: inspect screenshot, act once, wait for the next screenshot, then continue.\n"
+                "- Do not use shell commands, system shutdown/logout/lock, credential entry, payment, checkout, or destructive file-manager actions.\n"
+                "- Do not bypass authentication, CAPTCHA, two-factor authentication, security warnings, or confirmation screens.\n"
+                "- When the task reaches a terminal state, call finish_computer_task exactly once with status, summary, material actions, and blockers.\n"
+            )
+        if self.computer_agent_family == "qwen_generic":
+            return (
+                "You are a dedicated visual desktop-control agent working on one user-approved task.\n\n"
+                "Rules:\n"
+                "- Use the screenshot attached to each turn as the authoritative desktop state.\n"
+                "- Call exactly one computer_* tool per step unless finishing.\n"
+                "- Use normalized 0..1000 coordinates for all mouse actions.\n"
+                "- Do not repeat an action if the previous screenshot did not visibly change; replan or inspect.\n"
+                "- Do not use shell commands, system shutdown/logout/lock, credential entry, payment, checkout, or destructive file-manager actions.\n"
+                "- When complete or blocked, call finish_computer_task exactly once.\n"
+            )
+        return self.COMPUTER_AGENT_PROMPT
+
     def _build_system_prompt(self, system_prompt: str) -> str:
         now = datetime.now()
         preamble = (
@@ -1140,6 +1248,11 @@ class LLMInteractionService:
         report_policy: str = "silent",
         event_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         iteration_image_provider: Optional[Callable[[], str]] = None,
+        max_iterations: Optional[int] = None,
+        turn_status_instructions: bool = True,
+        final_turn_instruction: Optional[str] = None,
+        disable_tools_on_final_turn: bool = True,
+        final_turn_response_format: str = "plain",
     ) -> str:
         """
         Run a full LLM interaction: send user input, stream response,
@@ -1177,6 +1290,11 @@ class LLMInteractionService:
                 tools_used=tools_used,
                 iteration=0,
                 iteration_image_provider=iteration_image_provider,
+                max_iterations=max_iterations,
+                turn_status_instructions=turn_status_instructions,
+                final_turn_instruction=final_turn_instruction,
+                disable_tools_on_final_turn=disable_tools_on_final_turn,
+                final_turn_response_format=final_turn_response_format,
             )
 
     async def resume_interaction(
@@ -1261,6 +1379,11 @@ class LLMInteractionService:
                 tools_used=tools_used,
                 iteration=int(checkpoint.get("iteration") or 0),
                 iteration_image_provider=None,
+                max_iterations=checkpoint.get("max_iterations"),
+                turn_status_instructions=bool(checkpoint.get("turn_status_instructions", True)),
+                final_turn_instruction=checkpoint.get("final_turn_instruction"),
+                disable_tools_on_final_turn=bool(checkpoint.get("disable_tools_on_final_turn", True)),
+                final_turn_response_format=str(checkpoint.get("final_turn_response_format") or "plain"),
             )
 
     def _image_for_iteration(
@@ -1315,11 +1438,23 @@ class LLMInteractionService:
         tools_used: List[str],
         iteration: int,
         iteration_image_provider: Optional[Callable[[], str]],
+        max_iterations: Optional[int],
+        turn_status_instructions: bool,
+        final_turn_instruction: Optional[str],
+        disable_tools_on_final_turn: bool,
+        final_turn_response_format: str,
     ) -> str:
         assistant_text = ""
-        while iteration < self.MAX_ITERATIONS:
+        loop_max = max(1, int(max_iterations or self.max_interaction_iterations or self.MAX_ITERATIONS))
+        recovery_enabled = self.final_turn_recovery_enabled
+        final_instruction = (
+            final_turn_instruction
+            or self._default_final_turn_instruction(final_turn_response_format)
+        )
+        while iteration < loop_max:
             self._check_interrupted()
             iteration += 1
+            is_final_turn = recovery_enabled and iteration >= loop_max
             self.logger.info(
                 "--- Iteration %s (agent depth %s/%s) ---",
                 iteration, agent_depth, self.MAX_AGENT_DEPTH,
@@ -1334,16 +1469,37 @@ class LLMInteractionService:
                 iteration=iteration,
                 iteration_image_provider=iteration_image_provider,
             )
+            request_messages = self._with_loop_budget_messages(
+                request_messages,
+                iteration=iteration,
+                max_iterations=loop_max,
+                turn_status_instructions=turn_status_instructions,
+                is_final_turn=is_final_turn,
+                final_turn_instruction=final_instruction,
+            )
+            request_tools = None
+            if not (is_final_turn and disable_tools_on_final_turn):
+                request_tools = self._tools_for_agent_depth(
+                    agent_depth, allowed_tool_names=allowed_tool_names
+                )
             completion = await self.llm.chat_completion_stream(
                 model=model,
                 messages=request_messages,
-                tools=self._tools_for_agent_depth(agent_depth, allowed_tool_names=allowed_tool_names),
+                tools=request_tools,
                 image=request_image_path,
             )
             assistant_text, tool_calls = await self._consume_stream(
-                completion, event_callback=event_callback,
+                completion,
+                event_callback=event_callback,
+                allow_text_tool_recovery=not is_final_turn,
             )
             self._check_interrupted()
+            if is_final_turn and disable_tools_on_final_turn and tool_calls:
+                self.logger.warning(
+                    "Ignoring %s tool call(s) emitted on final recovery turn.",
+                    len(tool_calls),
+                )
+                tool_calls = []
             if not tool_calls:
                 self._frame.messages.append({"role": "assistant", "content": assistant_text})
                 self.logger.info("Model finished (no more tool calls)")
@@ -1378,6 +1534,11 @@ class LLMInteractionService:
                     "report_policy": report_policy,
                     "iteration": iteration,
                     "tools_used": list(tools_used),
+                    "max_iterations": loop_max,
+                    "turn_status_instructions": turn_status_instructions,
+                    "final_turn_instruction": final_turn_instruction,
+                    "disable_tools_on_final_turn": disable_tools_on_final_turn,
+                    "final_turn_response_format": final_turn_response_format,
                     "suspended_tool_call_id": suspended.tool_call_id,
                     "suspended_tool_name": next(
                         (str(call.get("function", {}).get("name") or "") for call in tool_calls
@@ -1400,7 +1561,7 @@ class LLMInteractionService:
                 )
                 return terminal_result
 
-        self.logger.warning("Reached maximum iterations: (%s). Stopping.", self.MAX_ITERATIONS)
+        self.logger.warning("Reached maximum iterations: (%s). Stopping.", loop_max)
         await self._attach_user_report(
             report_policy=report_policy, interaction_run_id=interaction_run_id,
             model=model, user_input=user_input, final_response=assistant_text,
@@ -1460,6 +1621,7 @@ class LLMInteractionService:
         self,
         completion,
         event_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        allow_text_tool_recovery: bool = True,
     ) -> tuple[str, List[Dict]]:
         """
         Consume a streaming completion iterator.
@@ -1509,7 +1671,7 @@ class LLMInteractionService:
                         tool_calls[index]["function"]["arguments"] += tc_delta.function.arguments
 
         assistant_text = self._strip_think_tags(assistant_text).strip()
-        if not tool_calls:
+        if allow_text_tool_recovery and not tool_calls:
             raw_tool_source = "\n".join(
                 part for part in [raw_assistant_text, raw_reasoning_text] if part
             )
@@ -1812,6 +1974,7 @@ class LLMInteractionService:
                             agent_depth=agent_depth + 1,
                             allowed_tool_names=allowed_tool_names,
                             report_policy="silent",
+                            final_turn_response_format="plain",
                         )
                     finally:
                         self._pop_frame()
