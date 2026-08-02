@@ -287,6 +287,15 @@ def test_workspace_tool_names_classify_common_read_variants():
     assert registry.describe("calendar_create_event").capability == "communication.calendar.write"
 
 
+def test_document_tools_are_classified_as_read_or_reversible_local_writes():
+    registry = CapabilityRegistry()
+
+    assert registry.describe("document_read").capability == "filesystem.read"
+    edit = registry.describe("document_edit")
+    assert edit.capability == "documents.write"
+    assert edit.reversible is True
+
+
 def test_computer_read_only_session_hides_typing_tools():
     session = ComputerControlSession(read_only=True)
     try:

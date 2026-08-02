@@ -67,6 +67,10 @@ class CapabilityRegistry:
             return self._d(name, "context.observe", "context", "read", False, True, "low", ("screen",), "result")
         if lowered == "use_filesystem" or lowered.startswith("fs_"):
             return self._d(name, "filesystem.read", "local_control", "read", False, True, "medium", ("filesystem",), "result", 2)
+        if lowered in {"document_inspect", "document_read", "document_list_backups"}:
+            return self._d(name, "filesystem.read", "local_control", "read", False, True, "medium", ("documents", "filesystem"), "result", 2)
+        if lowered in {"document_create", "document_edit"}:
+            return self._d(name, "documents.write", "local_control", "write", False, True, "medium", ("documents", "filesystem"), "file_exists", 2)
         if lowered == "request_computer_use":
             return self._d(name, "computer.use", "local_control", "write", True, False, "critical", ("screen", "keyboard", "mouse"), "explicit", 4)
         if lowered.startswith("computer_"):
@@ -187,6 +191,7 @@ class CapabilityPolicyService:
         "finance.mutate": "deny",
         "filesystem.read": "ask",
         "filesystem.write": "deny",
+        "documents.write": "ask",
         "computer.observe": "ask",
         "computer.use": "ask",
         "computer.mutate": "deny",
