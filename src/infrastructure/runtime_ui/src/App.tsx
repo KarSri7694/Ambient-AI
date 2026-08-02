@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Activity, Archive, BarChart3, Bot, BrainCircuit, Database, FileText, Home, Inbox,
   ListRestart, MessageSquare, Moon, OctagonX, Pause, Play, RotateCcw, ScrollText, Sun, TestTube2,
-  UserRound,
+  UserRound, Repeat2,
 } from "lucide-react";
 import { getJson, sendJson } from "./api";
 import { Badge, Button } from "./components/ui";
@@ -18,12 +18,14 @@ import { RealWorldTestsPage } from "./pages/RealWorldTestsPage";
 import { ProcessingQueuePage } from "./pages/ProcessingQueuePage";
 import { ArtifactsPage } from "./pages/ArtifactsPage";
 import { HomePage } from "./pages/HomePage";
+import { RecurringTasksPage } from "./pages/RecurringTasksPage";
 
 const routes = [
   { path: "/home", label: "Home", icon: Home },
   { path: "/chat", label: "Chat", icon: MessageSquare },
   { path: "/interactions", label: "Interactions", icon: Database },
   { path: "/inbox", label: "Proactive Inbox", icon: Inbox },
+  { path: "/recurring-tasks", label: "Monitors", icon: Repeat2 },
   { path: "/processing-queue", label: "Processing Queue", icon: ListRestart },
   { path: "/reports", label: "Reports", icon: FileText },
   { path: "/artifacts", label: "Artifacts", icon: Archive },
@@ -134,6 +136,7 @@ export function App() {
       case "/home": return <HomePage onNavigate={navigate} />;
       case "/interactions": return <InteractionsPage />;
       case "/inbox": return <InboxPage privacy={privacy.data} resources={resources.data} />;
+      case "/recurring-tasks": return <RecurringTasksPage />;
       case "/processing-queue": return <ProcessingQueuePage />;
       case "/reports": return <ReportsPage />;
       case "/artifacts": return <ArtifactsPage />;

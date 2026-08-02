@@ -649,6 +649,46 @@ async def schedule_task_at(
 
 
 @mcp.tool
+async def create_recurring_task(
+    title: Annotated[str, "Short name for the monitor or repeating task"],
+    instruction: Annotated[str, "Detailed standalone instruction for each run"],
+    task_kind: Annotated[str, "interval for repeated work, monitor for a change/condition"],
+    source_kind: Annotated[str, "screen, gmail, calendar, or another approved read-only source"] = "screen",
+    interval_seconds: Annotated[int, "How often to check or run, at least 10 seconds"] = 1800,
+    monitor_condition: Annotated[str, "For monitors, the factual condition that ends the wait"] = "",
+    stop_condition: Annotated[str, "Optional additional condition that cancels monitoring"] = "",
+    source_scope: Annotated[dict, "Optional foreground source binding: app_name, process_name, domain"] = {},
+    safe_actions: Annotated[list[str], "Optional pre-approved safe actions: local_note, email_draft, todoist_item"] = [],
+) -> str:
+    """Create a durable interval task or privacy-bound monitor. Implemented by Ambient runtime."""
+    pass
+
+
+@mcp.tool
+async def list_recurring_tasks() -> str:
+    """List the user's active and paused recurring tasks and monitors."""
+    pass
+
+
+@mcp.tool
+async def pause_recurring_task(task_id: Annotated[str, "Recurring task identifier"]) -> str:
+    """Pause a recurring task without deleting its state."""
+    pass
+
+
+@mcp.tool
+async def resume_recurring_task(task_id: Annotated[str, "Recurring task identifier"]) -> str:
+    """Resume a paused recurring task or monitor."""
+    pass
+
+
+@mcp.tool
+async def cancel_recurring_task(task_id: Annotated[str, "Recurring task identifier"]) -> str:
+    """Cancel a recurring task permanently."""
+    pass
+
+
+@mcp.tool
 async def use_filesystem(
     task: Annotated[
         str,

@@ -72,6 +72,9 @@ Do not repeat an action already reported as performed.
         visual_context_batch_size: int = 1,
         visual_context_batch_max_wait_seconds: int = 60,
         visual_context_batch_flush_high_salience: bool = True,
+        recurring_task_service: Any = None,
+        user_idle_checker: Any = None,
+        user_idle_seconds_provider: Any = None,
         logger: logging.Logger | None = None,
     ):
         self.store = store
@@ -94,6 +97,9 @@ Do not repeat an action already reported as performed.
         self.visual_context_batch_size = max(1, int(visual_context_batch_size))
         self.visual_context_batch_max_wait_seconds = max(1, int(visual_context_batch_max_wait_seconds))
         self.visual_context_batch_flush_high_salience = bool(visual_context_batch_flush_high_salience)
+        self.recurring_task_service = recurring_task_service
+        self.user_idle_checker = user_idle_checker
+        self.user_idle_seconds_provider = user_idle_seconds_provider
         self.logger = logger or logging.getLogger(self.__class__.__name__)
 
     def enqueue_visual_observation(self, observation: VisualObservation) -> AmbientEvent:
@@ -800,6 +806,15 @@ Do not repeat an action already reported as performed.
                 priority=0.78,
             )
         else:
+            if self.recurring_task_service is not None:
+                try:
+                    user_idle = bool(self.user_idle_checker()) if self.user_idle_checker is not None else False
+                    if not user_idle:
+                        self.recurring_task_service.mark_visual_completion_seen(observation)
+                    idle_seconds = float(self.user_idle_seconds_provider()) if self.user_idle_seconds_provider is not None else 0.0
+                    self.recurring_task_service.evaluate_visual_observation(observation, user_idle=user_idle, idle_seconds=idle_seconds)
+                except Exception:
+                    self.logger.exception("Recurring monitor evaluation failed for %s", observation.observation_id)
             downstream_event = self._enqueue_visual_batch_or_single(observation, payload)
         enriched = {
             **payload,
@@ -954,6 +969,17 @@ Do not repeat an action already reported as performed.
         updated = replace(updated, analysis_status=status, needs_deep_analysis=False)
         if memory is not None and hasattr(memory, "append_visual_observation"):
             memory.append_visual_observation(updated)
+        if self.recurring_task_service is not None:
+            try:
+                user_idle = bool(self.user_idle_checker()) if self.user_idle_checker is not None else False
+                if user_idle:
+                    idle_seconds = float(self.user_idle_seconds_provider()) if self.user_idle_seconds_provider is not None else 0.0
+                    self.recurring_task_service.evaluate_visual_observation(updated, user_idle=True, idle_seconds=idle_seconds)
+                else:
+                    self.recurring_task_service.mark_visual_completion_seen(updated)
+                    self.recurring_task_service.evaluate_visual_observation(updated, user_idle=False, idle_seconds=0.0)
+            except Exception:
+                self.logger.exception("Recurring monitor evaluation failed for visual observation %s", updated.observation_id)
         downstream = self._enqueue_visual_batch_or_single(updated, payload)
         self.store.complete_event(event.event_id)
         return {

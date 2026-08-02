@@ -130,6 +130,30 @@ class Notification:
 
 
 @dataclass(frozen=True)
+class RecurringTask:
+    """A durable interval task or condition monitor owned by the autonomy runtime."""
+    task_id: str
+    title: str
+    instruction: str
+    task_kind: str
+    source_kind: str
+    status: str
+    interval_seconds: int
+    next_run_at: str
+    monitor_condition: str = ""
+    stop_condition: str = ""
+    source_scope_json: str = "{}"
+    safe_actions_json: str = "[]"
+    origin_kind: str = "chat"
+    origin_ref: str = ""
+    last_result_json: str = "{}"
+    created_at: str = ""
+    updated_at: str = ""
+    last_run_at: str | None = None
+    completed_at: str | None = None
+
+
+@dataclass(frozen=True)
 class SpeakerRecord:
     """A durable speaker identity used by the memory system."""
     speaker_id: str

@@ -15,6 +15,7 @@ from core.models import (
     DelegatedTask,
     OpportunityCandidate,
     ProactiveInboxItem,
+    RecurringTask,
 )
 
 
@@ -253,6 +254,56 @@ class SQLiteAutonomyAdapter(AutonomyStorePort):
                 );
                 CREATE INDEX IF NOT EXISTS idx_calibration_capability
                     ON calibration_outcomes(capability, created_at);
+                CREATE TABLE IF NOT EXISTS recurring_tasks (
+                    task_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    instruction TEXT NOT NULL,
+                    task_kind TEXT NOT NULL,
+                    source_kind TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    interval_seconds INTEGER NOT NULL,
+                    next_run_at TEXT NOT NULL,
+                    monitor_condition TEXT NOT NULL DEFAULT '',
+                    stop_condition TEXT NOT NULL DEFAULT '',
+                    source_scope_json TEXT NOT NULL DEFAULT '{}',
+                    safe_actions_json TEXT NOT NULL DEFAULT '[]',
+                    origin_kind TEXT NOT NULL,
+                    origin_ref TEXT NOT NULL DEFAULT '',
+                    last_result_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_run_at TEXT,
+                    completed_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_recurring_tasks_due
+                    ON recurring_tasks(status, next_run_at);
+                CREATE TABLE IF NOT EXISTS recurring_monitor_state (
+                    task_id TEXT PRIMARY KEY,
+                    state TEXT NOT NULL,
+                    evidence TEXT NOT NULL DEFAULT '',
+                    completion_fingerprint TEXT NOT NULL DEFAULT '',
+                    user_seen INTEGER NOT NULL DEFAULT 0,
+                    notification_state TEXT NOT NULL DEFAULT 'none',
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(task_id) REFERENCES recurring_tasks(task_id)
+                );
+                CREATE TABLE IF NOT EXISTS recurring_task_runs (
+                    run_id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    status TEXT NOT NULL,
+                    result_json TEXT NOT NULL DEFAULT '{}',
+                    error_text TEXT,
+                    FOREIGN KEY(task_id) REFERENCES recurring_tasks(task_id)
+                );
+                CREATE TABLE IF NOT EXISTS recurring_todoist_mappings (
+                    todoist_task_id TEXT PRIMARY KEY,
+                    recurring_task_id TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(recurring_task_id) REFERENCES recurring_tasks(task_id)
+                );
                 """
             )
             conn.execute(
@@ -566,13 +617,22 @@ class SQLiteAutonomyAdapter(AutonomyStorePort):
                 placeholders = ",".join("?" for _ in normalized_types)
                 type_clause = f"AND event_type IN ({placeholders})"
                 params.extend(normalized_types)
+            # Passive screenshots are a FIFO stream: process the oldest queued
+            # screenshot first so a long backlog preserves temporal order. Other
+            # autonomy work keeps its priority-aware ordering.
+            visual_only = bool(event_types) and set(normalized_types) == {"lightweight_visual_capture"}
+            order_clause = (
+                "ORDER BY julianday(occurred_at) ASC, rowid ASC"
+                if visual_only
+                else "ORDER BY priority DESC, julianday(occurred_at) ASC, rowid ASC"
+            )
             row = conn.execute(
                 f"""
                 SELECT event_id FROM ambient_events
                 WHERE status IN ('pending', 'resource_deferred')
                   AND julianday(available_at) <= julianday(?)
                 {type_clause}
-                ORDER BY priority DESC, julianday(occurred_at) ASC LIMIT 1
+                {order_clause} LIMIT 1
                 """,
                 params,
             ).fetchone()
@@ -738,7 +798,7 @@ class SQLiteAutonomyAdapter(AutonomyStorePort):
                 """SELECT * FROM ambient_events
                    WHERE event_type IN ('lightweight_visual_capture', 'audio_capture_pending')
                      AND status IN ('pending', 'resource_deferred', 'leased')
-                   ORDER BY julianday(occurred_at) ASC LIMIT ?""",
+                   ORDER BY julianday(occurred_at) DESC, rowid DESC LIMIT ?""",
                 (max(1, min(int(limit), 2000)),),
             ).fetchall()
         return [self._event_from_row(row) for row in rows]
@@ -1392,6 +1452,139 @@ class SQLiteAutonomyAdapter(AutonomyStorePort):
                 "INSERT INTO autonomy_audit VALUES (?, ?, ?, ?, ?, ?)",
                 (uuid.uuid4().hex, _utciso(), actor, action, target, json.dumps(details, ensure_ascii=False)),
             )
+
+    # --- Recurring task storage -------------------------------------------------
+    # These methods intentionally live beside the autonomy event store: recurring
+    # work needs the same crash-safe SQLite/WAL semantics and audit trail.
+    def upsert_recurring_task(self, task: RecurringTask) -> RecurringTask:
+        values = task.__dict__.copy()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """INSERT INTO recurring_tasks(task_id,title,instruction,task_kind,source_kind,status,
+                   interval_seconds,next_run_at,monitor_condition,stop_condition,source_scope_json,
+                   safe_actions_json,origin_kind,origin_ref,last_result_json,created_at,updated_at,
+                   last_run_at,completed_at)
+                   VALUES (:task_id,:title,:instruction,:task_kind,:source_kind,:status,:interval_seconds,
+                   :next_run_at,:monitor_condition,:stop_condition,:source_scope_json,:safe_actions_json,
+                   :origin_kind,:origin_ref,:last_result_json,:created_at,:updated_at,:last_run_at,:completed_at)
+                   ON CONFLICT(task_id) DO UPDATE SET title=excluded.title,instruction=excluded.instruction,
+                   task_kind=excluded.task_kind,source_kind=excluded.source_kind,status=excluded.status,
+                   interval_seconds=excluded.interval_seconds,next_run_at=excluded.next_run_at,
+                   monitor_condition=excluded.monitor_condition,stop_condition=excluded.stop_condition,
+                   source_scope_json=excluded.source_scope_json,safe_actions_json=excluded.safe_actions_json,
+                   origin_kind=excluded.origin_kind,origin_ref=excluded.origin_ref,
+                   last_result_json=excluded.last_result_json,updated_at=excluded.updated_at,
+                   last_run_at=excluded.last_run_at,completed_at=excluded.completed_at""",
+                values,
+            )
+            row = conn.execute("SELECT * FROM recurring_tasks WHERE task_id=?", (task.task_id,)).fetchone()
+        return self._recurring_task_from_row(row)
+
+    def list_recurring_tasks(self, *, status: str | None = None, limit: int = 100) -> list[RecurringTask]:
+        query = "SELECT * FROM recurring_tasks"
+        params: list[Any] = []
+        if status:
+            query += " WHERE status=?"
+            params.append(status)
+        query += " ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'paused' THEN 1 ELSE 2 END, next_run_at, created_at LIMIT ?"
+        params.append(max(1, min(int(limit), 500)))
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [self._recurring_task_from_row(row) for row in rows]
+
+    def list_due_recurring_tasks(self, now_utc: str, *, limit: int = 5) -> list[RecurringTask]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT * FROM recurring_tasks WHERE status='active' AND next_run_at<=?
+                   ORDER BY next_run_at ASC LIMIT ?""",
+                (_normalize_utciso(now_utc) or now_utc, max(1, min(int(limit), 100))),
+            ).fetchall()
+        return [self._recurring_task_from_row(row) for row in rows]
+
+    def update_recurring_task_status(self, task_id: str, status: str) -> RecurringTask | None:
+        completed_at = _utciso() if status in {"completed", "cancelled"} else None
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE recurring_tasks SET status=?, updated_at=?, completed_at=? WHERE task_id=?",
+                (status, _utciso(), completed_at, task_id),
+            )
+            if not cursor.rowcount:
+                return None
+            row = conn.execute("SELECT * FROM recurring_tasks WHERE task_id=?", (task_id,)).fetchone()
+        return self._recurring_task_from_row(row)
+
+    def run_recurring_task_now(self, task_id: str) -> RecurringTask | None:
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE recurring_tasks SET status='active', next_run_at=?, updated_at=? WHERE task_id=? AND status NOT IN ('cancelled','completed')",
+                (_utciso(), _utciso(), task_id),
+            )
+            if not cursor.rowcount:
+                return None
+            row = conn.execute("SELECT * FROM recurring_tasks WHERE task_id=?", (task_id,)).fetchone()
+        return self._recurring_task_from_row(row)
+
+    def record_recurring_task_run(self, task_id: str, *, result: dict[str, Any], status: str, next_run_at: str, last_run_at: str) -> RecurringTask | None:
+        now = _utciso()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """INSERT INTO recurring_task_runs(run_id,task_id,started_at,completed_at,status,result_json)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (uuid.uuid4().hex, task_id, last_run_at, now, status, json.dumps(result, ensure_ascii=False)),
+            )
+            cursor = conn.execute(
+                """UPDATE recurring_tasks SET status=?, last_result_json=?, last_run_at=?, next_run_at=?, updated_at=?
+                   WHERE task_id=?""",
+                (status, json.dumps(result, ensure_ascii=False), last_run_at, _normalize_utciso(next_run_at) or next_run_at, now, task_id),
+            )
+            if not cursor.rowcount:
+                return None
+            row = conn.execute("SELECT * FROM recurring_tasks WHERE task_id=?", (task_id,)).fetchone()
+        return self._recurring_task_from_row(row)
+
+    def get_recurring_monitor_state(self, task_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM recurring_monitor_state WHERE task_id=?", (task_id,)).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["user_seen"] = bool(result.get("user_seen"))
+        return result
+
+    def upsert_recurring_monitor_state(self, task_id: str, *, state: str, evidence: str, completion_fingerprint: str = "", user_seen: bool = False, notification_state: str = "none") -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """INSERT INTO recurring_monitor_state(task_id,state,evidence,completion_fingerprint,user_seen,notification_state,updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(task_id) DO UPDATE SET state=excluded.state,evidence=excluded.evidence,
+                   completion_fingerprint=excluded.completion_fingerprint,user_seen=excluded.user_seen,
+                   notification_state=excluded.notification_state,updated_at=excluded.updated_at""",
+                (task_id, state, evidence, completion_fingerprint, int(bool(user_seen)), notification_state, _utciso()),
+            )
+
+    def add_recurring_task_inbox_item(self, task_id: str, *, title: str, summary: str, delivery: str) -> ProactiveInboxItem:
+        now = _utciso()
+        fingerprint = hashlib.sha256(f"recurring:{task_id}:{title}:{summary}".encode("utf-8")).hexdigest()
+        opportunity = OpportunityCandidate(
+            opportunity_id=uuid.uuid4().hex, fingerprint=fingerprint, title=title, goal=title,
+            rationale="A user-created monitor observed its configured completion condition.",
+            source_event_ids=[], expected_value=0.9, urgency=0.7, confidence=0.8,
+            cost_of_wrong=0.25, personalization_benefit=0.5, evidence_gaps=[], status="surfaced",
+            created_at=now, updated_at=now, metadata_json=json.dumps({"recurring_task_id": task_id, "delivery": delivery}),
+        )
+        opportunity = self.upsert_opportunity(opportunity)
+        item = ProactiveInboxItem(
+            inbox_id=uuid.uuid4().hex, opportunity_id=opportunity.opportunity_id, title=title,
+            summary=summary, detailed_report=summary, status="open", confidence=0.8,
+            why_now="A monitor you created observed a requested change.",
+            sources_json=json.dumps([{"recurring_task_id": task_id}], ensure_ascii=False),
+            personalization_json="{}", actions_json=json.dumps({"delivery": delivery}, ensure_ascii=False),
+            created_at=now, updated_at=now,
+        )
+        return self.add_inbox_item(item)
+
+    def _recurring_task_from_row(self, row: sqlite3.Row) -> RecurringTask:
+        return RecurringTask(**dict(row))
 
     def _event_from_row(self, row: sqlite3.Row) -> AmbientEvent:
         return AmbientEvent(**dict(row))

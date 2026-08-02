@@ -1090,6 +1090,41 @@ def create_runtime_log_app(
         rows = autonomy_store.list_inbox_items(limit=limit, status=status) if autonomy_store is not None else []
         return {"items": [_as_dict(row) for row in rows], "count": len(rows)}
 
+    @app.get("/api/recurring-tasks")
+    def list_recurring_tasks(
+        status: str | None = Query(default=None),
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> dict[str, Any]:
+        if autonomy_store is None or not hasattr(autonomy_store, "list_recurring_tasks"):
+            return {"tasks": [], "count": 0, "available": False}
+        rows = autonomy_store.list_recurring_tasks(status=status, limit=limit)
+        payload = []
+        for row in rows:
+            item = _as_dict(row)
+            item["monitor_state"] = autonomy_store.get_recurring_monitor_state(row.task_id)
+            item["source_scope"] = _safe_json(row.source_scope_json, {})
+            item["safe_actions"] = _safe_json(row.safe_actions_json, [])
+            item["last_result"] = _safe_json(row.last_result_json, {})
+            payload.append(item)
+        return {"tasks": payload, "count": len(payload), "available": True}
+
+    @app.post("/api/recurring-tasks/{task_id}/{action}")
+    def recurring_task_action(task_id: str, action: str) -> dict[str, Any]:
+        if autonomy_store is None or not hasattr(autonomy_store, "update_recurring_task_status"):
+            raise HTTPException(status_code=503, detail="recurring_tasks_unavailable")
+        if action == "run":
+            task = autonomy_store.run_recurring_task_now(task_id) if hasattr(autonomy_store, "run_recurring_task_now") else None
+            if task is None:
+                raise HTTPException(status_code=404, detail="recurring_task_not_runnable")
+            return {"ok": True, "task": _as_dict(task)}
+        mapping = {"pause": "paused", "resume": "active", "cancel": "cancelled"}
+        if action not in mapping:
+            raise HTTPException(status_code=400, detail="unsupported_action")
+        task = autonomy_store.update_recurring_task_status(task_id, mapping[action])
+        if task is None:
+            raise HTTPException(status_code=404, detail="recurring_task_not_found")
+        return {"ok": True, "task": _as_dict(task)}
+
     @app.post("/api/autonomy/inbox/{inbox_id}/feedback")
     async def proactive_inbox_feedback(inbox_id: str, request: Request) -> dict[str, Any]:
         if autonomy_store is None:
@@ -1626,6 +1661,7 @@ def create_runtime_log_app(
     @app.get("/reports", response_class=HTMLResponse)
     @app.get("/artifacts", response_class=HTMLResponse)
     @app.get("/inbox", response_class=HTMLResponse)
+    @app.get("/recurring-tasks", response_class=HTMLResponse)
     @app.get("/chat", response_class=HTMLResponse)
     @app.get("/interactions", response_class=HTMLResponse)
     @app.get("/", response_class=HTMLResponse)

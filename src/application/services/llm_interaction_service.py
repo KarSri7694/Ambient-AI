@@ -22,6 +22,7 @@ from application.services.interaction_trace import (
     interaction_trace,
 )
 from application.services.scheduled_task_service import ScheduledTaskService
+from application.services.recurring_task_service import RecurringTaskService
 from application.services.capability_policy_service import (
     ApprovalRequiredError,
     CapabilityPolicyService,
@@ -290,6 +291,7 @@ class LLMInteractionService:
         computer_enabled: bool = False,
         local_control_approval_ttl_minutes: int = 30,
         scheduled_task_service: Optional[ScheduledTaskService] = None,
+        recurring_task_service: Optional[RecurringTaskService] = None,
         reporter_model: Optional[str] = None,
         artifact_root: Optional[str] = None,
         capability_policy: Optional[CapabilityPolicyService] = None,
@@ -322,6 +324,7 @@ class LLMInteractionService:
         self.computer_enabled = computer_enabled
         self.local_control_approval_ttl_minutes = max(1, int(local_control_approval_ttl_minutes))
         self.scheduled_task_service = scheduled_task_service
+        self.recurring_task_service = recurring_task_service
         self.logger = logging.getLogger(self.__class__.__name__)
         self._tools: Optional[List[Dict[str, Any]]] = None
         self._frame_stack: List[AgentFrame] = [AgentFrame(tool_bridge=tool_bridge)]
@@ -1986,6 +1989,44 @@ class LLMInteractionService:
                         },
                     )
                     response_content = json.dumps(scheduled, ensure_ascii=False)
+                elif tool_name == "create_recurring_task":
+                    if self.recurring_task_service is None:
+                        raise RuntimeError("Recurring task scheduling is not configured.")
+                    metadata = current_interaction_metadata()
+                    raw_scope = tool_args.get("source_scope")
+                    source_scope = raw_scope if isinstance(raw_scope, dict) else {}
+                    task = self.recurring_task_service.create(
+                        title=str(tool_args.get("title", "")),
+                        instruction=str(tool_args.get("instruction", "")),
+                        task_kind=str(tool_args.get("task_kind", "")),
+                        source_kind=str(tool_args.get("source_kind", "screen")),
+                        interval_seconds=int(tool_args.get("interval_seconds", 1800) or 1800),
+                        monitor_condition=str(tool_args.get("monitor_condition", "")),
+                        stop_condition=str(tool_args.get("stop_condition", "")),
+                        source_scope=source_scope,
+                        safe_actions=[str(item) for item in (tool_args.get("safe_actions") or [])],
+                        origin_kind="chat",
+                        origin_ref=str(metadata.get("chat_session_id") or ""),
+                    )
+                    response_content = json.dumps({"status": "created", "task": task.__dict__}, ensure_ascii=False)
+                elif tool_name in {"list_recurring_tasks", "pause_recurring_task", "resume_recurring_task", "cancel_recurring_task"}:
+                    if self.recurring_task_service is None:
+                        raise RuntimeError("Recurring task scheduling is not configured.")
+                    if tool_name == "list_recurring_tasks":
+                        response_content = json.dumps(
+                            {"tasks": [task.__dict__ for task in self.recurring_task_service.list(limit=100)]},
+                            ensure_ascii=False,
+                        )
+                    else:
+                        status = {
+                            "pause_recurring_task": "paused",
+                            "resume_recurring_task": "active",
+                            "cancel_recurring_task": "cancelled",
+                        }[tool_name]
+                        task = self.recurring_task_service.set_status(str(tool_args.get("task_id", "")), status)
+                        response_content = json.dumps(
+                            {"status": status, "task": task.__dict__ if task else None}, ensure_ascii=False
+                        )
                 elif tool_name == "load_agent":
                     if agent_depth >= self.MAX_AGENT_DEPTH:
                         response_content = (

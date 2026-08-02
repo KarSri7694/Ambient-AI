@@ -96,6 +96,8 @@ class CapabilityRegistry:
             return self._d(name, "communication.send", "communication", "write", True, False, "high", ("communications",), "provider_readback", 2, True)
         if lowered in {"google_search", "tavily_search"} or lowered.startswith("search"):
             return self._d(name, "research.web", "research", "read", False, True, "low", ("web",), "sources", 2)
+        if lowered in {"create_recurring_task", "pause_recurring_task", "resume_recurring_task", "cancel_recurring_task", "list_recurring_tasks"}:
+            return self._d(name, "assistance.recurring", "personal_assistance", "write" if lowered != "list_recurring_tasks" else "read", lowered != "list_recurring_tasks", True, "medium", ("tasks",), "provider_readback", 1, True)
         if lowered in {"add_task", "queue_night_task", "schedule_task_at"} or "reminder" in lowered:
             return self._d(name, "assistance.reminder", "personal_assistance", "write", True, True, "medium", ("tasks",), "provider_readback", 1, True)
         if "calendar" in lowered and self._looks_read_only_tool(lowered):
@@ -179,6 +181,7 @@ class CapabilityPolicyService:
         "research.web": "auto_reversible",
         "assistance.artifact": "auto_reversible",
         "assistance.reminder": "auto_reversible",
+        "assistance.recurring": "auto_reversible",
         "assistance.calendar.read": "auto_reversible",
         "communication.read": "ask",
         "communication.calendar.write": "ask",
@@ -232,6 +235,9 @@ class CapabilityPolicyService:
             decision = self._policy_for(descriptor.capability)
             if source.startswith("autonomy"):
                 if decision not in {"auto_reversible", "trusted_bounded"}:
+                    continue
+                if descriptor.capability == "assistance.recurring":
+                    # Only an explicit chat/Todoist directive may create durable work.
                     continue
                 if descriptor.capability == "assistance.reminder" and confidence < self.reminder_confidence_threshold:
                     continue

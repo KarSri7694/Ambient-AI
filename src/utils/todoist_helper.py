@@ -98,7 +98,20 @@ class TodoistHelper:
                 task_id = getattr(task, "id", None)
                 if content is None or task_id is None:
                     continue
-                normalized_tasks.append({"content": content, "id": task_id})
+                due = getattr(task, "due", None)
+                labels = getattr(task, "labels", None) or []
+                normalized_tasks.append(
+                    {
+                        "content": content,
+                        "id": task_id,
+                        "description": getattr(task, "description", "") or "",
+                        "labels": [str(label) for label in labels],
+                        "updated_at": str(getattr(task, "updated_at", "") or ""),
+                        "due_string": str(getattr(due, "string", "") or "") if due else "",
+                        "due_datetime": str(getattr(due, "datetime", "") or "") if due else "",
+                        "due_is_recurring": bool(getattr(due, "is_recurring", False)) if due else False,
+                    }
+                )
             return normalized_tasks
         except Exception as exc:
             self.logger.warning("Error fetching Todoist tasks: %s", exc)

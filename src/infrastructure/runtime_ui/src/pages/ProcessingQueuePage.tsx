@@ -57,7 +57,9 @@ export function ProcessingQueuePage() {
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["processing-queue"] }),
   });
   const items = useMemo(
-    () => (queue.data?.items || []).filter((item) => filter === "all" || item.modality === filter),
+    () => [...(queue.data?.items || [])]
+      .filter((item) => filter === "all" || item.modality === filter)
+      .sort((left, right) => Date.parse(right.occurred_at) - Date.parse(left.occurred_at)),
     [queue.data?.items, filter],
   );
 

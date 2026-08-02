@@ -18,6 +18,7 @@ from application.services.reflection_service import ReflectionService
 from application.services.llm_interaction_service import InteractionSuspended, LLMInteractionService
 from application.services.interaction_trace import interaction_trace
 from application.services.scheduled_task_service import ScheduledTaskService
+from application.services.recurring_task_service import RecurringTaskService
 from application.services.passive_observer_service import PassiveObserverService
 from application.services.semantic_deduplication_service import SemanticDeduplicationService
 from application.services.semantic_memory_service import SemanticMemoryService
@@ -62,6 +63,7 @@ from infrastructure.adapter.SQLiteVoiceAdapter import SQLiteVoiceAdapter
 from infrastructure.adapter.SQLiteAutonomyAdapter import SQLiteAutonomyAdapter
 from infrastructure.adapter.TodoistTaskAdapter import TodoistTaskAdapter
 from infrastructure.adapter.UIATAdapter import UIATAdapter
+from infrastructure.adapter.WindowsToastNotifier import WindowsToastNotifier
 from infrastructure.windows_resource_monitor import WindowsResourceMonitor
 from infrastructure.runtime_log_server import (
     configure_runtime_log_streaming,
@@ -194,6 +196,14 @@ PASSIVE_OBSERVER_VISUAL_CONTEXT_BATCH_FLUSH_HIGH_SALIENCE = CONFIG.get_bool(
     "passive_observer", "visual_context_batch_flush_high_salience", True
 )
 PASSIVE_OBSERVER_UIAT_MODE = CONFIG.get_str("passive_observer", "uiat_mode", "screen_content")
+RECURRING_TASKS_ENABLED = CONFIG.get_bool("recurring_tasks", "enabled", True)
+RECURRING_TASKS_DEFAULT_INTERVAL_MINUTES = CONFIG.get_int("recurring_tasks", "default_interval_minutes", 30)
+RECURRING_TASKS_MINIMUM_INTERVAL_SECONDS = CONFIG.get_int("recurring_tasks", "minimum_interval_seconds", 10)
+RECURRING_TASKS_MAX_ACTIVE = CONFIG.get_int("recurring_tasks", "max_active_tasks", 20)
+RECURRING_TASKS_IDLE_SCREEN_MONITORING = CONFIG.get_bool("recurring_tasks", "idle_screen_monitoring_enabled", True)
+RECURRING_TASKS_ABSENCE_THRESHOLD_MINUTES = CONFIG.get_int("recurring_tasks", "absence_threshold_minutes", 5)
+RECURRING_TASKS_TODOIST_LABEL = CONFIG.get_str("recurring_tasks", "todoist_label", "ambient").strip().lower()
+RECURRING_TASKS_TODOIST_SYNC_SECONDS = CONFIG.get_float("recurring_tasks", "todoist_sync_seconds", 60.0)
 LOG_API_ENABLED = CONFIG.get_bool("log_api", "enabled", True)
 LOG_API_HOST = CONFIG.get_str("log_api", "host", "0.0.0.0")
 LOG_API_PORT = CONFIG.get_int("log_api", "port", 8765)
@@ -473,7 +483,9 @@ class AmbientRuntime:
         "Use state-changing tools only when the user's current message explicitly requests the action. "
         "For a clear request to do something at an exact future time, call schedule_task_at with a detailed "
         "standalone task and an absolute ISO 8601 date-time. If the requested time is ambiguous, ask a short "
-        "clarifying question instead of guessing. Execute explicitly requested immediate tasks now."
+        "clarifying question instead of guessing. For a request to monitor a condition until it changes or "
+        "to repeat work at an interval, call create_recurring_task with a factual completion condition, a "
+        "bounded interval, and only explicitly requested safe actions. Execute explicitly requested immediate tasks now."
     )
 
     def __init__(   
@@ -951,6 +963,21 @@ class AmbientRuntime:
         tool_bridge = MCPToolAdapter()
         task_queue = SQLiteTaskQueueAdapter()
         scheduled_task_service = ScheduledTaskService(task_queue)
+        windows_toast_notifier = WindowsToastNotifier()
+        def _recurring_toast(title: str, message: str) -> None:
+            # Persisted notifications are the dependable cross-platform fallback.
+            # A desktop notifier can be added without changing monitor semantics.
+            night_mode.add_notification(f"{title}: {message}", source="recurring_monitor")
+            windows_toast_notifier.notify(title, message)
+            logger.info("Recurring monitor notification: %s", title)
+        recurring_task_service = RecurringTaskService(
+            autonomy_store=autonomy_store,
+            default_interval_minutes=RECURRING_TASKS_DEFAULT_INTERVAL_MINUTES,
+            minimum_interval_seconds=RECURRING_TASKS_MINIMUM_INTERVAL_SECONDS,
+            max_active_tasks=RECURRING_TASKS_MAX_ACTIVE,
+            absence_threshold_minutes=RECURRING_TASKS_ABSENCE_THRESHOLD_MINUTES,
+            toast_notifier=_recurring_toast,
+        )
         if BROWSER_BACKEND == "fara_visual":
             browser_tool_bridge = FaraVisualBrowserAdapter(
                 llm_provider=logged_llm,
@@ -1061,6 +1088,7 @@ class AmbientRuntime:
             computer_enabled=COMPUTER_ENABLED,
             local_control_approval_ttl_minutes=AUTONOMY_APPROVAL_TTL_MINUTES,
             scheduled_task_service=scheduled_task_service,
+            recurring_task_service=recurring_task_service if RECURRING_TASKS_ENABLED else None,
             reporter_model=REPORTER_MODEL,
             artifact_root=str(ARTIFACTS_ROOT),
             capability_policy=capability_policy,
@@ -1258,6 +1286,9 @@ class AmbientRuntime:
                 visual_context_batch_size=PASSIVE_OBSERVER_VISUAL_CONTEXT_BATCH_SIZE,
                 visual_context_batch_max_wait_seconds=PASSIVE_OBSERVER_VISUAL_CONTEXT_BATCH_MAX_WAIT_SECONDS,
                 visual_context_batch_flush_high_salience=PASSIVE_OBSERVER_VISUAL_CONTEXT_BATCH_FLUSH_HIGH_SALIENCE,
+                recurring_task_service=recurring_task_service if RECURRING_TASKS_ENABLED else None,
+                user_idle_checker=system_idle_service.is_user_idle,
+                user_idle_seconds_provider=system_idle_service.get_idle_seconds,
             )
             if AUTONOMY_COORDINATOR_ENABLED
             else None
@@ -1316,6 +1347,7 @@ class AmbientRuntime:
             user_context_service,
             proactive_sweep_service,
             browser_approval_fallback_service,
+            recurring_task_service,
         )
 
     def _start_screenshot_capture_loop(
@@ -1326,6 +1358,7 @@ class AmbientRuntime:
         system_idle_service: SystemIdleService,
         capture_interval_seconds: float,
         autonomy_coordinator: AutonomyCoordinatorService | None = None,
+        recurring_task_service: RecurringTaskService | None = None,
     ) -> None:
         if (
             not PASSIVE_OBSERVER_ENABLED
@@ -1363,7 +1396,15 @@ class AmbientRuntime:
                         continue
                     lightweight_context["capture_policy_applied"] = True
                     lightweight_context["capture_decision"] = capture_decision
-                    if system_idle_service.is_user_idle():
+                    if system_idle_service.is_user_idle() and not (
+                        RECURRING_TASKS_ENABLED
+                        and RECURRING_TASKS_IDLE_SCREEN_MONITORING
+                        and recurring_task_service is not None
+                        and any(
+                            task.task_kind == "monitor" and task.source_kind in {"screen", "visual"}
+                            for task in recurring_task_service.list(status="active", limit=RECURRING_TASKS_MAX_ACTIVE)
+                        )
+                    ):
                         self._screenshot_capture_stop_event.wait(capture_interval_seconds)
                         continue
 
@@ -1655,6 +1696,77 @@ class AmbientRuntime:
                 task_queue.mark_task_complete(task.id, status="delegated_to_autonomy")
                 delegated += 1
         return delegated
+
+    async def _process_due_recurring_task(
+        self,
+        *,
+        llm_adapter: ModelResidencyManager,
+        llm_service: LLMInteractionService,
+        recurring_task_service: RecurringTaskService | None,
+        services_initialized: bool,
+        user_idle: bool,
+    ) -> tuple[bool, bool]:
+        """Run one due recurring task without letting it interrupt active users."""
+        if recurring_task_service is None or not user_idle:
+            return False, services_initialized
+        due = recurring_task_service.due_tasks(limit=1)
+        if not due:
+            return False, services_initialized
+        task = due[0]
+        # Visual monitors are evaluated by fresh VLM observations; their due tick only
+        # advances bookkeeping, avoiding an unnecessary general-model call.
+        if task.task_kind == "monitor" and task.source_kind in {"screen", "visual"}:
+            recurring_task_service.mark_run_finished(task, result={"status": "waiting_for_visual_observation"})
+            return True, services_initialized
+        try:
+            services_initialized = await self._ensure_runtime(
+                llm_adapter=llm_adapter,
+                services_initialized=services_initialized,
+                reason="executing recurring task",
+                model_name=FOLLOWUP_EXECUTION_MODEL,
+            )
+            llm_service.reset_context()
+            try:
+                safe_actions = set(json.loads(task.safe_actions_json or "[]"))
+            except json.JSONDecodeError:
+                safe_actions = set()
+            allowed_tool_names: set[str] = set()
+            registry = capability_policy = getattr(llm_service, "capability_policy", None)
+            for definition in llm_service.available_tool_definitions():
+                name = str(definition.get("function", {}).get("name") or "")
+                if not name:
+                    continue
+                descriptor = registry.registry.describe(name) if registry is not None else None
+                if descriptor is not None and descriptor.access == "read":
+                    allowed_tool_names.add(name)
+                if "todoist_item" in safe_actions and name in {"add_task", "queue_night_task"}:
+                    allowed_tool_names.add(name)
+                if "email_draft" in safe_actions and "draft" in name.lower():
+                    allowed_tool_names.add(name)
+                if "local_note" in safe_actions and name in {"document_create", "document_edit"}:
+                    allowed_tool_names.add(name)
+            with interaction_trace("recurring_task", {"recurring_task_id": task.task_id, "kind": task.task_kind}):
+                with self.gpu_lock:
+                    result = await llm_service.run_interaction(
+                        user_input=(
+                            f"This is a recurring {task.task_kind} task. Execute only the approved, "
+                            f"reversible work in this instruction and report factual results.\n\n{task.instruction}"
+                        ),
+                        system_prompt=self.FOLLOWUP_EXECUTION_PROMPT,
+                        model=FOLLOWUP_EXECUTION_MODEL,
+                        report_policy="auto_surface",
+                        allowed_tool_names=allowed_tool_names,
+                    )
+            recurring_task_service.mark_run_finished(task, result={"status": "completed", "response": str(result)[:8000]})
+        except InteractionSuspended as suspended:
+            recurring_task_service.set_status(task.task_id, "awaiting_approval")
+            logger.info("Recurring task %s is waiting for approval %s", task.task_id, suspended.approval_id)
+        except Exception as exc:
+            logger.exception("Recurring task %s failed", task.task_id)
+            recurring_task_service.mark_run_finished(task, result={"status": "failed", "error": str(exc)[:1000]}, status="failed")
+        finally:
+            llm_service.reset_context()
+        return True, services_initialized
 
     def _enqueue_pending_background_tasks(
         self,
@@ -2103,6 +2215,7 @@ class AmbientRuntime:
             user_context_service,
             proactive_sweep_service,
             browser_approval_fallback_service,
+            recurring_task_service,
         ) = self._build_services()
         idle_cycle_interval = 30
         passive_observer_interval = PASSIVE_OBSERVER_CAPTURE_INTERVAL_SECONDS
@@ -2112,6 +2225,7 @@ class AmbientRuntime:
         user_idle_now = False
         services_initialized = False
         last_browser_approval_fallback_check_at = 0.0
+        last_recurring_todoist_sync_at = 0.0
 
         try:
             self.stop_event.clear()
@@ -2142,6 +2256,7 @@ class AmbientRuntime:
                 system_idle_service=system_idle_service,
                 capture_interval_seconds=passive_observer_interval,
                 autonomy_coordinator=autonomy_coordinator,
+                recurring_task_service=recurring_task_service,
             )
             logger.info("Starting ambient runtime manager.")
 
@@ -2321,6 +2436,37 @@ class AmbientRuntime:
                         if await self._sleep_or_stop(0.1):
                             break
                         continue
+
+                recurring_handled, services_initialized = await self._process_due_recurring_task(
+                    llm_adapter=llm_adapter,
+                    llm_service=llm_service,
+                    recurring_task_service=recurring_task_service if RECURRING_TASKS_ENABLED else None,
+                    services_initialized=services_initialized,
+                    user_idle=user_idle_now,
+                )
+                if recurring_handled:
+                    services_initialized = await self._restore_chat_residency(
+                        llm_adapter=llm_adapter,
+                        services_initialized=services_initialized,
+                        reason="recurring task work unit finished",
+                    )
+                    if await self._sleep_or_stop(0.1):
+                        break
+                    continue
+
+                if (
+                    RECURRING_TASKS_ENABLED and recurring_task_service is not None and todoist_provider is not None
+                    and time.monotonic() - last_recurring_todoist_sync_at >= RECURRING_TASKS_TODOIST_SYNC_SECONDS
+                ):
+                    last_recurring_todoist_sync_at = time.monotonic()
+                    try:
+                        sync_result = recurring_task_service.sync_todoist_tasks(
+                            todoist_provider.get_tasks(), label=RECURRING_TASKS_TODOIST_LABEL
+                        )
+                        if any(sync_result[key] for key in ("created", "updated", "cancelled")):
+                            logger.info("Synced @%s Todoist recurring directives: %s", RECURRING_TASKS_TODOIST_LABEL, sync_result)
+                    except Exception:
+                        logger.exception("Could not synchronize recurring Todoist directives.")
 
                 try:
                     transcript_path = self.queue.get_nowait()
