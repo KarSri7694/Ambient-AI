@@ -433,6 +433,38 @@ def test_bounded_visual_request_options_are_forwarded_to_llama_cpp():
     assert captured["extra_body"]["chat_template_kwargs"] == {"enable_thinking": False}
 
 
+def test_multi_image_request_attaches_all_images(tmp_path):
+    adapter = LlamaCppAdapter("http://localhost:8080")
+    captured = {}
+    first = tmp_path / "first.png"
+    second = tmp_path / "second.png"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+
+    class _Completions:
+        async def create(self, **kwargs):
+            captured.update(kwargs)
+            return "stream"
+
+    adapter.client = SimpleNamespace(chat=SimpleNamespace(completions=_Completions()))
+    adapter._require_model_ready = lambda _model: None
+
+    result = asyncio.run(
+        adapter.chat_completion_stream(
+            model="fast-vlm",
+            messages=[{"role": "user", "content": "inspect"}],
+            image=[str(first), str(second)],
+        )
+    )
+
+    assert result == "stream"
+    content = captured["messages"][0]["content"]
+    assert content[0] == {"type": "text", "text": "inspect"}
+    assert [item["type"] for item in content[1:]] == ["image_url", "image_url"]
+    assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
+    assert content[2]["image_url"]["url"].startswith("data:image/png;base64,")
+
+
 def test_default_max_tokens_is_applied_when_request_does_not_override():
     adapter = LlamaCppAdapter("http://localhost:8080", default_max_tokens=60000)
     captured = {}

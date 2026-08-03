@@ -123,6 +123,62 @@ the screenshot and supplied accessibility text. Do not explain your reasoning.""
             },
         },
     }
+    BATCH_ROUTER_PROMPT = """Extract ordered screen states for an ambient assistant.
+You will receive multiple screenshots in the same order as the frames array.
+Return JSON only with an observations array. Each item must include frame_index and the
+same fields used by the single-screen observer. Use visible evidence, not speculation.
+Keep summaries brief and preserve the input order."""
+    BATCH_RESPONSE_SCHEMA = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "ambient_visual_observation_batch",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["observations"],
+                "properties": {
+                    "observations": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": [
+                                "frame_index", "app_page", "summary", "detailed_description",
+                                "inferred_user_activity", "maybe_require_a_reminder",
+                                "reminder_context", "salient_facts", "salience",
+                                "needs_deep_analysis", "work_extraction",
+                            ],
+                            "properties": {
+                                "frame_index": {"type": "integer", "minimum": 0},
+                                "app_page": {"type": "string", "maxLength": 160},
+                                "summary": {"type": "string", "maxLength": 240},
+                                "detailed_description": {"type": "string", "maxLength": 500},
+                                "inferred_user_activity": {"type": "string", "maxLength": 200},
+                                "maybe_require_a_reminder": {"type": "boolean"},
+                                "reminder_context": {
+                                    "type": "object",
+                                    "additionalProperties": False,
+                                    "required": ["message_to_user", "due_date"],
+                                    "properties": {
+                                        "message_to_user": {"type": "string", "maxLength": 240},
+                                        "due_date": {"type": "string", "maxLength": 40},
+                                    },
+                                },
+                                "salient_facts": {
+                                    "type": "array", "maxItems": 5,
+                                    "items": {"type": "string", "maxLength": 180},
+                                },
+                                "salience": {"type": "string", "enum": ["low", "medium", "high"]},
+                                "needs_deep_analysis": {"type": "boolean"},
+                                "work_extraction": FAST_RESPONSE_SCHEMA["json_schema"]["schema"]["properties"]["work_extraction"],
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    }
 
     def __init__(
         self,
@@ -256,9 +312,129 @@ the screenshot and supplied accessibility text. Do not explain your reasoning.""
                 )
         if not parsed:
             return None
+        observation = self._observation_from_parsed(
+            parsed=parsed,
+            stored_screenshot_path=stored_screenshot_path,
+            model=model,
+            captured_at=captured_at,
+            observation_id=observation_id,
+            source_capture_event_id=source_capture_event_id,
+        )
+        if not self.persist_observations:
+            self.logger.debug(
+                "Passive observer persistence disabled; returning transient observation for %s",
+                screenshot_path,
+            )
+            return observation
+        return self._persist_observation(observation)
 
+    async def process_screenshot_batch(
+        self,
+        *,
+        screenshots: List[Dict[str, Any]],
+        model: str,
+        recent_context: str,
+        temporal_context: str = "",
+        force_full_analysis: bool = False,
+    ) -> List[VisualObservation]:
+        self._check_interrupted()
+        items = [dict(item) for item in screenshots if str(item.get("screenshot_path") or "").strip()]
+        if not items:
+            return []
+        if len(items) == 1:
+            observation = await self.process_screenshot(
+                screenshot_path=str(items[0]["screenshot_path"]),
+                persisted_screenshot_path=items[0].get("persisted_screenshot_path"),
+                archive_source=bool(items[0].get("archive_source", True)),
+                model=model,
+                recent_context=recent_context,
+                temporal_context=temporal_context,
+                captured_at=items[0].get("captured_at"),
+                similarity_score=items[0].get("similarity_score"),
+                observation_id=items[0].get("observation_id"),
+                source_capture_event_id=items[0].get("source_capture_event_id"),
+                force_full_analysis=force_full_analysis,
+                allow_uiat_fallback=False,
+            )
+            return [observation] if observation is not None else []
+
+        parsed_items = await self._analyze_batch(
+            screenshots=items,
+            model=model,
+            recent_context=recent_context,
+            temporal_context=temporal_context,
+            force_full_analysis=force_full_analysis,
+        )
+        if len(parsed_items) != len(items):
+            self.logger.warning(
+                "Passive observer batch returned %s/%s observations; falling back to per-image processing.",
+                len(parsed_items),
+                len(items),
+            )
+            observations: List[VisualObservation] = []
+            for item in items:
+                observation = await self.process_screenshot(
+                    screenshot_path=str(item["screenshot_path"]),
+                    persisted_screenshot_path=item.get("persisted_screenshot_path"),
+                    archive_source=bool(item.get("archive_source", True)),
+                    model=model,
+                    recent_context=recent_context,
+                    temporal_context=temporal_context,
+                    captured_at=item.get("captured_at"),
+                    similarity_score=item.get("similarity_score"),
+                    observation_id=item.get("observation_id"),
+                    source_capture_event_id=item.get("source_capture_event_id"),
+                    force_full_analysis=force_full_analysis,
+                    allow_uiat_fallback=False,
+                )
+                if observation is not None:
+                    observations.append(observation)
+            return observations
+
+        observations = []
+        for index, (item, parsed) in enumerate(zip(items, parsed_items)):
+            stored_screenshot_path = str(item.get("persisted_screenshot_path") or item["screenshot_path"])
+            if (
+                bool(item.get("archive_source", True))
+                and self.capture_store is not None
+                and Path(str(item["screenshot_path"])).exists()
+            ):
+                stored_screenshot_path = self.capture_store.store_file(
+                    str(item["screenshot_path"]), kind="screenshot", delete_source=True
+                )
+            parsed.setdefault("_analysis_mode", "batch_fast_model")
+            parsed.setdefault("_analysis_model", self.fast_model or model)
+            parsed.setdefault("_frame_index", index)
+            observation = self._observation_from_parsed(
+                parsed=parsed,
+                stored_screenshot_path=stored_screenshot_path,
+                model=model,
+                captured_at=item.get("captured_at"),
+                observation_id=item.get("observation_id"),
+                source_capture_event_id=item.get("source_capture_event_id"),
+            )
+            observations.append(observation if not self.persist_observations else self._persist_observation(observation))
+        return observations
+
+    async def observe(self, *, model: str, recent_context: str) -> Optional[VisualObservation]:
+        screenshot_path = self.capture_screenshot()
+        return await self.process_screenshot(
+            screenshot_path=screenshot_path,
+            model=model,
+            recent_context=recent_context,
+        )
+
+    def _observation_from_parsed(
+        self,
+        *,
+        parsed: dict,
+        stored_screenshot_path: str,
+        model: str,
+        captured_at: str | None,
+        observation_id: str | None,
+        source_capture_event_id: str | None,
+    ) -> VisualObservation:
         app_name, page_hint = self._split_app_page(self._opt_text(parsed.get("app_page")))
-
         raw_payload_json = json.dumps(parsed, ensure_ascii=False, indent=2)
         if self.capture_store is not None and self.persist_payloads:
             raw_payload_json = self.capture_store.store_bytes(
@@ -267,7 +443,7 @@ the screenshot and supplied accessibility text. Do not explain your reasoning.""
                 kind="visual_model_payload",
                 mime_type="application/json",
             )
-        observation = VisualObservation(
+        return VisualObservation(
             observation_id=observation_id or uuid.uuid4().hex,
             screenshot_path=stored_screenshot_path,
             created_at=captured_at or datetime.now().isoformat(),
@@ -294,12 +470,8 @@ the screenshot and supplied accessibility text. Do not explain your reasoning.""
             source_capture_event_id=source_capture_event_id,
             work_extraction=parsed.get("work_extraction") if isinstance(parsed.get("work_extraction"), dict) else {},
         )
-        if not self.persist_observations:
-            self.logger.debug(
-                "Passive observer persistence disabled; returning transient observation for %s",
-                screenshot_path,
-            )
-            return observation
+
+    def _persist_observation(self, observation: VisualObservation) -> VisualObservation:
         session = self._attach_to_session(observation)
         observation = replace(observation, session_id=session.session_id)
         self.memory.append_visual_observation(observation)
@@ -314,14 +486,6 @@ the screenshot and supplied accessibility text. Do not explain your reasoning.""
         )
         self.refresh_digest()
         return observation
-
-    async def observe(self, *, model: str, recent_context: str) -> Optional[VisualObservation]:
-        screenshot_path = self.capture_screenshot()
-        return await self.process_screenshot(
-            screenshot_path=screenshot_path,
-            model=model,
-            recent_context=recent_context,
-        )
 
     def refresh_digest(self, session_limit: int = 4, observation_limit: int = 5) -> None:
         sessions = self.memory.list_visual_sessions(statuses=["open"], limit=session_limit)
@@ -755,24 +919,35 @@ the screenshot and supplied accessibility text. Do not explain your reasoning.""
         *,
         prompt: str,
         payload: Dict[str, Any],
-        screenshot_path: str,
+        screenshot_path: str | List[str],
         interaction_image_path: str = "",
         model_name: str,
+        response_format: Optional[Dict[str, Any]] = None,
     ) -> dict:
+        screenshot_paths = (
+            [screenshot_path]
+            if isinstance(screenshot_path, str)
+            else [str(item) for item in screenshot_path if str(item)]
+        )
         self.logger.debug(
-            "Invoking passive observer model=%s image=%s payload_keys=%s",
+            "Invoking passive observer model=%s images=%s payload_keys=%s",
             model_name,
-            screenshot_path,
+            screenshot_paths,
             sorted(payload.keys()),
         )
         text = ""
         stream_metrics: Dict[str, Any] = {}
         try:
             with tempfile.TemporaryDirectory(prefix="ambient-vision-") as temp_dir:
-                prepared_path = str(Path(temp_dir) / "screen.jpg")
-                inference_path = await asyncio.to_thread(
-                    self._prepare_inference_image, screenshot_path, prepared_path
-                )
+                inference_paths = []
+                for index, source_path in enumerate(screenshot_paths):
+                    prepared_path = str(Path(temp_dir) / f"screen_{index}.jpg")
+                    inference_paths.append(
+                        await asyncio.to_thread(
+                            self._prepare_inference_image, source_path, prepared_path
+                        )
+                    )
+                inference_image = inference_paths[0] if len(inference_paths) == 1 else inference_paths
                 with interaction_trace(
                     "passive_observer",
                     metadata={
@@ -793,11 +968,15 @@ the screenshot and supplied accessibility text. Do not explain your reasoning.""
                                 model=model_name,
                                 messages=messages,
                                 tools=None,
-                                image=inference_path,
+                                image=inference_image,
                                 temperature=0.1,
-                                max_tokens=self.max_output_tokens,
+                                max_tokens=self.max_output_tokens * max(1, len(inference_paths)),
                                 response_format=(
-                                    self.FAST_RESPONSE_SCHEMA if prompt == self.FAST_ROUTER_PROMPT else None
+                                    response_format
+                                    if response_format is not None
+                                    else self.FAST_RESPONSE_SCHEMA
+                                    if prompt == self.FAST_ROUTER_PROMPT
+                                    else None
                                 ),
                                 chat_template_kwargs={"enable_thinking": False},
                                 request_timeout_seconds=self.vlm_request_timeout_seconds,
@@ -812,7 +991,7 @@ the screenshot and supplied accessibility text. Do not explain your reasoning.""
                                 model=model_name,
                                 messages=messages,
                                 tools=None,
-                                image=inference_path,
+                                image=inference_image,
                                 temperature=0.1,
                             )
                         text, stream_metrics = await self._consume_stream_text(completion)
@@ -836,6 +1015,82 @@ the screenshot and supplied accessibility text. Do not explain your reasoning.""
             len(text or ""),
         )
         return parsed if isinstance(parsed, dict) else {}
+
+    async def _analyze_batch(
+        self,
+        *,
+        screenshots: List[Dict[str, Any]],
+        model: str,
+        recent_context: str,
+        temporal_context: str = "",
+        force_full_analysis: bool = False,
+    ) -> List[dict]:
+        existing_paths = [str(item.get("screenshot_path") or "") for item in screenshots]
+        if any(not Path(path).exists() for path in existing_paths):
+            missing = [path for path in existing_paths if not Path(path).exists()]
+            self.logger.warning("Passive observer batch has missing screenshots: %s", missing)
+            return []
+        analysis_started = time.perf_counter()
+        recent_observations = self.memory.get_recent_visual_observations(limit=1)
+        previous_observation = recent_observations[0] if recent_observations else None
+        frames = []
+        for index, item in enumerate(screenshots):
+            frames.append(
+                {
+                    "frame_index": index,
+                    "screenshot_captured_at": item.get("captured_at") or datetime.now().isoformat(),
+                    "similarity_score": item.get("similarity_score"),
+                    "source_capture_event_id": item.get("source_capture_event_id"),
+                }
+            )
+        payload = {
+            "frames": frames,
+            "recent_context": recent_context[:1800],
+            "temporal_work_context": str(temporal_context or "")[:1800],
+            "previous_observation": (
+                {
+                    "app_name": previous_observation.app_name,
+                    "page_hint": previous_observation.page_hint,
+                    "summary": previous_observation.summary,
+                    "inferred_user_activity": previous_observation.inferred_user_activity,
+                }
+                if previous_observation is not None
+                else None
+            ),
+        }
+        model_name = self.full_model if force_full_analysis else (self.fast_model or model)
+        parsed = await self._invoke_model(
+            prompt=self.BATCH_ROUTER_PROMPT,
+            payload=payload,
+            screenshot_path=existing_paths,
+            interaction_image_path="",
+            model_name=model_name,
+            response_format=self.BATCH_RESPONSE_SCHEMA,
+        )
+        observations = parsed.get("observations") if isinstance(parsed, dict) else None
+        if not isinstance(observations, list):
+            return []
+        by_index: dict[int, dict] = {}
+        for item in observations:
+            if not isinstance(item, dict):
+                continue
+            try:
+                frame_index = int(item.get("frame_index"))
+            except (TypeError, ValueError):
+                continue
+            by_index[frame_index] = item
+        ordered: List[dict] = []
+        for index, source in enumerate(screenshots):
+            item = by_index.get(index)
+            if not item:
+                return []
+            item.setdefault("_analysis_mode", "batch_full_vlm" if force_full_analysis else "batch_fast_model")
+            item.setdefault("_analysis_latency_ms", int((time.perf_counter() - analysis_started) * 1000))
+            item.setdefault("_analysis_model", model_name)
+            if source.get("similarity_score") is not None:
+                item.setdefault("_similarity_score", source.get("similarity_score"))
+            ordered.append(item)
+        return ordered
 
     def _prepare_inference_image(self, source_path: str, output_path: str) -> str:
         try:

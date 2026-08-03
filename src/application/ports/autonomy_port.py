@@ -20,6 +20,21 @@ class AutonomyStorePort(ABC):
     ) -> Optional[AmbientEvent]:
         pass
 
+    def claim_next_events(
+        self,
+        *,
+        lease_seconds: int = 180,
+        event_types: Optional[list[str]] = None,
+        limit: int = 1,
+    ) -> list[AmbientEvent]:
+        events: list[AmbientEvent] = []
+        for _ in range(max(1, int(limit))):
+            event = self.claim_next_event(lease_seconds=lease_seconds, event_types=event_types)
+            if event is None:
+                break
+            events.append(event)
+        return events
+
     @abstractmethod
     def complete_event(self, event_id: str, *, status: str = "processed", error_text: str | None = None) -> None:
         """Mark an event terminal. Status may include processed, ignored, dead_letter, or interrupted."""

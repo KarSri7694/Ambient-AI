@@ -4,6 +4,7 @@ import logging
 import re
 import uuid
 import time
+from contextlib import ExitStack
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -743,6 +744,156 @@ Do not repeat an action already reported as performed.
             event_types=["lightweight_visual_capture"],
         )
 
+    async def process_next_visual_batch(self, *, max_events: int = 1) -> dict[str, Any]:
+        if max_events <= 1:
+            return await self.process_next_visual()
+        if self.mode == "disabled":
+            return {"processed": False, "reason": "disabled"}
+        if self.visual_observer is None or self.capture_store is None or not self.visual_model:
+            return {"processed": False, "reason": "visual_observer_unavailable"}
+        claim_many = getattr(self.store, "claim_next_events", None)
+        if claim_many is None:
+            return await self.process_next_visual()
+        events = claim_many(
+            lease_seconds=self.event_lease_seconds,
+            event_types=["lightweight_visual_capture"],
+            limit=max(1, int(max_events)),
+        )
+        if not events:
+            return {"processed": False, "reason": "no_events"}
+        if len(events) == 1:
+            event = events[0]
+            try:
+                enriched_event = await self._enrich_lightweight_visual(
+                    event,
+                    personalization_context="",
+                    temporal_context="",
+                    temporal_thread_id="",
+                )
+                enriched_payload = self._safe_json(enriched_event.payload_json)
+                if enriched_payload.get("capture_processing_skipped"):
+                    self.store.complete_event(event.event_id, status="ignored")
+                    return {
+                        "processed": True,
+                        "count": 1,
+                        "results": [{"event_id": event.event_id, "processed": True, "outcome": "ignored"}],
+                    }
+                self.store.complete_event(event.event_id)
+                if self.temporal_memory_service is not None:
+                    if hasattr(self.temporal_memory_service, "record_enriched_visual_event"):
+                        self.temporal_memory_service.record_enriched_visual_event(enriched_event)
+                    else:
+                        self.temporal_memory_service.record_ambient_event(enriched_event, outcome="perception completed")
+                return {
+                    "processed": True,
+                    "count": 1,
+                    "results": [
+                        {
+                            "event_id": event.event_id,
+                            "processed": True,
+                            "outcome": "perception_completed",
+                            "observation_id": enriched_payload.get("observation_id"),
+                            "analysis_status": enriched_payload.get("analysis_status"),
+                            "analysis_latency_ms": enriched_payload.get("analysis_latency_ms"),
+                            "downstream_event_id": enriched_payload.get("downstream_event_id"),
+                        }
+                    ],
+                }
+            except Exception as exc:
+                self.store.retry_event(event.event_id, error_text=str(exc))
+                return {
+                    "processed": True,
+                    "count": 1,
+                    "results": [{"event_id": event.event_id, "processed": True, "outcome": "retry"}],
+                }
+
+        results: list[dict[str, Any]] = []
+        screenshot_items: list[dict[str, Any]] = []
+        event_by_id = {event.event_id: event for event in events}
+        payload_by_id: dict[str, dict[str, Any]] = {}
+        materialized_stack = ExitStack()
+        try:
+            for event in events:
+                payload = self._safe_json(event.payload_json)
+                payload_by_id[event.event_id] = payload
+                screenshot_ref = str(payload.get("screenshot_ref") or event.source_ref)
+                if not screenshot_ref.startswith("capture://"):
+                    self.store.complete_event(
+                        event.event_id,
+                        status="ignored",
+                        error_text="visual capture did not reference a stored screenshot",
+                    )
+                    results.append({"event_id": event.event_id, "processed": True, "outcome": "ignored"})
+                    continue
+                materialized = materialized_stack.enter_context(self.capture_store.materialize(screenshot_ref))
+                screenshot_items.append(
+                    {
+                        "screenshot_path": materialized,
+                        "persisted_screenshot_path": screenshot_ref,
+                        "archive_source": False,
+                        "model": self.visual_model,
+                        "captured_at": event.occurred_at,
+                        "similarity_score": payload.get("similarity_score"),
+                        "observation_id": f"capture-{event.event_id}",
+                        "source_capture_event_id": event.event_id,
+                    }
+                )
+                if self.temporal_memory_service is not None and hasattr(self.temporal_memory_service, "record_source_evidence"):
+                    self.temporal_memory_service.record_source_evidence(event)
+            observations = await self.visual_observer.process_screenshot_batch(
+                screenshots=screenshot_items,
+                model=self.visual_model,
+                recent_context="",
+                temporal_context="",
+            )
+            observations_by_event = {
+                str(observation.source_capture_event_id or ""): observation
+                for observation in observations
+            }
+            for event_id in [event.event_id for event in events]:
+                if any(result.get("event_id") == event_id for result in results):
+                    continue
+                event = event_by_id[event_id]
+                observation = observations_by_event.get(event_id)
+                if observation is None:
+                    self.store.retry_event(event_id, error_text="batch visual processing returned no observation")
+                    results.append({"event_id": event_id, "processed": True, "outcome": "retry"})
+                    continue
+                enriched_event = self._replace_visual_event_with_observation(
+                    event=event,
+                    observation=observation,
+                    source_payload=payload_by_id.get(event_id, {}),
+                    temporal_context="",
+                    temporal_thread_id="",
+                )
+                enriched_payload = self._safe_json(enriched_event.payload_json)
+                self.store.complete_event(event_id)
+                if self.temporal_memory_service is not None:
+                    if hasattr(self.temporal_memory_service, "record_enriched_visual_event"):
+                        self.temporal_memory_service.record_enriched_visual_event(enriched_event)
+                    else:
+                        self.temporal_memory_service.record_ambient_event(enriched_event, outcome="perception completed")
+                results.append(
+                    {
+                        "event_id": event_id,
+                        "processed": True,
+                        "outcome": "perception_completed",
+                        "observation_id": enriched_payload.get("observation_id"),
+                        "analysis_status": enriched_payload.get("analysis_status"),
+                        "analysis_latency_ms": enriched_payload.get("analysis_latency_ms"),
+                        "downstream_event_id": enriched_payload.get("downstream_event_id"),
+                    }
+                )
+        except Exception as exc:
+            self.logger.exception("Visual perception batch failed.")
+            for event in events:
+                if not any(result.get("event_id") == event.event_id for result in results):
+                    self.store.retry_event(event.event_id, error_text=str(exc))
+                    results.append({"event_id": event.event_id, "processed": True, "outcome": "retry"})
+        finally:
+            materialized_stack.close()
+        return {"processed": bool(results), "count": len(results), "results": results}
+
     def _flush_pending_visual_batch(self, event: AmbientEvent) -> AmbientEvent:
         payload = self._safe_json(event.payload_json)
         payload["flush_reason"] = payload.get("flush_reason") or "timeout"
@@ -866,6 +1017,25 @@ Do not repeat an action already reported as performed.
                 "capture_skip_reason": "visual_observer_returned_no_observation",
             }
             return replace(event, payload_json=json.dumps(skipped, ensure_ascii=False))
+        return self._replace_visual_event_with_observation(
+            event=event,
+            observation=observation,
+            source_payload=payload,
+            temporal_context=temporal_context,
+            temporal_thread_id=temporal_thread_id,
+        )
+
+    def _replace_visual_event_with_observation(
+        self,
+        *,
+        event: AmbientEvent,
+        observation: VisualObservation,
+        source_payload: dict[str, Any],
+        temporal_context: str = "",
+        temporal_thread_id: str = "",
+    ) -> AmbientEvent:
+        payload = dict(source_payload or {})
+        screenshot_ref = str(payload.get("screenshot_ref") or event.source_ref)
         if observation.needs_deep_analysis and self.deep_visual_observer is not None:
             downstream_event = self.enqueue_event(
                 event_type="visual_deep_enrichment",

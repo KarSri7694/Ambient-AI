@@ -86,6 +86,14 @@ class ScreenshotQueueService:
                 return None
             return self._queue.popleft()
 
+    def dequeue_many(self, max_items: int) -> list[ScreenshotJob]:
+        with self._lock:
+            count = max(1, int(max_items))
+            jobs: list[ScreenshotJob] = []
+            while self._queue and len(jobs) < count:
+                jobs.append(self._queue.popleft())
+            return jobs
+
     def size(self) -> int:
         with self._lock:
             return len(self._queue)

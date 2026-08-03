@@ -693,7 +693,7 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         model: str,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
-        image: str = "",
+        image: str | list[str] = "",
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         top_k: Optional[int] = None,
@@ -705,17 +705,17 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         """
         Create a streaming chat completion through the OpenAI-compatible API.
 
-        If `image` is provided, it is attached to the final user message as a
-        base64 data URL for multimodal models.
+        If `image` is provided, it is attached to the final user message as one
+        or more base64 data URLs for multimodal models.
         """
         self._raise_if_shutdown_requested()
         await asyncio.to_thread(self._require_model_ready, model)
         copy_messages = copy.deepcopy(messages)
-        if image and copy_messages:
+        image_paths = [image] if isinstance(image, str) and image else [
+            str(item) for item in (image or []) if str(item)
+        ]
+        if image_paths and copy_messages:
             import base64
-            with open(image, "rb") as f:
-                base64_image = base64.b64encode(f.read()).decode("utf-8")
-
             target_message = None
             for message in reversed(copy_messages):
                 if message.get("role") == "user":
@@ -724,16 +724,22 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
 
             if target_message is not None:
                 content = target_message.get("content", "")
-                image_part = {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{base64_image}"},
-                }
+                image_parts = []
+                for image_path in image_paths:
+                    with open(image_path, "rb") as f:
+                        base64_image = base64.b64encode(f.read()).decode("utf-8")
+                    image_parts.append(
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{base64_image}"},
+                        }
+                    )
                 if isinstance(content, list):
-                    target_message["content"] = list(content) + [image_part]
+                    target_message["content"] = list(content) + image_parts
                 else:
                     target_message["content"] = [
                         {"type": "text", "text": str(content)},
-                        image_part,
+                        *image_parts,
                     ]
 
         kwargs: Dict[str, Any] = {

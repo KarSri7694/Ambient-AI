@@ -204,6 +204,13 @@ PASSIVE_OBSERVER_VISUAL_CONTEXT_BATCH_MAX_WAIT_SECONDS = CONFIG.get_int(
 PASSIVE_OBSERVER_VISUAL_CONTEXT_BATCH_FLUSH_HIGH_SALIENCE = CONFIG.get_bool(
     "passive_observer", "visual_context_batch_flush_high_salience", True
 )
+PASSIVE_OBSERVER_VISUAL_INFERENCE_BATCH_SIZE = max(
+    1,
+    CONFIG.get_int("passive_observer", "visual_inference_batch_size", 1),
+)
+PASSIVE_OBSERVER_VISUAL_INFERENCE_PARALLELISM = CONFIG.get_str(
+    "passive_observer", "visual_inference_parallelism", "1"
+).strip().lower()
 PASSIVE_OBSERVER_UIAT_MODE = CONFIG.get_str("passive_observer", "uiat_mode", "screen_content")
 RECURRING_TASKS_ENABLED = CONFIG.get_bool("recurring_tasks", "enabled", True)
 RECURRING_TASKS_DEFAULT_INTERVAL_MINUTES = CONFIG.get_int("recurring_tasks", "default_interval_minutes", 30)
@@ -1290,7 +1297,7 @@ class AmbientRuntime:
                 inference_height=PASSIVE_OBSERVER_INFERENCE_HEIGHT,
                 inference_jpeg_quality=PASSIVE_OBSERVER_INFERENCE_JPEG_QUALITY,
                 uiat_text_max_chars=PASSIVE_OBSERVER_UIAT_TEXT_MAX_CHARS,
-                uiat_adapter=UIATAdapter(mode=PASSIVE_OBSERVER_UIAT_MODE) if PASSIVE_OBSERVER_FAST_ROUTING_ENABLED else None,
+                uiat_adapter=None,
                 persist_observations=True,
                 capture_store=self.capture_store,
                 persist_payloads=AUTONOMY_COORDINATOR_ENABLED,
@@ -2325,6 +2332,30 @@ class AmbientRuntime:
             or (user_idle and not ran_in_idle_window)
         )
 
+    def _passive_visual_parallelism(self) -> int:
+        configured = PASSIVE_OBSERVER_VISUAL_INFERENCE_PARALLELISM
+        if configured in {"", "1", "serial"}:
+            return 1
+        if configured != "auto":
+            try:
+                return max(1, int(configured))
+            except ValueError:
+                logger.warning("Invalid visual_inference_parallelism=%r; using serial visual processing.", configured)
+                return 1
+        provider = self._vision_llm
+        capacity_method = getattr(provider, "slot_capacity", None)
+        if provider is None or capacity_method is None:
+            return 1
+        try:
+            capacity = capacity_method(PASSIVE_OBSERVER_MODEL)
+        except Exception:
+            logger.exception("Unable to read passive-observer llama.cpp slot capacity.")
+            return 1
+        if not capacity.get("known"):
+            return 1
+        idle = int(capacity.get("idle") or 0)
+        return max(1, idle - PARALLEL_CHAT_RESERVE_SLOTS)
+
     async def run_loop(self):
         (
             llm_adapter,
@@ -2733,13 +2764,13 @@ class AmbientRuntime:
                     and screenshot_queue is not None
                     and not screenshot_queue.is_empty()
                 ):
-                    job = screenshot_queue.dequeue()
-                    if job is not None and Path(job.screenshot_path).exists():
+                    jobs = screenshot_queue.dequeue_many(PASSIVE_OBSERVER_VISUAL_INFERENCE_BATCH_SIZE)
+                    jobs = [job for job in jobs if Path(job.screenshot_path).exists()]
+                    if jobs:
                         try:
                             logger.debug(
-                                "Processing queued screenshot similarity_score=%s path=%s",
-                                job.similarity_score,
-                                job.screenshot_path,
+                                "Processing %s queued passive-observer screenshots.",
+                                len(jobs),
                             )
                             services_initialized = await self._ensure_runtime(
                                 llm_adapter=llm_adapter,
@@ -2748,26 +2779,32 @@ class AmbientRuntime:
                                 model_name=PASSIVE_OBSERVER_MODEL,
                             )
                             with self.gpu_lock:
-                                observation = await passive_observer.process_screenshot(
-                                    screenshot_path=job.screenshot_path,
+                                observations = await passive_observer.process_screenshot_batch(
+                                    screenshots=[
+                                        {
+                                            "screenshot_path": job.screenshot_path,
+                                            "captured_at": job.captured_at,
+                                            "similarity_score": job.similarity_score,
+                                        }
+                                        for job in jobs
+                                    ],
                                     model=PASSIVE_OBSERVER_MODEL,
                                     recent_context=user_context_service.build_prompt_context(
                                         include_semantic=False,
                                         max_chars=PERSONALIZATION_PROMPT_CONTEXT_CHARS,
                                     ),
-                                    captured_at=job.captured_at,
-                                    similarity_score=job.similarity_score,
                                 )
-                            if observation is not None:
-                                biodata_context_events_since_update += 1
+                            if observations:
+                                biodata_context_events_since_update += len(observations)
                                 logger.info(
-                                    "Processed queued screenshot for %s.",
-                                    observation.app_name or observation.page_hint or "screen",
+                                    "Processed %s queued screenshots.",
+                                    len(observations),
                                 )
-                                if ALWAYS_ON_MODE and passive_followup is not None:
-                                    self._deferred_followup_observations.append(observation)
-                                if autonomy_coordinator is not None:
-                                    autonomy_coordinator.enqueue_visual_observation(observation)
+                                for observation in observations:
+                                    if ALWAYS_ON_MODE and passive_followup is not None:
+                                        self._deferred_followup_observations.append(observation)
+                                    if autonomy_coordinator is not None:
+                                        autonomy_coordinator.enqueue_visual_observation(observation)
                         except Exception:
                             logger.exception("Queued passive observer screenshot processing failed.")
                         services_initialized = await self._restore_chat_residency(
@@ -2778,8 +2815,6 @@ class AmbientRuntime:
                         if await self._sleep_or_stop(0.1):
                             break
                         continue
-                    if job is not None:
-                        logger.warning("Queued screenshot no longer exists, skipping: %s", job.screenshot_path)
 
                 if autonomy_coordinator is not None and autonomy_coordinator.has_ready_visual_work():
                     if (
@@ -2800,16 +2835,54 @@ class AmbientRuntime:
                                 break
                             continue
                     try:
-                        with self.gpu_lock:
+                        visual_parallelism = self._passive_visual_parallelism()
+                        if not VISION_KEEP_RESIDENT:
+                            visual_parallelism = 1
+
+                        async def _process_visual_batch():
                             with self.interrupt_controller.active(kind="visual_perception", model=PASSIVE_OBSERVER_MODEL):
-                                visual_result = await autonomy_coordinator.process_next_visual()
+                                return await autonomy_coordinator.process_next_visual_batch(
+                                    max_events=PASSIVE_OBSERVER_VISUAL_INFERENCE_BATCH_SIZE,
+                                )
+
+                        if visual_parallelism > 1:
+                            visual_results = await asyncio.gather(
+                                *(_process_visual_batch() for _ in range(visual_parallelism)),
+                                return_exceptions=True,
+                            )
+                            processed_results = []
+                            for item in visual_results:
+                                if isinstance(item, Exception):
+                                    logger.error(
+                                        "Parallel visual perception worker failed.",
+                                        exc_info=(type(item), item, item.__traceback__),
+                                    )
+                                    continue
+                                if item.get("processed"):
+                                    processed_results.extend(item.get("results") or [item])
+                            visual_result = {
+                                "processed": bool(processed_results),
+                                "count": len(processed_results),
+                                "results": processed_results,
+                            }
+                        else:
+                            with self.gpu_lock:
+                                visual_result = await _process_visual_batch()
                         if visual_result.get("processed"):
-                            biodata_context_events_since_update += 1
+                            biodata_context_events_since_update += int(visual_result.get("count") or 1)
+                            first_result = next(
+                                (
+                                    item for item in visual_result.get("results", [])
+                                    if isinstance(item, dict) and item.get("outcome") == "perception_completed"
+                                ),
+                                {},
+                            )
                             logger.info(
-                                "Visual perception completed in %sms (status=%s, observation=%s).",
-                                visual_result.get("analysis_latency_ms"),
-                                visual_result.get("analysis_status"),
-                                visual_result.get("observation_id"),
+                                "Visual perception completed count=%s first_latency=%sms first_status=%s first_observation=%s.",
+                                visual_result.get("count") or 1,
+                                first_result.get("analysis_latency_ms"),
+                                first_result.get("analysis_status"),
+                                first_result.get("observation_id"),
                             )
                     except Exception:
                         logger.exception("Fast visual perception work unit failed.")

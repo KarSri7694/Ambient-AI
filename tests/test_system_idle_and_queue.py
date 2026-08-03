@@ -85,6 +85,17 @@ class SystemIdleAndQueueTests(unittest.TestCase):
             self.assertEqual(oldest.screenshot_path, str(second))
             self.assertEqual(newest.screenshot_path, str(third))
 
+    def test_screenshot_queue_dequeue_many_preserves_fifo(self):
+        queue = ScreenshotQueueService(maxlen=5, ssim_compare_count=0)
+        queue.enqueue("first.png", captured_at="2026-06-25T10:00:00")
+        queue.enqueue("second.png", captured_at="2026-06-25T10:00:10")
+        queue.enqueue("third.png", captured_at="2026-06-25T10:00:20")
+
+        jobs = queue.dequeue_many(2)
+
+        self.assertEqual([job.screenshot_path for job in jobs], ["first.png", "second.png"])
+        self.assertEqual(queue.dequeue().screenshot_path, "third.png")
+
     def test_screenshot_queue_skips_similar_recent_image(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             temp_path = Path(tmpdir)

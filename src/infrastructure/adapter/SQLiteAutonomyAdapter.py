@@ -667,6 +667,71 @@ class SQLiteAutonomyAdapter(AutonomyStorePort):
             conn.commit()
         return self._event_from_row(claimed) if claimed else None
 
+    def claim_next_events(
+        self,
+        *,
+        lease_seconds: int = 180,
+        event_types: Optional[list[str]] = None,
+        limit: int = 1,
+    ) -> list[AmbientEvent]:
+        now = _utcnow()
+        now_iso = _utciso(now)
+        lease_expires = _utciso(now + timedelta(seconds=max(1, lease_seconds)))
+        safe_limit = max(1, min(int(limit), 64))
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                UPDATE ambient_events SET status='pending', leased_at=NULL, lease_expires_at=NULL
+                WHERE status='leased' AND julianday(lease_expires_at) < julianday(?)
+                """,
+                (now_iso,),
+            )
+            params: list[Any] = [now_iso]
+            type_clause = "AND event_type != 'audio_capture_pending'"
+            normalized_types: list[str] = []
+            if event_types:
+                normalized_types = [str(value) for value in event_types if str(value)]
+                placeholders = ",".join("?" for _ in normalized_types)
+                type_clause = f"AND event_type IN ({placeholders})"
+                params.extend(normalized_types)
+            visual_only = bool(event_types) and set(normalized_types) == {"lightweight_visual_capture"}
+            order_clause = (
+                "ORDER BY julianday(occurred_at) ASC, rowid ASC"
+                if visual_only
+                else "ORDER BY priority DESC, julianday(occurred_at) ASC, rowid ASC"
+            )
+            rows = conn.execute(
+                f"""
+                SELECT event_id FROM ambient_events
+                WHERE status IN ('pending', 'resource_deferred')
+                  AND julianday(available_at) <= julianday(?)
+                {type_clause}
+                {order_clause} LIMIT ?
+                """,
+                [*params, safe_limit],
+            ).fetchall()
+            event_ids = [row["event_id"] for row in rows]
+            if not event_ids:
+                conn.commit()
+                return []
+            placeholders = ",".join("?" for _ in event_ids)
+            conn.execute(
+                f"""
+                UPDATE ambient_events
+                SET status='leased', leased_at=?, lease_expires_at=?, attempt_count=attempt_count+1
+                WHERE event_id IN ({placeholders}) AND status IN ('pending', 'resource_deferred')
+                """,
+                [now_iso, lease_expires, *event_ids],
+            )
+            claimed_rows = conn.execute(
+                f"""SELECT * FROM ambient_events WHERE event_id IN ({placeholders})""",
+                event_ids,
+            ).fetchall()
+            conn.commit()
+        by_id = {row["event_id"]: self._event_from_row(row) for row in claimed_rows}
+        return [by_id[event_id] for event_id in event_ids if event_id in by_id]
+
     def complete_event(self, event_id: str, *, status: str = "processed", error_text: str | None = None) -> None:
         if status not in {"processed", "ignored", "dead_letter", "interrupted"}:
             raise ValueError("invalid terminal event status")

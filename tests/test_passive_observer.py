@@ -353,6 +353,55 @@ class PassiveObserverTests(unittest.TestCase):
         self.assertFalse(llm.calls[0]["request_options"]["chat_template_kwargs"]["enable_thinking"])
         self.assertEqual(llm.calls[0]["request_options"]["response_format"]["type"], "json_schema")
 
+    def test_process_screenshot_batch_preserves_input_order(self):
+        batch_response = {
+            "observations": [
+                self._batch_observation(0, "VS Code / first.py", "First screen is open."),
+                self._batch_observation(1, "Browser / docs", "Documentation is open."),
+            ]
+        }
+        llm = FakeVisualLLM([json.dumps(batch_response)])
+        first = self.temp_path / "first.png"
+        second = self.temp_path / "second.png"
+        first.write_bytes(b"first")
+        second.write_bytes(b"second")
+        service = PassiveObserverService(
+            memory=self.memory,
+            llm_provider=llm,
+            screen_capture=FakeScreenCapture([]),
+            screenshot_root=str(self.temp_path / "shots"),
+            fast_model="fast-model",
+            persist_observations=False,
+        )
+
+        observations = asyncio.run(
+            service.process_screenshot_batch(
+                screenshots=[
+                    {
+                        "screenshot_path": str(first),
+                        "captured_at": "2026-06-25T10:00:00",
+                        "observation_id": "obs-first",
+                        "source_capture_event_id": "event-first",
+                    },
+                    {
+                        "screenshot_path": str(second),
+                        "captured_at": "2026-06-25T10:00:10",
+                        "observation_id": "obs-second",
+                        "source_capture_event_id": "event-second",
+                    },
+                ],
+                model="fallback-model",
+                recent_context="",
+            )
+        )
+
+        self.assertEqual([item.observation_id for item in observations], ["obs-first", "obs-second"])
+        self.assertEqual([item.summary for item in observations], ["First screen is open.", "Documentation is open."])
+        self.assertEqual(llm.calls[0]["model"], "fast-model")
+        self.assertEqual(llm.calls[0]["payload"]["frames"][0]["source_capture_event_id"], "event-first")
+        self.assertIsInstance(llm.calls[0]["image"], list)
+        self.assertEqual(len(llm.calls[0]["image"]), 2)
+
     def test_timeout_persists_uiat_fallback_without_retry(self):
         llm = SlowVisualLLM(["{}"])
         screenshot = self.temp_path / "timeout.png"
@@ -389,6 +438,33 @@ class PassiveObserverTests(unittest.TestCase):
         self.assertIn("Product A costs 100", observation.detailed_description)
         self.assertLess(observation.analysis_latency_ms, 1000)
         self.assertEqual(llm.calls, [])
+
+    def _batch_observation(self, frame_index, app_page, summary):
+        return {
+            "frame_index": frame_index,
+            "app_page": app_page,
+            "summary": summary,
+            "detailed_description": summary,
+            "inferred_user_activity": "working",
+            "maybe_require_a_reminder": False,
+            "reminder_context": {"message_to_user": "", "due_date": ""},
+            "salient_facts": [],
+            "salience": "low",
+            "needs_deep_analysis": False,
+            "work_extraction": {
+                "canonical_activity": "",
+                "project_or_task": "",
+                "operation": "unknown",
+                "work_phase": "unknown",
+                "entities": [],
+                "artifact_anchors": [],
+                "completion_evidence": [],
+                "blocker_evidence": [],
+                "open_loop_candidates": [],
+                "continuation_relation": "unclear",
+                "confidence": 0.0,
+            },
+        }
 
     def test_process_screenshot_skips_ignored_app_without_override(self):
         llm = FakeVisualLLM([])
