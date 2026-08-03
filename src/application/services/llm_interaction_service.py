@@ -410,6 +410,22 @@ class LLMInteractionService:
         """Clear the message history for a new conversation."""
         self._frame.messages = []
 
+    def fork_for_parallel_interaction(self) -> "LLMInteractionService":
+        """Create an isolated message/frame state sharing the same providers/tools.
+
+        A direct chat stream must never mutate the frame used by ambient
+        background work. Provider, tool bridge, policy, memory, and artifact
+        services remain shared; only per-interaction state and local-control
+        locks are isolated.
+        """
+        child = copy.copy(self)
+        child._frame_stack = [AgentFrame(tool_bridge=self.tool_bridge)]
+        child._browser_lock = asyncio.Lock()
+        child._filesystem_lock = asyncio.Lock()
+        child._computer_lock = asyncio.Lock()
+        child._retained_browser_sessions = []
+        return child
+
     def get_context(self) -> List[Dict[str, Any]]:
         """Return a snapshot of the current message history."""
         return list(self._frame.messages)

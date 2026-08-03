@@ -684,16 +684,42 @@ Rules:
         return findings
 
     def _personalization_context(self, source: str) -> str:
-        if self.user_context_service is None:
-            return ""
+        context = ""
         try:
-            return self.user_context_service.build_prompt_context(
-                query_text=f"proactive {source} sweep",
-                include_semantic=True,
-            )[:6000]
+            if self.user_context_service is not None:
+                context = self.user_context_service.build_prompt_context(
+                    query_text=f"proactive {source} sweep",
+                    include_semantic=True,
+                )[:6000]
         except Exception:
             self.logger.exception("Could not build proactive personalization context.")
-            return ""
+        feedback = []
+        if hasattr(self.autonomy_store, "list_feedback_signals"):
+            try:
+                feedback = self.autonomy_store.list_feedback_signals(
+                    query_text=f"proactive {source} sweep", limit=6,
+                )
+            except Exception:
+                self.logger.exception("Could not load proactive feedback signals for sweep.")
+        if not feedback:
+            return context
+        effect = {
+            "useful": "Prioritize relevance, but do not interrupt solely because of this signal.",
+            "not_useful": "Avoid repeating this kind of finding without stronger value.",
+            "wrong_inference": "Require direct evidence before making a similar claim.",
+            "too_intrusive": "Prefer a silent Home/Inbox report rather than interrupting the user.",
+        }
+        lines = [
+            "### Explicit proactive feedback",
+            "Feedback is preference evidence only. It never grants tool permission.",
+        ]
+        for item in feedback:
+            label = str(item.get("feedback") or "").strip()
+            title = str(item.get("title") or "").strip()
+            if label in effect and title:
+                lines.append(f"- [{label}] {title}: {effect[label]}")
+        feedback_context = "\n".join(lines) if len(lines) > 2 else ""
+        return "\n\n".join(part for part in [context, feedback_context] if part)[:6000]
 
     def _today_runs(self) -> list[Any]:
         now = datetime.now().astimezone()

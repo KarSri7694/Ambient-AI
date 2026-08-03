@@ -70,6 +70,9 @@ class _ModelProvider:
         self.current = self.saved[-1]
         return Path("saved-state.bin")
 
+    def slot_capacity(self, _model_name=None):
+        return {"known": True, "total": 4, "busy": 1, "idle": 3}
+
 
 def test_active_use_requires_strict_headroom_and_capture_only_defers_background():
     monitor = _MutableMonitor(available_ram_mb=1_500, free_vram_mb=5_000)
@@ -318,6 +321,45 @@ def test_resident_model_is_reused_and_uses_post_load_floor():
     assert governor.evaluate(
         InferenceRequest("ambient", "different-model", True, True), force_snapshot=True
     ).allowed is False
+
+
+def test_chat_prefers_resident_model_when_llama_cpp_has_a_free_slot():
+    monitor = _MutableMonitor(available_ram_mb=4_000, free_vram_mb=5_000)
+    provider = _ModelProvider()
+    provider.current = "ambient-vision"
+    manager = ModelResidencyManager(
+        provider=provider,
+        governor=ResourceGovernorService(monitor=monitor),
+    )
+
+    model, reused, capacity = asyncio.run(
+        manager.select_chat_model("chat-model", use_loaded_model=True, reserve_slots=1)
+    )
+
+    assert model == "ambient-vision"
+    assert reused is True
+    assert capacity["idle"] == 3
+
+
+def test_chat_defers_transition_when_resident_model_has_no_free_slot():
+    monitor = _MutableMonitor(available_ram_mb=4_000, free_vram_mb=5_000)
+    provider = _ModelProvider()
+    provider.current = "ambient-vision"
+    provider.slot_capacity = lambda _model_name=None: {
+        "known": True, "total": 4, "busy": 4, "idle": 0,
+    }
+    manager = ModelResidencyManager(
+        provider=provider,
+        governor=ResourceGovernorService(monitor=monitor),
+    )
+
+    model, reused, capacity = asyncio.run(
+        manager.select_chat_model("chat-model", use_loaded_model=True, reserve_slots=1)
+    )
+
+    assert model == "chat-model"
+    assert reused is False
+    assert capacity["reason"] == "no_reserved_chat_slot"
 
 
 def test_blank_lightweight_model_keeps_healthy_active_model_resident():

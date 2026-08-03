@@ -2,6 +2,7 @@ import asyncio
 import logging
 import threading
 import time
+from contextlib import asynccontextmanager
 from dataclasses import asdict
 from typing import Any, Callable, Optional
 
@@ -405,6 +406,65 @@ class ModelResidencyManager:
         self._last_transition_at = 0.0
         self._healthy_since: Optional[float] = None
         self._saved_model_stack: list[str] = []
+        self._shared_inference_lock = asyncio.Lock()
+        self._shared_inference_idle = asyncio.Event()
+        self._shared_inference_idle.set()
+        self._shared_inference: dict[str, int] = {}
+
+    @asynccontextmanager
+    async def shared_inference(self, model_name: str, *, workload: str):
+        """Protect a resident model from transitions during a shared request."""
+        key = str(model_name or "").strip() or "unknown"
+        # Register while holding the transition lock so a request can never be
+        # sent to a model which was replaced after slot selection.
+        async with self._transition_lock:
+            current = str(self.provider.get_current_model() or "").strip()
+            if current != key:
+                raise RuntimeError(
+                    f"resident model changed before shared inference: expected {key}, found {current or 'none'}"
+                )
+            async with self._shared_inference_lock:
+                self._shared_inference[key] = self._shared_inference.get(key, 0) + 1
+                self._shared_inference_idle.clear()
+        try:
+            yield
+        finally:
+            async with self._shared_inference_lock:
+                remaining = self._shared_inference.get(key, 0) - 1
+                if remaining > 0:
+                    self._shared_inference[key] = remaining
+                else:
+                    self._shared_inference.pop(key, None)
+                if not self._shared_inference:
+                    self._shared_inference_idle.set()
+
+    async def _wait_for_shared_inference(self) -> None:
+        await self._shared_inference_idle.wait()
+
+    async def select_chat_model(
+        self,
+        preferred_model: str,
+        *,
+        use_loaded_model: bool = True,
+        reserve_slots: int = 1,
+    ) -> tuple[str, bool, dict[str, Any]]:
+        """Prefer a ready resident model when llama.cpp has chat capacity."""
+        preferred = str(preferred_model or "").strip()
+        loaded = str(self.provider.get_current_model() or "").strip()
+        if not use_loaded_model or not loaded:
+            return preferred, False, {"known": False, "reason": "no_resident_reuse"}
+        capacity_method = getattr(self.provider, "slot_capacity", None)
+        if capacity_method is None:
+            return loaded, True, {"known": False, "reason": "slot_capacity_unavailable"}
+        capacity = await asyncio.to_thread(capacity_method, loaded)
+        if not capacity.get("known"):
+            # llama.cpp can queue a request internally; keep chat usable when a
+            # custom router does not expose slot state.
+            return loaded, True, capacity
+        idle = int(capacity.get("idle") or 0)
+        if idle >= max(1, int(reserve_slots)):
+            return loaded, True, capacity
+        return preferred, False, {**capacity, "reason": "no_reserved_chat_slot"}
 
     async def load_model(
         self,
@@ -426,6 +486,7 @@ class ModelResidencyManager:
             self.governor._log_deferral(request, decision)
             self.governor._audit("resource.model_load_denied", model_name, self.governor._decision_details(request, decision))
             return decision
+        await self._wait_for_shared_inference()
         async with self._transition_lock:
             before = self.provider.get_current_model()
             if before == model_name:
@@ -488,6 +549,7 @@ class ModelResidencyManager:
         return post_load_decision
 
     async def unload_model(self, *, reason: str = "resource release") -> None:
+        await self._wait_for_shared_inference()
         async with self._transition_lock:
             loaded = self.provider.get_current_model()
             if loaded is None:
@@ -502,6 +564,7 @@ class ModelResidencyManager:
             )
 
     async def save_and_unload(self, messages):
+        await self._wait_for_shared_inference()
         async with self._transition_lock:
             loaded = self.provider.get_current_model()
             result = await self.provider.save_and_unload(messages)
@@ -536,6 +599,7 @@ class ModelResidencyManager:
                 self.governor._decision_details(request, decision),
             )
             raise ResourceUnavailableError(decision)
+        await self._wait_for_shared_inference()
         async with self._transition_lock:
             started_at = time.monotonic()
             result = await self.provider.load_and_restore()
@@ -615,4 +679,5 @@ class ModelResidencyManager:
             "loaded_model": self.provider.get_current_model(),
             "lightweight_chat_model": self.lightweight_chat_model or None,
             "keep_active_model_resident": self.keep_active_model_resident,
+            "shared_inference": dict(self._shared_inference),
         }

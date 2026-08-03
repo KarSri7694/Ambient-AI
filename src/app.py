@@ -91,6 +91,11 @@ API_BASE_URL = CONFIG.get_str("runtime", "api_base_url", "http://localhost:8080"
 API_KEY = CONFIG.get_str("runtime", "api_key", "testkey")
 MODEL_LOAD_TIMEOUT_SECONDS = CONFIG.get_float("runtime", "model_load_timeout_seconds", 600.0)
 MAX_GENERATION_TOKENS = CONFIG.get_int("runtime", "max_generation_tokens", 60000)
+LLM_STREAM_RETRY_ATTEMPTS = CONFIG.get_int("runtime", "llm_stream_retry_attempts", 3)
+LLM_STREAM_RETRY_DELAY_SECONDS = CONFIG.get_float("runtime", "llm_stream_retry_delay_seconds", 1.0)
+PARALLEL_CHAT_ENABLED = CONFIG.get_bool("runtime", "parallel_chat_enabled", True)
+PARALLEL_CHAT_RESERVE_SLOTS = max(1, CONFIG.get_int("runtime", "parallel_chat_reserve_slots", 1))
+PARALLEL_CHAT_USE_LOADED_MODEL = CONFIG.get_bool("runtime", "parallel_chat_use_loaded_model", True)
 VISION_API_BASE_URL = CONFIG.get_str("vision_runtime", "api_base_url", "").strip()
 VISION_API_KEY = CONFIG.get_str("vision_runtime", "api_key", "").strip() or API_KEY
 VISION_PRELOAD = CONFIG.get_bool("vision_runtime", "preload", True)
@@ -524,6 +529,7 @@ class AmbientRuntime:
         self._screenshot_capture_thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._chat_wakeup_event = asyncio.Event()
+        self._chat_dispatch_task: Optional[asyncio.Task] = None
         self._tool_bridge: Optional[MCPToolAdapter] = None
         self._chat_resource_backoff_until = 0.0
         self._deferred_followup_observations: deque = deque()
@@ -614,6 +620,15 @@ class AmbientRuntime:
 
     def interrupt_status(self) -> dict:
         return self.interrupt_controller.status()
+
+    def parallel_chat_status(self) -> dict:
+        task = self._chat_dispatch_task
+        return {
+            "enabled": PARALLEL_CHAT_ENABLED,
+            "use_loaded_model": PARALLEL_CHAT_USE_LOADED_MODEL,
+            "reserve_slots": PARALLEL_CHAT_RESERVE_SLOTS,
+            "dispatcher_running": bool(task is not None and not task.done()),
+        }
 
     def request_reflection(self) -> dict:
         now = datetime.now(timezone.utc).isoformat()
@@ -939,6 +954,8 @@ class AmbientRuntime:
             model_load_timeout_seconds=MODEL_LOAD_TIMEOUT_SECONDS,
             isolated_model_tracking=True,
             default_max_tokens=MAX_GENERATION_TOKENS,
+            stream_retry_attempts=LLM_STREAM_RETRY_ATTEMPTS,
+            stream_retry_delay_seconds=LLM_STREAM_RETRY_DELAY_SECONDS,
             shutdown_controller=self.shutdown_controller,
         )
         self._shutdown_llm_adapters = [raw_llm_adapter]
@@ -975,6 +992,8 @@ class AmbientRuntime:
                 model_load_timeout_seconds=VISION_MODEL_LOAD_TIMEOUT_SECONDS,
                 isolated_model_tracking=True,
                 default_max_tokens=MAX_GENERATION_TOKENS,
+                stream_retry_attempts=LLM_STREAM_RETRY_ATTEMPTS,
+                stream_retry_delay_seconds=LLM_STREAM_RETRY_DELAY_SECONDS,
                 shutdown_controller=self.shutdown_controller,
             )
             self._shutdown_llm_adapters.append(vision_raw_llm)
@@ -1505,6 +1524,7 @@ class AmbientRuntime:
         llm_adapter: ModelResidencyManager,
         llm_service: LLMInteractionService,
         services_initialized: bool,
+        parallel: bool = False,
     ) -> tuple[bool, bool]:
         if self.chat_store is None:
             return False, services_initialized
@@ -1520,7 +1540,10 @@ class AmbientRuntime:
         self._publish_chat_event(message_id, {"type": "status", "status": "running"})
         streamed_parts: list[str] = []
         last_checkpoint = time.monotonic()
-        chat_model = LIGHTWEIGHT_CHAT_MODEL or CHAT_MODEL
+        preferred_chat_model = LIGHTWEIGHT_CHAT_MODEL or CHAT_MODEL
+        chat_model = preferred_chat_model
+        chat_service = llm_service
+        reusing_resident_model = False
 
         def on_event(event: dict) -> None:
             nonlocal last_checkpoint
@@ -1533,6 +1556,28 @@ class AmbientRuntime:
             self._publish_chat_event(message_id, event)
 
         try:
+            if parallel:
+                chat_model, reusing_resident_model, capacity = await llm_adapter.select_chat_model(
+                    preferred_chat_model,
+                    use_loaded_model=PARALLEL_CHAT_USE_LOADED_MODEL,
+                    reserve_slots=PARALLEL_CHAT_RESERVE_SLOTS,
+                )
+                if not reusing_resident_model and llm_adapter.status().get("loaded_model"):
+                    reason = "Waiting for a free llama.cpp slot while background work is running."
+                    self._chat_resource_backoff_until = time.monotonic() + 0.25
+                    self.chat_store.defer_message(message_id, reason)
+                    self._publish_chat_event(
+                        message_id,
+                        {"type": "status", "status": "queued", "reason": reason, "capacity": capacity},
+                    )
+                    return True, services_initialized
+                if reusing_resident_model:
+                    chat_service = llm_service.fork_for_parallel_interaction()
+                    logger.info(
+                        "Direct chat reusing resident model %s (%s).",
+                        chat_model,
+                        capacity.get("reason") or f"idle slots={capacity.get('idle', 'unknown')}",
+                    )
             active_work = self.interrupt_controller.active(
                 kind="direct_chat",
                 chat_session_id=session_id,
@@ -1540,18 +1585,19 @@ class AmbientRuntime:
                 model=chat_model,
             )
             with active_work:
-                services_initialized = await self._ensure_runtime(
-                    llm_adapter=llm_adapter,
-                    services_initialized=services_initialized,
-                    reason="answering direct chat message",
-                    model_name=chat_model,
-                )
+                if not reusing_resident_model:
+                    services_initialized = await self._ensure_runtime(
+                        llm_adapter=llm_adapter,
+                        services_initialized=services_initialized,
+                        reason="answering direct chat message",
+                        model_name=chat_model,
+                    )
                 history = self.chat_store.conversation_history(
                     session_id,
                     before_message_id=user_message["id"],
                     limit=CHAT_HISTORY_MESSAGE_LIMIT,
                 )
-                llm_service.restore_conversation(
+                chat_service.restore_conversation(
                     system_prompt=self.CHAT_SYSTEM_PROMPT,
                     messages=history,
                 )
@@ -1562,14 +1608,24 @@ class AmbientRuntime:
                         "chat_message_id": message_id,
                     },
                 ):
-                    with self.gpu_lock:
-                        result = await llm_service.run_interaction(
-                            user_input=user_message["content"],
-                            system_prompt=self.CHAT_SYSTEM_PROMPT,
-                            model=chat_model,
-                            report_policy="silent",
-                            event_callback=on_event,
-                        )
+                    if reusing_resident_model:
+                        async with llm_adapter.shared_inference(chat_model, workload="direct_chat"):
+                            result = await chat_service.run_interaction(
+                                user_input=user_message["content"],
+                                system_prompt=self.CHAT_SYSTEM_PROMPT,
+                                model=chat_model,
+                                report_policy="silent",
+                                event_callback=on_event,
+                            )
+                    else:
+                        with self.gpu_lock:
+                            result = await chat_service.run_interaction(
+                                user_input=user_message["content"],
+                                system_prompt=self.CHAT_SYSTEM_PROMPT,
+                                model=chat_model,
+                                report_policy="silent",
+                                event_callback=on_event,
+                            )
             self.chat_store.complete_message(message_id, result)
             self._chat_resource_backoff_until = 0.0
             self._publish_chat_event(
@@ -1600,6 +1656,17 @@ class AmbientRuntime:
             self._chat_resource_backoff_until = 0.0
             self.chat_store.fail_message(message_id, reason)
             self._publish_chat_event(message_id, {"type": "error", "error": reason})
+        except RuntimeError as exc:
+            if parallel and "resident model changed before shared inference" in str(exc):
+                reason = "Resident model changed; retrying chat on the next available llama.cpp slot."
+                self._chat_resource_backoff_until = time.monotonic() + 0.25
+                self.chat_store.defer_message(message_id, reason)
+                self._publish_chat_event(message_id, {"type": "status", "status": "queued", "reason": reason})
+            else:
+                self._chat_resource_backoff_until = 0.0
+                logger.exception("Direct chat message %s failed.", message_id)
+                self.chat_store.fail_message(message_id, str(exc))
+                self._publish_chat_event(message_id, {"type": "error", "error": str(exc)})
         except ResourceUnavailableError as exc:
             self._chat_resource_backoff_until = time.monotonic() + RESOURCE_DEFER_SECONDS
             self.chat_store.defer_message(message_id, f"Queued until resources are available: {exc}")
@@ -1798,8 +1865,28 @@ class AmbientRuntime:
             logger.exception("Recurring task %s failed", task.task_id)
             recurring_task_service.mark_run_finished(task, result={"status": "failed", "error": str(exc)[:1000]}, status="failed")
         finally:
-            llm_service.reset_context()
+            chat_service.reset_context()
         return True, services_initialized
+
+    async def _chat_dispatch_loop(
+        self,
+        *,
+        llm_adapter: ModelResidencyManager,
+        llm_service: LLMInteractionService,
+    ) -> None:
+        """Keep direct chat responsive while the main loop handles ambient work."""
+        while not self.stop_event.is_set():
+            handled, _ = await self._process_pending_chat_turn(
+                llm_adapter=llm_adapter,
+                llm_service=llm_service,
+                services_initialized=bool(llm_adapter.status().get("loaded_model")),
+                parallel=True,
+            )
+            if handled:
+                await asyncio.sleep(0)
+                continue
+            if await self._wait_for_chat_or_timeout(0.25):
+                return
 
     def _enqueue_pending_background_tasks(
         self,
@@ -2291,6 +2378,15 @@ class AmbientRuntime:
                 autonomy_coordinator=autonomy_coordinator,
                 recurring_task_service=recurring_task_service,
             )
+            if PARALLEL_CHAT_ENABLED:
+                self._chat_dispatch_task = asyncio.create_task(
+                    self._chat_dispatch_loop(llm_adapter=llm_adapter, llm_service=llm_service),
+                    name="AmbientChatDispatcher",
+                )
+                logger.info(
+                    "Parallel direct-chat dispatcher enabled (reserve_slots=%s).",
+                    PARALLEL_CHAT_RESERVE_SLOTS,
+                )
             logger.info("Starting ambient runtime manager.")
 
             while not self.stop_event.is_set():
@@ -2372,15 +2468,16 @@ class AmbientRuntime:
                         break
                     continue
 
-                handled_chat, services_initialized = await self._process_pending_chat_turn(
-                    llm_adapter=llm_adapter,
-                    llm_service=llm_service,
-                    services_initialized=services_initialized,
-                )
-                if handled_chat:
-                    if await self._sleep_or_stop(0.1):
-                        break
-                    continue
+                if not PARALLEL_CHAT_ENABLED:
+                    handled_chat, services_initialized = await self._process_pending_chat_turn(
+                        llm_adapter=llm_adapter,
+                        llm_service=llm_service,
+                        services_initialized=services_initialized,
+                    )
+                    if handled_chat:
+                        if await self._sleep_or_stop(0.1):
+                            break
+                        continue
 
                 if self._manual_artifact_maintenance_requested.is_set():
                     maintenance_handled, services_initialized = await self._run_artifact_maintenance(
@@ -3186,6 +3283,10 @@ class AmbientRuntime:
             logger.info("Ambient runtime loop cancelled during shutdown.")
         finally:
             self._stop_screenshot_capture_loop()
+            if self._chat_dispatch_task is not None:
+                self._chat_dispatch_task.cancel()
+                await asyncio.gather(self._chat_dispatch_task, return_exceptions=True)
+                self._chat_dispatch_task = None
             llm_service.reset_context()
             shutdown_requested = self.shutdown_controller.is_graceful_requested()
             if shutdown_requested:

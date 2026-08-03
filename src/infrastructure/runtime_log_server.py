@@ -1088,7 +1088,13 @@ def create_runtime_log_app(
         status: str | None = Query(default=None),
     ) -> dict[str, Any]:
         rows = autonomy_store.list_inbox_items(limit=limit, status=status) if autonomy_store is not None else []
-        return {"items": [_as_dict(row) for row in rows], "count": len(rows)}
+        items = []
+        for row in rows:
+            item = _as_dict(row)
+            if hasattr(autonomy_store, "list_feedback_for_inbox"):
+                item["feedback_history"] = autonomy_store.list_feedback_for_inbox(row.inbox_id)
+            items.append(item)
+        return {"items": items, "count": len(items)}
 
     @app.get("/api/recurring-tasks")
     def list_recurring_tasks(
@@ -1134,7 +1140,13 @@ def create_runtime_log_app(
             updated = autonomy_store.record_feedback(inbox_id, str(body.get("feedback") or ""))
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return {"ok": updated}
+        effect = {
+            "useful": "Similar proactive help will be prioritized when relevant.",
+            "not_useful": "Similar suggestions will be reduced unless they have stronger value.",
+            "wrong_inference": "Similar claims will require stronger direct evidence.",
+            "too_intrusive": "Similar proactive work will prefer silent reporting or wait for a request.",
+        }.get(str(body.get("feedback") or ""), "")
+        return {"ok": updated, "effect": effect}
 
     @app.get("/api/autonomy/policies")
     def list_capability_policies() -> dict[str, Any]:
@@ -1354,6 +1366,8 @@ def create_runtime_log_app(
         if resource_governor is None:
             raise HTTPException(status_code=503, detail="resource_governor_unavailable")
         payload = resource_governor.status()
+        if runtime_control is not None and hasattr(runtime_control, "parallel_chat_status"):
+            payload["parallel_chat"] = runtime_control.parallel_chat_status()
         if autonomy_store is not None and hasattr(autonomy_store, "event_counts"):
             payload["event_counts"] = autonomy_store.event_counts()
         return payload

@@ -140,6 +140,21 @@ class SQLiteAutonomyAdapter(AutonomyStorePort):
                 );
                 CREATE INDEX IF NOT EXISTS idx_inbox_items_updated
                     ON inbox_items(status, updated_at DESC);
+                CREATE TABLE IF NOT EXISTS inbox_feedback_events (
+                    feedback_id TEXT PRIMARY KEY,
+                    inbox_id TEXT NOT NULL,
+                    opportunity_id TEXT NOT NULL,
+                    feedback TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    source_event_ids_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(inbox_id) REFERENCES inbox_items(inbox_id),
+                    FOREIGN KEY(opportunity_id) REFERENCES opportunities(opportunity_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_inbox_feedback_events_created
+                    ON inbox_feedback_events(created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_inbox_feedback_events_inbox
+                    ON inbox_feedback_events(inbox_id, created_at DESC);
                 CREATE TABLE IF NOT EXISTS capability_policies (
                     capability TEXT PRIMARY KEY,
                     decision TEXT NOT NULL,
@@ -1036,11 +1051,60 @@ class SQLiteAutonomyAdapter(AutonomyStorePort):
         if feedback not in allowed:
             raise ValueError("invalid feedback")
         with self._lock, self._connect() as conn:
+            item = conn.execute(
+                """SELECT inbox_id, opportunity_id, title FROM inbox_items WHERE inbox_id=?""",
+                (inbox_id,),
+            ).fetchone()
+            if item is None:
+                return False
+            opportunity = conn.execute(
+                "SELECT source_event_ids_json FROM opportunities WHERE opportunity_id=?",
+                (item["opportunity_id"],),
+            ).fetchone()
+            created_at = _utciso()
+            conn.execute(
+                """INSERT INTO inbox_feedback_events (
+                    feedback_id, inbox_id, opportunity_id, feedback, title,
+                    source_event_ids_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    uuid.uuid4().hex, item["inbox_id"], item["opportunity_id"], feedback,
+                    item["title"],
+                    str(opportunity["source_event_ids_json"] if opportunity else "[]"),
+                    created_at,
+                ),
+            )
             cursor = conn.execute(
                 "UPDATE inbox_items SET feedback=?, updated_at=? WHERE inbox_id=?",
-                (feedback, _utciso(), inbox_id),
+                (feedback, created_at, inbox_id),
             )
             return cursor.rowcount == 1
+
+    def list_feedback_for_inbox(self, inbox_id: str, *, limit: int = 20) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT feedback_id, feedback, title, created_at
+                   FROM inbox_feedback_events WHERE inbox_id=?
+                   ORDER BY created_at DESC LIMIT ?""",
+                (inbox_id, max(1, min(int(limit), 100))),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_feedback_signals(self, *, query_text: str = "", limit: int = 8) -> list[dict[str, Any]]:
+        """Return recent feedback, preferring titles that share query tokens."""
+        tokens = {token.lower() for token in str(query_text or "").split() if len(token) >= 4}
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT feedback_id, feedback, title, created_at
+                   FROM inbox_feedback_events ORDER BY created_at DESC LIMIT 100"""
+            ).fetchall()
+        scored: list[tuple[int, dict[str, Any]]] = []
+        for row in rows:
+            item = dict(row)
+            title_tokens = {token.lower() for token in str(item.get("title") or "").split()}
+            scored.append((len(tokens & title_tokens), item))
+        scored.sort(key=lambda entry: (entry[0], entry[1]["created_at"]), reverse=True)
+        return [item for _, item in scored[:max(1, min(int(limit), 30))]]
 
     def get_policy(self, capability: str) -> Optional[dict[str, Any]]:
         with self._connect() as conn:

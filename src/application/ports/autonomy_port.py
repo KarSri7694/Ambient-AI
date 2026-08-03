@@ -50,6 +50,19 @@ class AutonomyStorePort(ABC):
     def record_feedback(self, inbox_id: str, feedback: str) -> bool:
         pass
 
+    def list_feedback_signals(self, *, query_text: str = "", limit: int = 8) -> list[dict[str, Any]]:
+        """Return bounded, durable user feedback for personalization.
+
+        Implementations may use the query to select relevant signals. Feedback is
+        preference evidence only; it never grants a capability or replaces source
+        evidence.
+        """
+        return []
+
+    def list_feedback_for_inbox(self, inbox_id: str, *, limit: int = 20) -> list[dict[str, Any]]:
+        """Return the local audit trail for a displayed proactive result."""
+        return []
+
     @abstractmethod
     def get_policy(self, capability: str) -> Optional[dict[str, Any]]:
         pass

@@ -1,5 +1,6 @@
 import asyncio
 import openai
+import httpx
 from typing import Optional, List, Dict, Any, Iterator
 import requests
 import logging
@@ -31,6 +32,8 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         model_load_timeout_seconds: float = 600.0,
         isolated_model_tracking: bool = False,
         default_max_tokens: Optional[int] = None,
+        stream_retry_attempts: int = 3,
+        stream_retry_delay_seconds: float = 1.0,
         shutdown_controller: Optional[RuntimeShutdownController] = None,
     ):
         """Create an adapter for a llama.cpp-compatible OpenAI API server."""
@@ -46,6 +49,10 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         self.model_load_timeout_seconds = max(1.0, float(model_load_timeout_seconds))
         self.isolated_model_tracking = bool(isolated_model_tracking)
         self.default_max_tokens = max(1, int(default_max_tokens)) if default_max_tokens is not None else None
+        # Attempts include the original request. Retrying is deliberately
+        # provider-wide so every caller gets the same transport resilience.
+        self.stream_retry_attempts = max(1, int(stream_retry_attempts))
+        self.stream_retry_delay_seconds = max(0.0, float(stream_retry_delay_seconds))
         self.currently_loaded_model: Optional[str] = None
         self._ready_model: Optional[str] = None
         self.kv_state = KVStateControl(self)
@@ -474,6 +481,47 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         response.raise_for_status()
         return slot_base_url
 
+    def slot_capacity(self, model_name: Optional[str] = None) -> Dict[str, Any]:
+        """Return best-effort llama.cpp parallel-slot capacity for a ready model.
+
+        The router and standalone server expose slightly different `/slots`
+        payloads, so unknown fields intentionally produce `known=False` rather
+        than an unsafe capacity claim.
+        """
+        target = str(model_name or self.get_current_model() or "").strip()
+        if not target:
+            return {"known": False, "model": None, "total": None, "busy": None, "idle": None}
+        try:
+            base = self._slot_base_url()
+            response = requests.get(f"{base}/slots", timeout=5)
+            response.raise_for_status()
+            payload = response.json()
+        except (requests.RequestException, ValueError, RuntimeError) as exc:
+            return {
+                "known": False, "model": target, "total": None, "busy": None,
+                "idle": None, "error": str(exc),
+            }
+        slots = payload.get("slots") if isinstance(payload, dict) else payload
+        if not isinstance(slots, list):
+            return {"known": False, "model": target, "total": None, "busy": None, "idle": None}
+        busy = 0
+        for slot in slots:
+            if not isinstance(slot, dict):
+                return {"known": False, "model": target, "total": None, "busy": None, "idle": None}
+            state = str(slot.get("state") or "").lower()
+            processing = bool(
+                slot.get("is_processing")
+                or slot.get("is_generating")
+                or slot.get("is_busy")
+                or state in {"processing", "generating", "busy"}
+            )
+            if processing:
+                busy += 1
+        return {
+            "known": True, "model": target, "total": len(slots),
+            "busy": busy, "idle": max(0, len(slots) - busy),
+        }
+
     def save_current_kv_state(self, messages) -> Optional[Path]:
         """Request a KV state save for slot 0 and return the expected local file path."""
         if self.currently_loaded_model is None:
@@ -702,27 +750,93 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         if tools:
             kwargs["tools"] = tools
 
-        completion = await self.client.chat.completions.create(**kwargs)
-        if self.shutdown_controller is None:
+        async def _create_with_retries(start_attempt: int = 1) -> tuple[Any, int]:
+            last_error: Exception | None = None
+            for attempt in range(start_attempt, self.stream_retry_attempts + 1):
+                if self.shutdown_controller is not None and not self.shutdown_controller.permits_new_model_request():
+                    raise ShutdownInProgress("Shutdown is in progress; no new llama.cpp request will be sent.")
+                try:
+                    return await self.client.chat.completions.create(**kwargs), attempt
+                except (asyncio.CancelledError, ForcedShutdown):
+                    raise
+                except Exception as exc:
+                    if not self._is_retryable_stream_error(exc) or attempt >= self.stream_retry_attempts:
+                        raise
+                    last_error = exc
+                    await self._sleep_before_stream_retry(attempt, exc)
+            assert last_error is not None
+            raise last_error
+
+        completion, initial_attempt = await _create_with_retries()
+        # Preserve the straightforward provider contract for simple test and
+        # compatibility stubs which return a completed non-streaming value.
+        if not hasattr(completion, "__aiter__"):
+            if self.shutdown_controller is not None:
+                self._active_streams.add(completion)
+                self.shutdown_controller.stream_started()
             return completion
+
         self._active_streams.add(completion)
-        self.shutdown_controller.stream_started()
+        if self.shutdown_controller is not None:
+            self.shutdown_controller.stream_started()
 
         async def _tracked_stream():
-            try:
-                async for chunk in completion:
+            """Retry transient stream failures without leaking partial output."""
+            nonlocal completion, initial_attempt
+            while True:
+                buffered_chunks: list[Any] = []
+                retry_error: Exception | None = None
+                try:
+                    async for chunk in completion:
+                        if self.shutdown_controller is not None and self.shutdown_controller.is_force_requested():
+                            raise ForcedShutdown("Forced shutdown requested during llama.cpp stream.")
+                        buffered_chunks.append(chunk)
+                except (asyncio.CancelledError, ForcedShutdown):
+                    raise
+                except Exception as exc:
                     if self.shutdown_controller is not None and self.shutdown_controller.is_force_requested():
-                        raise ForcedShutdown("Forced shutdown requested during llama.cpp stream.")
-                    yield chunk
-            except Exception as exc:
-                if self.shutdown_controller is not None and self.shutdown_controller.is_force_requested():
-                    raise ForcedShutdown("Forced shutdown closed the llama.cpp stream.") from exc
-                raise
-            finally:
-                self._active_streams.discard(completion)
-                self.shutdown_controller.stream_finished()
+                        raise ForcedShutdown("Forced shutdown closed the llama.cpp stream.") from exc
+                    if not self._is_retryable_stream_error(exc) or initial_attempt >= self.stream_retry_attempts:
+                        raise
+                    retry_error = exc
+                finally:
+                    self._active_streams.discard(completion)
+                    if self.shutdown_controller is not None:
+                        self.shutdown_controller.stream_finished()
+                if retry_error is None:
+                    for chunk in buffered_chunks:
+                        yield chunk
+                    return
+                await self._sleep_before_stream_retry(initial_attempt, retry_error)
+                completion, initial_attempt = await _create_with_retries(initial_attempt + 1)
+                if not hasattr(completion, "__aiter__"):
+                    raise RuntimeError("llama.cpp retry returned a non-streaming completion")
+                self._active_streams.add(completion)
+                if self.shutdown_controller is not None:
+                    self.shutdown_controller.stream_started()
 
         return _tracked_stream()
+
+    async def _sleep_before_stream_retry(self, attempt: int, exc: Exception) -> None:
+        delay = self.stream_retry_delay_seconds * (2 ** max(0, attempt - 1))
+        self.logger.warning(
+            "llama.cpp stream failed on attempt %s/%s (%s); retrying in %.2fs.",
+            attempt,
+            self.stream_retry_attempts,
+            exc,
+            delay,
+        )
+        if delay:
+            await asyncio.sleep(delay)
+
+    @staticmethod
+    def _is_retryable_stream_error(exc: Exception) -> bool:
+        """Limit automatic retries to transient connection/server failures."""
+        if isinstance(exc, (httpx.TransportError, openai.APIConnectionError, openai.APITimeoutError)):
+            return True
+        if isinstance(exc, openai.APIStatusError):
+            return int(getattr(exc, "status_code", 0) or 0) >= 500
+        return False
 
     async def close_active_connections(self) -> None:
         """Close open streaming responses and the HTTP client without unloading models."""

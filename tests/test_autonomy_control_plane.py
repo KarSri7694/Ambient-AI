@@ -572,6 +572,41 @@ def test_coordinator_builds_event_specific_personalization_context(tmp_path):
     assert user_context.queries[-1]["include_semantic"] is True
 
 
+def test_feedback_is_durable_and_injected_as_preference_evidence(tmp_path):
+    store = SQLiteAutonomyAdapter(str(tmp_path / "autonomy.db"))
+    policy = CapabilityPolicyService(store=store)
+    first = AutonomyCoordinatorService(
+        store=store,
+        judgment=OpportunityJudgmentService(llm_provider=_JudgmentProvider()),
+        policy=policy,
+        mode="shadow",
+    )
+    store.enqueue_event(_event())
+    assert asyncio.run(first.process_next(
+        model="test-model", llm_service=SimpleNamespace(), personalization_context=""
+    ))["outcome"] == "shadow"
+    inbox = store.list_inbox_items()[0]
+    assert store.record_feedback(inbox.inbox_id, "too_intrusive") is True
+    audit = store.list_feedback_for_inbox(inbox.inbox_id)
+    assert audit[0]["feedback"] == "too_intrusive"
+
+    judgment = _CapturingJudgment()
+    coordinator = AutonomyCoordinatorService(
+        store=store,
+        judgment=judgment,
+        policy=policy,
+        mode="shadow",
+    )
+    store.enqueue_event(_event("event-2", "fingerprint-2"))
+    assert asyncio.run(coordinator.process_next(
+        model="test-model", llm_service=SimpleNamespace(), personalization_context="base profile"
+    ))["outcome"] == "ignored"
+    context = judgment.personalization_contexts[-1]
+    assert "Explicit proactive feedback" in context
+    assert "too_intrusive" in context
+    assert "never authorization" in context
+
+
 def test_active_investigation_becomes_awaiting_approval_without_retry(tmp_path):
     store = SQLiteAutonomyAdapter(str(tmp_path / "autonomy.db"))
     coordinator = AutonomyCoordinatorService(

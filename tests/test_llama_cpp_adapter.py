@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 import requests
+import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -453,6 +454,47 @@ def test_default_max_tokens_is_applied_when_request_does_not_override():
 
     assert result == "stream"
     assert captured["max_tokens"] == 60000
+
+
+def test_dropped_llama_stream_retries_the_full_prompt_without_partial_output():
+    adapter = LlamaCppAdapter(
+        "http://localhost:8080",
+        stream_retry_attempts=3,
+        stream_retry_delay_seconds=0,
+    )
+    attempts = {"count": 0}
+
+    class _Stream:
+        def __init__(self, items):
+            self.items = list(items)
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not self.items:
+                raise StopAsyncIteration
+            next_item = self.items.pop(0)
+            if isinstance(next_item, Exception):
+                raise next_item
+            return next_item
+
+    class _Completions:
+        async def create(self, **_kwargs):
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                return _Stream(["partial", httpx.ReadError("connection dropped")])
+            return _Stream(["complete"])
+
+    adapter.client = SimpleNamespace(chat=SimpleNamespace(completions=_Completions()))
+    adapter._require_model_ready = lambda _model: None
+
+    async def exercise():
+        stream = await adapter.chat_completion_stream(model="main", messages=[])
+        return [item async for item in stream]
+
+    assert asyncio.run(exercise()) == ["complete"]
+    assert attempts["count"] == 2
 
 
 def test_shutdown_controller_allows_existing_stream_to_finish_but_blocks_next_request():
