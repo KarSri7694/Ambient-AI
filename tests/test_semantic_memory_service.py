@@ -56,9 +56,10 @@ class _FakeMemory:
 
 
 class _FakeAdapter:
-    def __init__(self):
+    def __init__(self, *, rerank_error=None):
         self.embed_calls = []
         self.rerank_calls = []
+        self.rerank_error = rerank_error
 
     def is_enabled(self):
         return True
@@ -69,6 +70,8 @@ class _FakeAdapter:
 
     def rerank(self, *, query, documents, top_n=None):
         self.rerank_calls.append({"query": query, "documents": documents, "top_n": top_n})
+        if self.rerank_error is not None:
+            raise self.rerank_error
         return [{"index": 0, "score": 0.75}]
 
 
@@ -114,6 +117,19 @@ def test_retrieve_passes_source_types_into_vector_search_and_uses_bounded_sync()
     assert memory.vector_search_calls[-1]["limit"] == 8
     assert len(memory.updated) == 1
     assert len(memory.missing_batches) == 1
+    assert adapter.rerank_calls[-1]["top_n"] == 1
+
+
+def test_retrieve_keeps_vector_context_when_reranker_errors():
+    memory = _FakeMemory()
+    adapter = _FakeAdapter(rerank_error=RuntimeError("reranker unavailable"))
+    service = SemanticMemoryService(memory=memory, semantic_adapter=adapter)
+
+    results = service.retrieve(query="same lecture", source_types=["artifact"], limit=8, rerank_limit=3)
+
+    assert len(results) == 1
+    assert results[0].chunk.content == "artifact one"
+    assert results[0].rerank_score is None
     assert adapter.rerank_calls[-1]["top_n"] == 1
 
 

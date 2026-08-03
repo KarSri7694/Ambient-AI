@@ -23,11 +23,12 @@ describe("runtime shell", () => {
       if (path.includes("/api/runtime/reflection/run")) return json({ ok: true, accepted: true, status: { requested: true, running: false } });
       if (path.includes("/api/runtime/biodata/status")) return json({ ok: true, status: { requested: false, running: false } });
       if (path.includes("/api/runtime/biodata/run")) return json({ ok: true, accepted: true, status: { requested: true, running: false } });
-      if (path.includes("/healthz")) return json({ status: "ok", latest_id: 12 });
+      if (path.includes("/healthz")) return json({ status: "ok", latest_id: 12, real_world_lab: false });
       if (path.includes("/api/chat/sessions")) return json({ sessions: [], count: 0 });
+      if (path.includes("/api/autonomy/approvals")) return json({ approvals: [], count: 0 });
       if (path.includes("/api/home")) return json({
         date: "2026-07-30", today: "2026-07-30", server_time: new Date().toISOString(),
-        counts: {}, background: { events: {} }, timeline: [], attention: [], new_count: 0,
+        counts: {}, background: { events: {} }, timeline: [], attention: [], upcoming: [], urgent: [], new_count: 0,
         briefing: null, briefing_pending: false, briefing_stale: false,
         briefing_refresh: { running: false, last_error: null },
         latest_headline: "Nothing important changed yet",
@@ -42,6 +43,34 @@ describe("runtime shell", () => {
     fireEvent.click(screen.getAllByRole("button", { name: "Interactions" })[0]);
     expect(window.location.pathname).toBe("/interactions");
     expect(await screen.findByRole("heading", { name: "Interaction Logs" })).toBeInTheDocument();
+  });
+
+  it("shows approvals in normal mode and hides real-world tests", async () => {
+    renderApp();
+    expect((await screen.findAllByRole("button", { name: "Approvals" })).length).toBeGreaterThan(0);
+    expect(screen.queryByRole("button", { name: "Real-world Tests" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getAllByRole("button", { name: "Approvals" })[0]);
+    expect(window.location.pathname).toBe("/approvals");
+    expect(await screen.findByRole("heading", { name: "Approvals" })).toBeInTheDocument();
+  });
+
+  it("shows real-world tests only when the lab runtime is active", async () => {
+    vi.mocked(fetch).mockImplementation((input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.includes("/healthz")) return json({ status: "ok", latest_id: 12, real_world_lab: true });
+      if (path.includes("/api/privacy/status")) return json({ capture: { paused: false }, capture_size_bytes: 0 });
+      if (path.includes("/api/runtime/resources")) return json({ preset: "balanced", residency: {}, snapshot: {}, event_counts: {} });
+      if (path.includes("/api/runtime/reflection/status")) return json({ ok: true, status: { requested: false, running: false } });
+      if (path.includes("/api/runtime/biodata/status")) return json({ ok: true, status: { requested: false, running: false } });
+      if (path.includes("/api/runtime/interrupt/status")) return json({ ok: true, status: { requested: false, active_work: null } });
+      if (path.includes("/api/chat/sessions")) return json({ sessions: [], count: 0 });
+      if (path.includes("/api/real-world/suites")) return json({ available: true, suites: [] });
+      if (path.includes("/api/real-world/models")) return json({ roles: {}, presets: [] });
+      if (path.includes("/api/real-world/runs")) return json({ runs: [] });
+      return json({});
+    });
+    renderApp();
+    expect((await screen.findAllByRole("button", { name: "Real-world Tests" })).length).toBeGreaterThan(0);
   });
 
   it("uses Home as the default route", async () => {
@@ -60,7 +89,9 @@ describe("runtime shell", () => {
       const path = String(input);
       if (path.includes("/api/home")) return json({
         date: "2026-07-30", today: "2026-07-30", server_time: new Date().toISOString(),
-        counts: {}, background: { events: {} }, timeline: [], attention: [], new_count: 0,
+        counts: { upcoming: 1, urgent: 1 }, background: { events: {} }, timeline: [], attention: [], new_count: 0,
+        upcoming: [{ id: "task-1", kind: "scheduled_task", title: "Check demo tasks", summary: "Scheduled for later.", status: "pending", scheduled_for: new Date().toISOString(), destination: "/reports" }],
+        urgent: [{ id: "approval-1", kind: "approval", title: "Approve browser use", summary: "Verification needs your approval.", status: "pending", approval_id: "approval-1", destination: "/approvals" }],
         briefing_stale: true, briefing_pending: true,
         briefing_refresh: { running: false, last_error: null },
         latest_headline: "Fresh runtime fallback",
@@ -80,7 +111,7 @@ describe("runtime shell", () => {
       if (path.includes("/api/runtime/reflection/status")) return json({ ok: true, status: { requested: false, running: false } });
       if (path.includes("/api/runtime/biodata/status")) return json({ ok: true, status: { requested: false, running: false } });
       if (path.includes("/api/runtime/interrupt/status")) return json({ ok: true, status: { requested: false, active_work: null } });
-      if (path.includes("/healthz")) return json({ status: "ok", latest_id: 12 });
+      if (path.includes("/healthz")) return json({ status: "ok", latest_id: 12, real_world_lab: false });
       return json({});
     });
 
@@ -88,8 +119,8 @@ describe("runtime shell", () => {
 
     expect(await screen.findByText("Cached accomplishment")).toBeInTheDocument();
     expect(screen.getByText("Cached learning")).toBeInTheDocument();
-    expect(screen.getByText("Cached failure")).toBeInTheDocument();
-    expect(screen.getByText("Cached attention")).toBeInTheDocument();
+    expect(screen.getAllByText(/Check demo tasks/i).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/Approve browser use/i).length).toBeGreaterThan(0);
     expect(screen.getByText(/Showing last completed digest/i)).toBeInTheDocument();
   });
 

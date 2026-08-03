@@ -10,6 +10,7 @@ from typing import Any, Callable, Optional
 
 from application.services.capability_policy_service import CapabilityRegistry
 from application.services.interaction_trace import interaction_trace
+from application.services.runtime_interrupt_service import ShutdownInProgress
 from core.models import OpportunityCandidate, ProactiveInboxItem, VisualObservation
 
 
@@ -119,6 +120,7 @@ Rules:
         enabled: bool = False,
         global_grant: bool = False,
         enabled_sources: Optional[list[str]] = None,
+        cadence_mode: str = "interval",
         cadence_minutes: int = 60,
         max_sweeps_per_day: int = 8,
         max_findings_per_sweep: int = 10,
@@ -145,6 +147,7 @@ Rules:
             for item in (enabled_sources or ["gmail", "calendar"])
             if item.strip()
         ]
+        self.cadence_mode = self._normalize_cadence_mode(cadence_mode)
         self.cadence_minutes = max(1, int(cadence_minutes))
         self.max_sweeps_per_day = max(1, int(max_sweeps_per_day))
         self.max_findings_per_sweep = max(1, int(max_findings_per_sweep))
@@ -157,16 +160,26 @@ Rules:
         self.registry = CapabilityRegistry()
         self.logger = logger or logging.getLogger(self.__class__.__name__)
 
-    def is_due(self) -> bool:
+    def is_due(self, *, idle_cycle_key: Optional[str] = None) -> bool:
         if not self.enabled or not self.global_grant or not self.model:
             return False
         runs = self._today_runs()
-        completed = [
+        countable = [
             run for run in runs
-            if run.status in {"completed", "completed_with_blocker", "failed", "blocked"}
+            if run.status in {"completed", "completed_with_blocker", "failed", "blocked", "interrupted"}
         ]
-        if len(completed) >= self.max_sweeps_per_day:
+        if len(countable) >= self.max_sweeps_per_day:
             return False
+        if self.cadence_mode == "once_per_day":
+            return not countable
+        if self.cadence_mode == "once_per_idle_cycle":
+            normalized_cycle = str(idle_cycle_key or "").strip()
+            if not normalized_cycle:
+                return False
+            return not any(
+                self._run_metadata(run).get("idle_cycle_key") == normalized_cycle
+                for run in countable
+            )
         latest = max(
             (self._parse_time(run.completed_at or run.created_at) for run in runs),
             default=None,
@@ -175,12 +188,12 @@ Rules:
             return True
         return datetime.now(timezone.utc) - latest >= timedelta(minutes=self.cadence_minutes)
 
-    async def run_if_due(self) -> dict[str, Any]:
-        if not self.is_due():
+    async def run_if_due(self, *, idle_cycle_key: Optional[str] = None) -> dict[str, Any]:
+        if not self.is_due(idle_cycle_key=idle_cycle_key):
             return {"ran": False, "reason": "not_due_or_disabled"}
-        return await self.run()
+        return await self.run(idle_cycle_key=idle_cycle_key)
 
-    async def run(self) -> dict[str, Any]:
+    async def run(self, *, idle_cycle_key: Optional[str] = None) -> dict[str, Any]:
         run = self.autonomy_store.queue_run(
             title="Idle proactive personal-source sweep",
             source_kind="proactive_sweep",
@@ -189,6 +202,8 @@ Rules:
             metadata={
                 "sources": self.enabled_sources,
                 "global_grant": self.global_grant,
+                "cadence_mode": self.cadence_mode,
+                "idle_cycle_key": str(idle_cycle_key or "").strip() or None,
             },
         )
         if hasattr(self.autonomy_store, "audit"):
@@ -209,6 +224,31 @@ Rules:
                 try:
                     source_findings = await self._scan_source_with_timeout(source)
                     findings.extend(source_findings)
+                except ShutdownInProgress as exc:
+                    self.logger.info("Stopping proactive sweep during shutdown: %s", exc)
+                    self.autonomy_store.complete_run(
+                        run.run_id,
+                        summary="Idle proactive sweep stopped during runtime shutdown.",
+                        output_text=json.dumps(
+                            {
+                                "created_findings": [],
+                                "errors": {},
+                                "sources": self.enabled_sources,
+                                "shutdown": True,
+                            },
+                            ensure_ascii=False,
+                            indent=2,
+                        ),
+                        status="interrupted",
+                        error_text=None,
+                    )
+                    return {
+                        "ran": True,
+                        "status": "interrupted",
+                        "run_id": run.run_id,
+                        "created_findings": 0,
+                        "errors": {},
+                    }
                 except Exception as exc:
                     self.logger.exception("Proactive source %s failed.", source)
                     errors[source] = str(exc)[:500]
@@ -727,6 +767,33 @@ Rules:
         end = (now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)).astimezone(timezone.utc).isoformat()
         rows = self.autonomy_store.list_activity_runs_between(start, end, limit=500)
         return [row for row in rows if row.source_kind == "proactive_sweep"]
+
+    @classmethod
+    def _normalize_cadence_mode(cls, value: Any) -> str:
+        normalized = str(value or "interval").strip().lower().replace("-", "_")
+        aliases = {
+            "minutes": "interval",
+            "minute_interval": "interval",
+            "cadence_minutes": "interval",
+            "daily": "once_per_day",
+            "once_daily": "once_per_day",
+            "once_a_day": "once_per_day",
+            "idle": "once_per_idle_cycle",
+            "idle_cycle": "once_per_idle_cycle",
+            "every_idle_cycle": "once_per_idle_cycle",
+        }
+        normalized = aliases.get(normalized, normalized)
+        if normalized not in {"interval", "once_per_day", "once_per_idle_cycle"}:
+            return "interval"
+        return normalized
+
+    @staticmethod
+    def _run_metadata(run: Any) -> dict[str, Any]:
+        try:
+            payload = json.loads(getattr(run, "metadata_json", "") or "{}")
+        except json.JSONDecodeError:
+            return {}
+        return payload if isinstance(payload, dict) else {}
 
     @classmethod
     def _parse_json(cls, text: str) -> dict[str, Any]:

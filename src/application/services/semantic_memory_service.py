@@ -178,11 +178,18 @@ class SemanticMemoryService:
         if not results:
             return []
         rerank_count = min(rerank_limit or self.rerank_limit, len(results))
-        reranked = self.semantic_adapter.rerank(
-            query=normalized_query,
-            documents=[result.chunk.content for result in results],
-            top_n=rerank_count,
-        )
+        try:
+            reranked = self.semantic_adapter.rerank(
+                query=normalized_query,
+                documents=[result.chunk.content for result in results],
+                top_n=rerank_count,
+            )
+        except Exception as exc:
+            self.logger.warning(
+                "Semantic rerank failed; using vector-search results as context: %s",
+                exc,
+            )
+            return results[:rerank_count]
         if not reranked:
             return results[:rerank_count]
         ordered = []

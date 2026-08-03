@@ -19,7 +19,10 @@ class DailyBriefingService:
         "Use the bounded user context only when it genuinely makes the update more relevant; never expose "
         "unrelated private profile details. Use only supplied sanitized activity summaries and never invent facts. "
         "Return JSON only with keys headline, overview, accomplishments, updates, failures, attention. "
-        "Overview should be 2-4 short paragraphs. The last four values must be arrays of short strings."
+        "Overview should be 2-4 short paragraphs. The last four values must be arrays of bullet-point strings. "
+        "Every bullet in accomplishments, updates, failures, and attention must be 1-2 short lines, concrete, "
+        "and based on an actual supplied item title or summary. Do not write aggregate count summaries like "
+        "'completed or updated 62 meaningful items'."
     )
 
     def __init__(
@@ -63,6 +66,10 @@ class DailyBriefingService:
             item["is_new"] = bool(since_at and self._instant(item.get("occurred_at")) > since_at)
         for item in collected["attention"]:
             item["is_new"] = bool(since_at and self._instant(item.get("occurred_at")) > since_at)
+        for item in collected["upcoming"]:
+            item["is_new"] = bool(since_at and self._instant(item.get("occurred_at")) > since_at)
+        for item in collected["urgent"]:
+            item["is_new"] = bool(since_at and self._instant(item.get("occurred_at")) > since_at)
         return {
             "date": selected.isoformat(),
             "today": local_now.date().isoformat(),
@@ -72,7 +79,13 @@ class DailyBriefingService:
             "background": collected["background"],
             "timeline": collected["timeline"],
             "attention": collected["attention"],
-            "new_count": sum(1 for item in collected["timeline"] + collected["attention"] if item["is_new"]),
+            "upcoming": collected["upcoming"],
+            "urgent": collected["urgent"],
+            "new_count": sum(
+                1
+                for item in collected["timeline"] + collected["upcoming"] + collected["urgent"]
+                if item["is_new"]
+            ),
             "briefing": cached,
             "latest_headline": self._latest_headline(selected, collected),
             "latest_narrative": self._latest_narrative(selected, collected),
@@ -179,6 +192,25 @@ class DailyBriefingService:
                 }
                 for item in collected["attention"][: self.max_items_per_source]
             ],
+            "upcoming": [
+                {
+                    "kind": item["kind"],
+                    "title": item["title"][:180],
+                    "summary": item["summary"][:500],
+                    "status": item["status"],
+                    "scheduled_for": item.get("scheduled_for"),
+                }
+                for item in collected["upcoming"][: self.max_items_per_source]
+            ],
+            "urgent": [
+                {
+                    "kind": item["kind"],
+                    "title": item["title"][:180],
+                    "summary": item["summary"][:500],
+                    "status": item["status"],
+                }
+                for item in collected["urgent"][: self.max_items_per_source]
+            ],
             "user_context": self._personalization_context(),
         }
         completion = await self.llm_provider.chat_completion_stream(
@@ -208,10 +240,10 @@ class DailyBriefingService:
             "timezone": str(local_now.tzinfo),
             "headline": headline[:240],
             "overview": overview[:3000],
-            "accomplishments": self._string_list(parsed.get("accomplishments"), 12),
-            "updates": self._string_list(parsed.get("updates"), 12),
-            "failures": self._string_list(parsed.get("failures"), 12),
-            "attention": self._string_list(parsed.get("attention"), 12),
+            "accomplishments": self._string_list(parsed.get("accomplishments"), 12, max_chars=220),
+            "updates": self._string_list(parsed.get("updates"), 12, max_chars=220),
+            "failures": self._string_list(parsed.get("failures"), 12, max_chars=220),
+            "attention": self._string_list(parsed.get("attention"), 12, max_chars=220),
             "source_counts": collected["counts"],
             "source_watermark": collected["watermark"],
             "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -296,7 +328,7 @@ class DailyBriefingService:
                     title=f"Approve {approval.capability.replace('_', ' ')}",
                     summary=str(constraints.get("reason") or constraints.get("task") or "A bounded agent action needs your decision."),
                     status=approval.status, occurred_at=approval.created_at,
-                    destination="/inbox", source_ref=approval.approval_id,
+                    destination="/approvals", source_ref=approval.approval_id,
                 ),
                 "approval_id": approval.approval_id,
                 "capability": approval.capability,
@@ -313,6 +345,18 @@ class DailyBriefingService:
         for item in timeline:
             if item["status"] in {"failed", "blocked", "completed_with_blocker", "dead_letter"}:
                 attention.append({**item, "id": f"attention:{item['id']}"})
+        urgent = [
+            {**item, "id": f"urgent:{item['id']}"}
+            for item in attention
+            if self._requires_urgent_attention(item)
+        ]
+        upcoming = self._upcoming_items(
+            selected=selected,
+            local_tz=local_tz,
+            local_now=local_now,
+            tasks=tasks,
+            inbox=inbox,
+        )
 
         background_actions: dict[str, int] = {}
         for audit in audits:
@@ -334,6 +378,7 @@ class DailyBriefingService:
             "delegated_tasks": len(delegations), "activity_runs": len(activities),
             "artifact_changes": len(artifacts), "pending_approvals": len(pending_approvals),
             "queued_tasks": len(tasks), "attention": len(attention),
+            "upcoming": len(upcoming), "urgent": len(urgent),
         }
         # Runtime event counts and resource/model audits are useful live
         # telemetry, but they must not invalidate the digest: restarts, leases,
@@ -349,14 +394,17 @@ class DailyBriefingService:
             ).hexdigest(),
             "timeline": [{k: item[k] for k in ("id", "title", "summary", "status", "occurred_at")} for item in timeline],
             "attention": [{k: item.get(k) for k in ("id", "title", "status", "occurred_at")} for item in attention],
+            "upcoming": [{k: item.get(k) for k in ("id", "title", "status", "occurred_at", "scheduled_for")} for item in upcoming],
+            "urgent": [{k: item.get(k) for k in ("id", "title", "status", "occurred_at")} for item in urgent],
         }
         watermark = hashlib.sha256(
             json.dumps(canonical, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
         ).hexdigest()
         return {
             "counts": counts, "background": background, "timeline": timeline,
-            "attention": attention, "watermark": watermark,
-            "meaningful": bool(timeline or attention or any(event_counts.values()) or maintenance_runs),
+            "attention": attention, "upcoming": upcoming, "urgent": urgent,
+            "watermark": watermark,
+            "meaningful": bool(timeline or attention or upcoming or urgent or any(event_counts.values()) or maintenance_runs),
         }
 
     def _personalization_context(self) -> str:
@@ -405,11 +453,11 @@ class DailyBriefingService:
         ]
         parts: list[str] = []
         if completed:
-            examples = "; ".join(item["title"] for item in completed[:3])
-            parts.append(
-                f"I completed or updated **{len(completed)}** meaningful item"
-                f"{'s' if len(completed) != 1 else ''} for you. The latest were: {examples}."
+            examples = "; ".join(
+                DailyBriefingService._compact_item_text(item)
+                for item in completed[:4]
             )
+            parts.append(f"Recent completed work: {examples}.")
         if counts["proactive_updates"] or counts["artifact_changes"]:
             details = []
             if counts["proactive_updates"]:
@@ -434,6 +482,89 @@ class DailyBriefingService:
         if not parts:
             parts.append("I haven’t completed, failed, or queued any meaningful work for this day yet. I’ll update this space as soon as something changes.")
         return "\n\n".join(parts)
+
+    def _upcoming_items(
+        self,
+        *,
+        selected: date,
+        local_tz: Any,
+        local_now: datetime,
+        tasks: list[Any],
+        inbox: list[Any],
+    ) -> list[dict[str, Any]]:
+        upcoming: list[dict[str, Any]] = []
+        for task in tasks:
+            scheduled_at = self._parse_timestamp(getattr(task, "run_at_utc", None))
+            scheduled_for = scheduled_at.astimezone(local_tz).isoformat() if scheduled_at else None
+            title = str(getattr(task, "description", "") or "Queued task").strip()
+            upcoming.append(self._item(
+                item_id=f"upcoming-task:{getattr(task, 'id', title)}",
+                kind="scheduled_task" if scheduled_for else "queued_task",
+                title=title[:180],
+                summary=(
+                    f"Scheduled for {format(scheduled_at.astimezone(local_tz), '%b %d, %I:%M %p')}."
+                    if scheduled_at
+                    else "Waiting for an idle execution window."
+                ),
+                status=str(getattr(task, "status", "pending") or "pending"),
+                occurred_at=str(getattr(task, "created_at", None) or scheduled_for or local_now.isoformat()),
+                scheduled_for=scheduled_for,
+                destination="/reports",
+                source_ref=str(getattr(task, "id", "")),
+            ))
+        for item in inbox:
+            if not self._looks_like_upcoming_event(item):
+                continue
+            updated_at = str(getattr(item, "updated_at", None) or local_now.isoformat())
+            upcoming.append(self._item(
+                item_id=f"upcoming-event:{getattr(item, 'inbox_id', updated_at)}",
+                kind="upcoming_event",
+                title=str(getattr(item, "title", "") or "Upcoming event")[:180],
+                summary=str(getattr(item, "summary", "") or "Event-related proactive update.")[:900],
+                status=str(getattr(item, "status", "pending") or "pending"),
+                occurred_at=updated_at,
+                scheduled_for=None,
+                destination="/inbox",
+                source_ref=str(getattr(item, "inbox_id", "")),
+            ))
+        upcoming.sort(
+            key=lambda item: (
+                self._instant(item.get("scheduled_for")) if item.get("scheduled_for") else datetime.max.replace(tzinfo=timezone.utc),
+                self._instant(item.get("occurred_at")),
+            )
+        )
+        if selected != local_now.date():
+            return [
+                item for item in upcoming
+                if self._within_day(item.get("scheduled_for") or item.get("occurred_at"), selected, local_tz)
+            ][: self.max_items_per_source]
+        return upcoming[: self.max_items_per_source]
+
+    @classmethod
+    def _requires_urgent_attention(cls, item: dict[str, Any]) -> bool:
+        if item.get("kind") == "approval":
+            return True
+        status = str(item.get("status") or "").strip().lower()
+        if status in {"failed", "blocked", "dead_letter", "completed_with_blocker"}:
+            return True
+        text = f"{item.get('title', '')} {item.get('summary', '')}".lower()
+        return any(marker in text for marker in ("urgent", "overdue", "deadline today", "requires your approval"))
+
+    def _looks_like_upcoming_event(self, item: Any) -> bool:
+        text = " ".join(
+            str(value or "")
+            for value in [
+                getattr(item, "title", ""),
+                getattr(item, "summary", ""),
+                getattr(item, "sources_json", ""),
+                getattr(item, "actions_json", ""),
+            ]
+        ).lower()
+        if "calendar" in text:
+            return True
+        event_markers = ("meeting", "event", "appointment", "deadline", "interview", "exam", "test", "travel")
+        date_markers = ("today", "tomorrow", "next ", " at ", " on ", "am", "pm")
+        return any(marker in text for marker in event_markers) and any(marker in text for marker in date_markers)
 
     def _artifacts_for_day(self, selected: date, local_tz: Any, limit: int) -> list[dict[str, Any]]:
         if self.organizer is None:
@@ -467,10 +598,32 @@ class DailyBriefingService:
         return payload if isinstance(payload, dict) else {}
 
     @staticmethod
-    def _string_list(value: Any, limit: int) -> list[str]:
+    def _string_list(value: Any, limit: int, *, max_chars: int = 500) -> list[str]:
         if not isinstance(value, list):
             return []
-        return [str(item).strip()[:500] for item in value if str(item).strip()][:limit]
+        output = []
+        for item in value:
+            text = " ".join(str(item or "").split())
+            if not text:
+                continue
+            if len(text) > max_chars:
+                text = text[: max(1, max_chars - 1)].rstrip() + "..."
+            output.append(text)
+            if len(output) >= limit:
+                break
+        return output
+
+    @staticmethod
+    def _compact_item_text(item: dict[str, Any], *, max_chars: int = 170) -> str:
+        title = str(item.get("title") or "").strip()
+        summary = str(item.get("summary") or "").strip()
+        text = title if title else summary
+        if title and summary and summary.lower() not in title.lower():
+            text = f"{title} - {summary}"
+        text = " ".join(text.split())
+        if len(text) > max_chars:
+            return text[: max(1, max_chars - 1)].rstrip() + "..."
+        return text or str(item.get("kind") or "item")
 
     @staticmethod
     def _parse_date(value: str) -> date:

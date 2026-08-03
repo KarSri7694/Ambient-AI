@@ -67,8 +67,21 @@ class FakeReportStore:
 
 
 class FakeTasks:
+    def __init__(self, now):
+        self.now = now
+
     def get_all_pending_tasks(self):
-        return []
+        return [
+            SimpleNamespace(
+                id=7,
+                description="Check queued experiment results",
+                priority="medium",
+                status="pending",
+                created_at=self.now.isoformat(),
+                metadata_json="{}",
+                run_at_utc=(self.now + timedelta(hours=2)).isoformat(),
+            )
+        ]
 
 
 class FakeOrganizer:
@@ -88,8 +101,8 @@ class FakeLLM:
         text = json.dumps({
             "headline": "Notes organized and one update awaits review",
             "overview": "Ambient AI consolidated a note and found a relevant update.",
-            "accomplishments": ["Organized lecture notes"],
-            "updates": ["A dependency update was found"],
+            "accomplishments": ["Organized lecture notes into the current Ambient AI implementation notes."],
+            "updates": ["A dependency update was found and summarized for review."],
             "failures": [],
             "attention": ["Approve the bounded browser verification"],
         })
@@ -117,7 +130,7 @@ def make_service(now):
     llm = FakeLLM()
     service = DailyBriefingService(
         autonomy_store=FakeAutonomyStore(now), report_store=FakeReportStore(now),
-        task_store=FakeTasks(), organizer=FakeOrganizer(), llm_provider=llm,
+        task_store=FakeTasks(now), organizer=FakeOrganizer(), llm_provider=llm,
         user_context_service=FakeUserContext(), model="reporter", cooldown_minutes=15,
     )
     return service, llm
@@ -135,7 +148,13 @@ def test_snapshot_marks_items_new_without_needing_ai():
     assert result["new_count"] >= 2
     assert result["counts"]["reports"] == 1
     assert result["counts"]["pending_approvals"] == 1
-    assert "I completed or updated" in result["latest_narrative"]
+    assert result["counts"]["upcoming"] == 1
+    assert result["counts"]["urgent"] == 1
+    assert result["upcoming"][0]["title"] == "Check queued experiment results"
+    assert result["urgent"][0]["kind"] == "approval"
+    assert "I completed or updated" not in result["latest_narrative"]
+    assert "Recent completed work" in result["latest_narrative"]
+    assert "Organized lecture notes" in result["latest_narrative"]
 
 
 def test_idle_refresh_caches_sanitized_ai_digest():
@@ -146,9 +165,12 @@ def test_idle_refresh_caches_sanitized_ai_digest():
     snapshot = service.snapshot(date_value=now.astimezone().date().isoformat())
     assert snapshot["briefing"]["headline"].startswith("Notes organized")
     prompt = llm.messages[1]["content"]
+    system_prompt = llm.messages[0]["content"]
     assert "private full model output" not in prompt
     assert "raw_capture" not in prompt
     assert "prefers concise technical summaries" in prompt
+    assert "1-2 short lines" in system_prompt
+    assert "completed or updated 62 meaningful items" in system_prompt
     assert snapshot["briefing"]["failures"] == []
     service.autonomy_store.audits.append({"action": "resource.model_loaded"})
     after_model_audit = service.snapshot(date_value=now.astimezone().date().isoformat())

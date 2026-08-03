@@ -59,14 +59,21 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         self.shutdown_controller = shutdown_controller
         self._active_streams: set[Any] = set()
 
+    def _raise_if_shutdown_requested(self) -> None:
+        shutdown_controller = getattr(self, "shutdown_controller", None)
+        if shutdown_controller is not None and not shutdown_controller.permits_new_model_request():
+            raise ShutdownInProgress("Shutdown is in progress; no new llama.cpp request will be sent.")
+
     # ── ModelManager ──────────────────────────────────────────
 
     async def load_model(self, model_name: str, unload_previous: bool = True) -> None:
         """Load a model through the llama.cpp server model-management endpoint."""
+        self._raise_if_shutdown_requested()
         await asyncio.to_thread(self.load_model_sync, model_name, unload_previous)
 
     def load_model_sync(self, model_name: str, unload_previous: bool = True) -> None:
         """Load a model and return only after its inference endpoint is healthy."""
+        self._raise_if_shutdown_requested()
         model_name = str(model_name or "").strip()
         if not model_name:
             raise ValueError("A non-empty model name is required.")
@@ -92,10 +99,12 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
             return
 
         if unload_previous and loaded_model is not None:
+            self._raise_if_shutdown_requested()
             self.unload_model_sync()
 
         model = {"model": model_name}
         try:
+            self._raise_if_shutdown_requested()
             response = requests.post(
                 f"{self.base_url}/models/load",
                 json=model,
@@ -125,10 +134,12 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
 
     async def unload_model(self, model_name: Optional[str] = None) -> None:
         """Unload the currently tracked model from the llama.cpp server."""
+        self._raise_if_shutdown_requested()
         await asyncio.to_thread(self.unload_model_sync, model_name)
 
     def unload_model_sync(self, model_name: Optional[str] = None) -> Optional[str]:
         """Synchronously unload the currently tracked model and return its name."""
+        self._raise_if_shutdown_requested()
         loaded_model = str(model_name or "").strip() or (
             self.currently_loaded_model
             if getattr(self, "isolated_model_tracking", False)
@@ -137,6 +148,7 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         if loaded_model is None:
             return None
         model = {"model": loaded_model}
+        self._raise_if_shutdown_requested()
         response = requests.post(
             f"{self.base_url}/models/unload",
             json=model,
@@ -311,6 +323,7 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         last_error: Optional[Exception] = None
 
         while time.time() < deadline:
+            self._raise_if_shutdown_requested()
             try:
                 metadata = self._get_model_metadata(model_name)
                 if metadata is not None:
@@ -344,6 +357,7 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         next_progress_log = started_at
 
         while time.monotonic() < deadline:
+            self._raise_if_shutdown_requested()
             remaining = deadline - time.monotonic()
             try:
                 metadata = next(
@@ -694,8 +708,7 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         If `image` is provided, it is attached to the final user message as a
         base64 data URL for multimodal models.
         """
-        if self.shutdown_controller is not None and not self.shutdown_controller.permits_new_model_request():
-            raise ShutdownInProgress("Shutdown is in progress; no new llama.cpp request will be sent.")
+        self._raise_if_shutdown_requested()
         await asyncio.to_thread(self._require_model_ready, model)
         copy_messages = copy.deepcopy(messages)
         if image and copy_messages:
@@ -753,8 +766,7 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         async def _create_with_retries(start_attempt: int = 1) -> tuple[Any, int]:
             last_error: Exception | None = None
             for attempt in range(start_attempt, self.stream_retry_attempts + 1):
-                if self.shutdown_controller is not None and not self.shutdown_controller.permits_new_model_request():
-                    raise ShutdownInProgress("Shutdown is in progress; no new llama.cpp request will be sent.")
+                self._raise_if_shutdown_requested()
                 try:
                     return await self.client.chat.completions.create(**kwargs), attempt
                 except (asyncio.CancelledError, ForcedShutdown):

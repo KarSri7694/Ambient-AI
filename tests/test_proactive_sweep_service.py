@@ -9,6 +9,7 @@ sys.path.insert(0, str(SRC_ROOT))
 
 from application.services.capability_policy_service import CapabilityPolicyService, CapabilityRegistry
 from application.services.proactive_sweep_service import ProactiveSweepService
+from application.services.runtime_interrupt_service import ShutdownInProgress
 from core.models import OpportunityCandidate, ProactiveInboxItem
 from infrastructure.adapter.SQLiteAutonomyAdapter import SQLiteAutonomyAdapter
 from local_control.computer import ComputerControlSession
@@ -81,6 +82,11 @@ class _Memory:
         self.observations.append(observation)
 
 
+class _ShutdownLlmService(_LlmService):
+    async def run_interaction(self, **kwargs):
+        raise ShutdownInProgress("Shutdown is in progress; no new llama.cpp request will be sent.")
+
+
 def test_proactive_sweep_does_not_run_without_global_grant(tmp_path):
     store = SQLiteAutonomyAdapter(str(tmp_path / "autonomy.db"))
     service = ProactiveSweepService(
@@ -127,6 +133,70 @@ def test_proactive_sweep_filters_read_tools_and_surfaces_finding(tmp_path):
     assert memory.observations[0].biodata_sent_at is None
     assert memory.observations[0].followup_sent_at
     assert "Important email needs review" in memory.observations[0].summary
+
+
+def test_proactive_sweep_can_run_once_per_day(tmp_path):
+    store = SQLiteAutonomyAdapter(str(tmp_path / "autonomy.db"))
+    service = ProactiveSweepService(
+        autonomy_store=store,
+        llm_service=_LlmService(),
+        capability_policy=CapabilityPolicyService(store=store),
+        model="model",
+        enabled=True,
+        global_grant=True,
+        enabled_sources=["gmail"],
+        cadence_mode="once_per_day",
+        cadence_minutes=1,
+        max_sweeps_per_day=8,
+    )
+
+    assert asyncio.run(service.run_if_due())["ran"] is True
+
+    assert service.is_due() is False
+    assert asyncio.run(service.run_if_due()) == {"ran": False, "reason": "not_due_or_disabled"}
+
+
+def test_proactive_sweep_can_run_once_per_idle_cycle(tmp_path):
+    store = SQLiteAutonomyAdapter(str(tmp_path / "autonomy.db"))
+    service = ProactiveSweepService(
+        autonomy_store=store,
+        llm_service=_LlmService(),
+        capability_policy=CapabilityPolicyService(store=store),
+        model="model",
+        enabled=True,
+        global_grant=True,
+        enabled_sources=["gmail"],
+        cadence_mode="once_per_idle_cycle",
+        cadence_minutes=999,
+        max_sweeps_per_day=8,
+    )
+
+    assert service.is_due() is False
+    assert service.is_due(idle_cycle_key="idle-1") is True
+    assert asyncio.run(service.run_if_due(idle_cycle_key="idle-1"))["ran"] is True
+
+    assert service.is_due(idle_cycle_key="idle-1") is False
+    assert service.is_due(idle_cycle_key="idle-2") is True
+
+
+def test_proactive_sweep_stops_cleanly_during_shutdown(tmp_path):
+    store = SQLiteAutonomyAdapter(str(tmp_path / "autonomy.db"))
+    service = ProactiveSweepService(
+        autonomy_store=store,
+        llm_service=_ShutdownLlmService(),
+        capability_policy=CapabilityPolicyService(store=store),
+        model="model",
+        enabled=True,
+        global_grant=True,
+        enabled_sources=["gmail"],
+    )
+
+    result = asyncio.run(service.run_if_due())
+
+    assert result["status"] == "interrupted"
+    assert result["created_findings"] == 0
+    assert result["errors"] == {}
+    assert store.list_inbox_items() == []
 
 
 def test_proactive_sweep_injects_configured_gmail_email(tmp_path):

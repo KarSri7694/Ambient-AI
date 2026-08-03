@@ -3,12 +3,13 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Activity, Archive, BarChart3, Bot, BrainCircuit, Database, FileText, Home, Inbox,
   ListRestart, MessageSquare, Moon, OctagonX, Pause, Play, RotateCcw, ScrollText, Sun, TestTube2,
-  UserRound, Repeat2,
+  UserRound, Repeat2, ShieldCheck,
 } from "lucide-react";
 import { getJson, sendJson } from "./api";
 import { Badge, Button } from "./components/ui";
 import { ChatPage } from "./pages/ChatPage";
 import { InboxPage } from "./pages/InboxPage";
+import { ApprovalsPage } from "./pages/ApprovalsPage";
 import { ReportsPage } from "./pages/ReportsPage";
 import { BenchmarksPage } from "./pages/BenchmarksPage";
 import { TrainingPage } from "./pages/TrainingPage";
@@ -25,12 +26,13 @@ const routes = [
   { path: "/chat", label: "Chat", icon: MessageSquare },
   { path: "/interactions", label: "Interactions", icon: Database },
   { path: "/inbox", label: "Proactive Inbox", icon: Inbox },
+  { path: "/approvals", label: "Approvals", icon: ShieldCheck },
   { path: "/recurring-tasks", label: "Monitors", icon: Repeat2 },
   { path: "/processing-queue", label: "Processing Queue", icon: ListRestart },
   { path: "/reports", label: "Reports", icon: FileText },
   { path: "/artifacts", label: "Artifacts", icon: Archive },
   { path: "/benchmarks", label: "Benchmarks", icon: BarChart3 },
-  { path: "/real-world-tests", label: "Real-world Tests", icon: TestTube2 },
+  { path: "/real-world-tests", label: "Real-world Tests", icon: TestTube2, labOnly: true },
   { path: "/training", label: "Training", icon: BrainCircuit },
   { path: "/logs", label: "Runtime Logs", icon: ScrollText },
 ] as const;
@@ -109,6 +111,14 @@ export function App() {
   const biodataBusy = Boolean(biodataStatus.running || biodataStatus.requested);
   const interruptStatus = interrupt.data?.status || {};
   const interruptActive = Boolean(interruptStatus.active_work || interruptStatus.requested);
+  const realWorldLabAvailable = Boolean(health.data?.real_world_lab);
+  const visibleRoutes = useMemo(
+    () => routes.filter((route) => !("labOnly" in route) || !route.labOnly || realWorldLabAvailable),
+    [realWorldLabAvailable]
+  );
+  useEffect(() => {
+    if (path === "/real-world-tests" && health.isSuccess && !realWorldLabAvailable) navigate("/home");
+  }, [path, health.isSuccess, realWorldLabAvailable, navigate]);
   const captureMutation = useMutation({
     mutationFn: () => sendJson(`/api/privacy/capture/${capturePaused ? "resume" : "pause"}`, "POST"),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["privacy-status"] }),
@@ -136,17 +146,18 @@ export function App() {
       case "/home": return <HomePage onNavigate={navigate} />;
       case "/interactions": return <InteractionsPage />;
       case "/inbox": return <InboxPage privacy={privacy.data} resources={resources.data} />;
+      case "/approvals": return <ApprovalsPage />;
       case "/recurring-tasks": return <RecurringTasksPage />;
       case "/processing-queue": return <ProcessingQueuePage />;
       case "/reports": return <ReportsPage />;
       case "/artifacts": return <ArtifactsPage />;
       case "/benchmarks": return <BenchmarksPage />;
-      case "/real-world-tests": return <RealWorldTestsPage />;
+      case "/real-world-tests": return realWorldLabAvailable ? <RealWorldTestsPage /> : <HomePage onNavigate={navigate} />;
       case "/training": return <TrainingPage />;
       case "/logs": return <LogsPage />;
       default: return <ChatPage />;
     }
-  }, [path, privacy.data, resources.data, navigate]);
+  }, [path, privacy.data, resources.data, realWorldLabAvailable, navigate]);
   const loadedModel = resources.data?.residency?.loaded_model || "On demand";
 
   return (
@@ -160,7 +171,7 @@ export function App() {
           </div>
         </div>
         <nav className="flex flex-1 flex-col gap-1" aria-label="Dashboard sections">
-          {routes.map((route) => {
+          {visibleRoutes.map((route) => {
             const Icon = route.icon;
             return (
               <button key={route.path} type="button" className={`nav-item ${path === route.path ? "active" : ""}`} onClick={() => navigate(route.path)} aria-current={path === route.path ? "page" : undefined}>
@@ -219,7 +230,7 @@ export function App() {
       </div>
 
       <nav className="mobile-nav" aria-label="Dashboard sections">
-        {routes.map((route) => {
+        {visibleRoutes.map((route) => {
           const Icon = route.icon;
           return <button key={route.path} type="button" className={path === route.path ? "active" : ""} onClick={() => navigate(route.path)} aria-label={route.label}><Icon size={19} /><span>{route.label.split(" ")[0]}</span></button>;
         })}

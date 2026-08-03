@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 
 from application.ports.LLMProvider import LLMProvider
 from application.ports.memory_port import MemoryPort
+from application.services.runtime_interrupt_service import ShutdownInProgress
 
 
 class SemanticDeduplicationService:
@@ -121,6 +122,8 @@ Rules:
                 tools=None,
             )
             parsed = self._parse_json_object(await self._consume_stream_text(completion))
+        except ShutdownInProgress:
+            raise
         except Exception as exc:
             self.logger.warning("Semantic dedupe evaluation failed: %s", exc)
             return self._fallback_result(

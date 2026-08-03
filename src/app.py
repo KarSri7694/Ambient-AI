@@ -360,6 +360,7 @@ LLM_INTERACTION_FINAL_TURN_RECOVERY_ENABLED = CONFIG.get_bool(
 PROACTIVE_AUTONOMY_ENABLED = CONFIG.get_bool("proactive_autonomy", "enabled", False)
 PROACTIVE_AUTONOMY_GLOBAL_GRANT = CONFIG.get_bool("proactive_autonomy", "global_grant", False)
 PROACTIVE_AUTONOMY_MODEL = CONFIG.get_model("model", FOLLOWUP_EXECUTION_MODEL, section="proactive_autonomy")
+PROACTIVE_AUTONOMY_CADENCE_MODE = CONFIG.get_str("proactive_autonomy", "cadence_mode", "interval")
 PROACTIVE_AUTONOMY_CADENCE_MINUTES = CONFIG.get_int("proactive_autonomy", "cadence_minutes", 60)
 PROACTIVE_AUTONOMY_MAX_SWEEPS_PER_DAY = CONFIG.get_int("proactive_autonomy", "max_sweeps_per_day", 8)
 PROACTIVE_AUTONOMY_MAX_FINDINGS = CONFIG.get_int("proactive_autonomy", "max_findings_per_sweep", 10)
@@ -1357,6 +1358,7 @@ class AmbientRuntime:
             enabled=PROACTIVE_AUTONOMY_ENABLED,
             global_grant=PROACTIVE_AUTONOMY_GLOBAL_GRANT,
             enabled_sources=PROACTIVE_AUTONOMY_SOURCES,
+            cadence_mode=PROACTIVE_AUTONOMY_CADENCE_MODE,
             cadence_minutes=PROACTIVE_AUTONOMY_CADENCE_MINUTES,
             max_sweeps_per_day=PROACTIVE_AUTONOMY_MAX_SWEEPS_PER_DAY,
             max_findings_per_sweep=PROACTIVE_AUTONOMY_MAX_FINDINGS,
@@ -2342,6 +2344,7 @@ class AmbientRuntime:
         last_idle_cycle_at = 0.0
         biodata_context_events_since_update = 0
         biodata_ran_in_idle_window = False
+        idle_window_id = 0
         user_idle_now = False
         services_initialized = False
         last_browser_approval_fallback_check_at = 0.0
@@ -2394,6 +2397,7 @@ class AmbientRuntime:
                 if current_user_idle != user_idle_now:
                     user_idle_now = current_user_idle
                     if user_idle_now:
+                        idle_window_id += 1
                         logger.info(
                             "User idle detected (>= %ss); background work may use the available resource window.",
                             USER_IDLE_THRESHOLD_SECONDS,
@@ -2879,7 +2883,10 @@ class AmbientRuntime:
                                                     ),
                                                     max_events=RESOURCE_BATCH_MAX_EVENTS,
                                                     max_seconds=RESOURCE_BATCH_MAX_SECONDS,
-                                                    should_preempt=self._chat_turn_ready,
+                                                    should_preempt=lambda: (
+                                                        self.stop_event.is_set()
+                                                        or self._chat_turn_ready()
+                                                    ),
                                                 )
                             if autonomy_result.get("processed"):
                                 context_event_count = sum(
@@ -3024,12 +3031,13 @@ class AmbientRuntime:
                             break
                         continue
 
+                proactive_idle_cycle_key = f"{datetime.now().astimezone().date().isoformat()}-{idle_window_id}"
                 if (
                     user_idle_now
                     and autonomy_coordinator is not None
                     and not autonomy_coordinator.has_ready_work()
                     and proactive_sweep_service is not None
-                    and proactive_sweep_service.is_due()
+                    and proactive_sweep_service.is_due(idle_cycle_key=proactive_idle_cycle_key)
                     and not self._chat_turn_ready()
                 ):
                     try:
@@ -3043,7 +3051,9 @@ class AmbientRuntime:
                             user_active=False,
                         )
                         with self.gpu_lock:
-                            sweep_result = await proactive_sweep_service.run_if_due()
+                            sweep_result = await proactive_sweep_service.run_if_due(
+                                idle_cycle_key=proactive_idle_cycle_key
+                            )
                         if sweep_result.get("ran"):
                             logger.info("Idle proactive sweep result: %s", sweep_result)
                     except ResourceUnavailableError as exc:

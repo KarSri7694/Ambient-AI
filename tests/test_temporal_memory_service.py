@@ -61,17 +61,18 @@ def test_work_retrieval_is_temporal_post_ranked_and_chronological(tmp_path):
     memory = SQLiteMemoryAdapter(str(tmp_path / "memory.db"), str(tmp_path / "memory"))
     semantic = _SemanticResults(memory)
     service = TemporalMemoryService(memory=memory, semantic_memory=semantic)
+    now = datetime.now().replace(microsecond=0)
     first = service.record_ambient_event(
         _event(
             "one",
-            "2026-08-02T09:00:00",
+            (now - timedelta(minutes=20)).isoformat(),
             {"activity": "Comparing Qwen embedding models for a local retrieval system", "app_name": "Browser"},
         )
     )
     second = service.record_ambient_event(
         _event(
             "two",
-            "2026-08-02T10:00:00",
+            (now - timedelta(minutes=10)).isoformat(),
             {"activity": "Validated the Qwen embedding integration in the local retrieval system", "app_name": "VS Code"},
         )
     )

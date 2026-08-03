@@ -24,7 +24,7 @@ function messageText(message: ChatMessage): string {
   if (message.content) return message.content;
   if (message.status === "queued") return "Queued…";
   if (message.status === "running") return "Thinking…";
-  if (message.status === "awaiting_approval") return "Waiting for your approval in the Inbox.";
+  if (message.status === "awaiting_approval") return "Waiting for your approval in Approvals.";
   return message.error_text || "No response returned.";
 }
 
@@ -95,7 +95,7 @@ export function ChatPage() {
             event.data.status === "running"
               ? "Ambient AI is thinking…"
               : event.data.status === "awaiting_approval"
-                ? "Approval required. Review it in the Inbox; this conversation will resume afterward."
+                ? "Approval required. Review it in Approvals; this conversation will resume afterward."
                 : event.data.status
           );
           if (["snapshot", "delta", "status", "done", "error"].includes(event?.type || "")) {
@@ -149,7 +149,19 @@ export function ChatPage() {
       setActivity(error instanceof Error ? error.message : "Could not send the message.");
     }
   };
-  const active = messages.data?.messages.some((message) => message.role === "assistant" && ["queued", "running", "awaiting_approval"].includes(message.status)) || streamingIds.size > 0;
+  const blockingAssistant = messages.data?.messages.find(
+    (message) => message.role === "assistant" && ["queued", "running", "awaiting_approval"].includes(message.status)
+  );
+  const active = Boolean(blockingAssistant) || streamingIds.size > 0;
+  const composerStatus = blockingAssistant
+    ? blockingAssistant.status === "awaiting_approval"
+      ? "Approval is required before this conversation can continue. Review it in Approvals."
+      : blockingAssistant.status === "queued"
+        ? "A response is queued. The composer unlocks when it finishes or fails."
+        : "Ambient AI is responding. The composer unlocks when this response finishes."
+    : streamingIds.size > 0
+      ? "Connecting to the live response stream."
+      : "";
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void submit(); }
   };
@@ -199,9 +211,9 @@ export function ChatPage() {
           ))}
           <div ref={messageEnd} />
         </div>
-        <div className="min-h-7 px-5 text-xs text-accent" aria-live="polite">{activity}</div>
+        <div className="min-h-7 px-5 text-xs text-accent" aria-live="polite">{activity || composerStatus}</div>
         <form className="chat-composer" onSubmit={submit}>
-          <textarea value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={onKeyDown} rows={2} maxLength={12000} placeholder="Message Ambient AI…" aria-label="Message Ambient AI" disabled={active} />
+          <textarea value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={onKeyDown} rows={2} maxLength={12000} placeholder={composerStatus || "Message Ambient AI..."} aria-label="Message Ambient AI" disabled={active} />
           <Button variant="primary" type="submit" disabled={active || !input.trim()}><Send size={17} />Send</Button>
         </form>
         <p className="pb-4 text-center text-xs text-muted">Enter to send · Shift+Enter for a new line · explicit action requests can use tools</p>

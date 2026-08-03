@@ -29,7 +29,7 @@ from application.services.capability_policy_service import (
     PolicyDeniedError,
 )
 from application.services.artifact_organizer_service import ArtifactOrganizer
-from application.services.runtime_interrupt_service import WorkInterrupted
+from application.services.runtime_interrupt_service import ShutdownInProgress, WorkInterrupted
 from core.models import ApprovalGrant, DelegatedTask
 from local_control.computer import ComputerControlSession
 from local_control.filesystem import FilesystemControlSession
@@ -223,6 +223,7 @@ class LLMInteractionService:
         "You are a dedicated read-only filesystem sub-agent working on one delegated task.\n"
         "\n"
         "Rules:\n"
+        "- You are operating in a Windows environment. Valid paths look like C:\\Users\\Name\\Documents or D:\\projects\\ambient_ai.\n"
         "- Operate only inside the user-granted paths available to your tools.\n"
         "- Filesystem tools require absolute paths. Start from the resolved granted roots in the task message; do not use '.', '/', '~', '/home', or guessed Linux paths.\n"
         "- Prefer fs_search_text on a resolved granted root when the task asks to find files or text recursively.\n"
@@ -742,7 +743,11 @@ class LLMInteractionService:
                             self.logger.exception("Failed to close browser session.")
 
                 restore_error: Optional[BaseException] = None
-                if model_swapped:
+                shutdown_requested = (
+                    self.shutdown_controller is not None
+                    and self.shutdown_controller.is_graceful_requested()
+                )
+                if model_swapped and not shutdown_requested:
                     try:
                         current_model_name = self.llm.get_current_model()
                         if current_model_name and current_model_name != parent_model_name:
@@ -751,8 +756,15 @@ class LLMInteractionService:
                     except BaseException as exc:
                         restore_error = exc
                         self.logger.exception("Failed to restore parent model after browser delegation.")
+                elif model_swapped:
+                    restore_error = ShutdownInProgress(
+                        "Shutdown is in progress; skipping parent model restoration after browser delegation."
+                    )
+                    self.logger.info(str(restore_error))
 
                 if restore_error is not None:
+                    if isinstance(restore_error, ShutdownInProgress):
+                        raise restore_error
                     if primary_error is not None:
                         raise RuntimeError(
                             f"Browser task failed ({primary_error}) and parent restoration also failed "
@@ -962,7 +974,7 @@ class LLMInteractionService:
         if not self.filesystem_agent_model:
             raise RuntimeError("No filesystem model is configured.")
         resolved_grants = [
-            str(Path(path).expanduser().resolve(strict=False))
+            self._normalize_filesystem_grant_path(str(path))
             for path in granted_paths
         ]
 
@@ -1035,7 +1047,11 @@ class LLMInteractionService:
                     self._pop_frame()
                 await session.cleanup()
                 restore_error: Optional[BaseException] = None
-                if model_swapped:
+                shutdown_requested = (
+                    self.shutdown_controller is not None
+                    and self.shutdown_controller.is_graceful_requested()
+                )
+                if model_swapped and not shutdown_requested:
                     try:
                         current_model_name = self.llm.get_current_model()
                         if current_model_name and current_model_name != parent_model_name:
@@ -1044,7 +1060,14 @@ class LLMInteractionService:
                     except BaseException as exc:
                         restore_error = exc
                         self.logger.exception("Failed to restore parent model after filesystem delegation.")
+                elif model_swapped:
+                    restore_error = ShutdownInProgress(
+                        "Shutdown is in progress; skipping parent model restoration after filesystem delegation."
+                    )
+                    self.logger.info(str(restore_error))
                 if restore_error is not None:
+                    if isinstance(restore_error, ShutdownInProgress):
+                        raise restore_error
                     if primary_error is not None:
                         raise RuntimeError(
                             f"Filesystem task failed ({primary_error}) and parent restoration also failed ({restore_error})."
@@ -1178,7 +1201,11 @@ class LLMInteractionService:
                     self._pop_frame()
                 await session.cleanup()
                 restore_error: Optional[BaseException] = None
-                if model_swapped:
+                shutdown_requested = (
+                    self.shutdown_controller is not None
+                    and self.shutdown_controller.is_graceful_requested()
+                )
+                if model_swapped and not shutdown_requested:
                     try:
                         current_model_name = self.llm.get_current_model()
                         if current_model_name and current_model_name != parent_model_name:
@@ -1187,7 +1214,14 @@ class LLMInteractionService:
                     except BaseException as exc:
                         restore_error = exc
                         self.logger.exception("Failed to restore parent model after computer-use deployment.")
+                elif model_swapped:
+                    restore_error = ShutdownInProgress(
+                        "Shutdown is in progress; skipping parent model restoration after computer-use delegation."
+                    )
+                    self.logger.info(str(restore_error))
                 if restore_error is not None:
+                    if isinstance(restore_error, ShutdownInProgress):
+                        raise restore_error
                     if primary_error is not None:
                         raise RuntimeError(
                             f"Computer-use task failed ({primary_error}) and parent restoration also failed ({restore_error})."
@@ -1249,8 +1283,39 @@ class LLMInteractionService:
             f"Current day of week: {now.strftime('%A')}\n"
             f"Current date: {now.strftime('%Y-%m-%d')}\n"
             f"Current time: {now.strftime('%H:%M:%S')}\n\n"
+            "Runtime environment: Windows. Use Windows paths such as "
+            "C:\\Users\\Kartikeya Srivastava\\Documents and D:\\projects\\ambient_ai; "
+            "do not invent Linux paths such as /home/user.\n\n"
         )
         return preamble + system_prompt
+
+    @staticmethod
+    def _normalize_filesystem_grant_path(raw_path: str) -> str:
+        value = str(raw_path or "").strip().replace("\\", "/")
+        home = Path.home()
+        stale_linux_home = "/home/user"
+        if value == stale_linux_home or value.startswith(stale_linux_home + "/"):
+            suffix = value[len(stale_linux_home):].strip("/")
+            if not suffix:
+                return str(home.resolve(strict=False))
+            first, _, rest = suffix.partition("/")
+            known_home_dirs = {"Desktop", "Documents", "Downloads"}
+            if first in known_home_dirs:
+                return str((home / first / rest).resolve(strict=False))
+            if first == "Projects":
+                return str((home / "Projects" / rest).resolve(strict=False))
+            if first == "ambient_ai":
+                cwd = Path.cwd().resolve(strict=False)
+                if cwd.name.lower() == "ambient_ai":
+                    return str(cwd)
+            return str((home / suffix).resolve(strict=False))
+        if value.startswith("/"):
+            raise ValueError(
+                "use_filesystem granted_paths must use Windows absolute paths in this runtime, "
+                "for example C:\\Users\\Kartikeya Srivastava\\Documents or D:\\projects\\ambient_ai."
+            )
+        path = Path(raw_path).expanduser()
+        return str(path.resolve(strict=False))
 
     def _emit_event(
         self,

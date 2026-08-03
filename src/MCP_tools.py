@@ -696,7 +696,7 @@ async def use_filesystem(
     ],
     granted_paths: Annotated[
         list[str],
-        "Absolute file or folder paths explicitly granted by the user for this task",
+        "Absolute Windows file or folder paths explicitly granted by the user for this task, e.g. C:\\Users\\Kartikeya Srivastava\\Documents or D:\\projects\\ambient_ai. Do not use Linux paths such as /home/user.",
     ],
 ) -> str:
     """
@@ -704,7 +704,9 @@ async def use_filesystem(
 
     The delegated agent can only list, stat, read, and search inside the granted
     paths. It cannot delete, overwrite, move, rename, run shell commands, or
-    access ungranted paths. Implemented by LLMInteractionService.
+    access ungranted paths. This runtime is on Windows, so granted_paths must be
+    Windows absolute paths, not Linux-style /home paths. Implemented by
+    LLMInteractionService.
     """
     pass
 

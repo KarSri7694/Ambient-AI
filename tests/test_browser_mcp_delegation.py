@@ -13,6 +13,7 @@ sys.path.insert(0, str(SRC_ROOT))
 from application.services.llm_interaction_service import InteractionSuspended, LLMInteractionService
 from application.services.capability_policy_service import CapabilityPolicyService
 from application.services.autonomy_coordinator_service import AutonomyCoordinatorService
+from application.services.runtime_interrupt_service import RuntimeShutdownController, ShutdownInProgress
 from infrastructure.adapter.BrowserMCPToolAdapter import (
     BrowserMCPToolAdapter,
     BrowserMCPToolSession,
@@ -539,6 +540,38 @@ def test_browser_timeout_still_cleans_up_and_restores_parent():
     assert browser_bridge.sessions[0].cleaned is True
     assert provider.current_model == "main-model"
     assert provider.events[-2:] == ["unload:browser-model", "restore_parent"]
+
+
+def test_browser_shutdown_skips_parent_restore_after_cleanup():
+    provider = _SlowBrowserProvider()
+    browser_bridge = _BrowserBridge()
+    shutdown = RuntimeShutdownController()
+    service = LLMInteractionService(
+        llm_provider=provider,
+        tool_bridge=_MainToolBridge(),
+        browser_tool_bridge=browser_bridge,
+        browser_agent_model="browser-model",
+        browser_task_timeout_seconds=0.05,
+        browser_headless=True,
+        shutdown_controller=shutdown,
+    )
+
+    async def exercise():
+        task = asyncio.create_task(
+            service._run_browser_agent(
+                task="Open example.com",
+                agent_depth=0,
+            )
+        )
+        await asyncio.sleep(0.01)
+        shutdown.request_interrupt()
+        with pytest.raises(ShutdownInProgress):
+            await task
+
+    asyncio.run(exercise())
+
+    assert browser_bridge.sessions[0].cleaned is True
+    assert provider.events == ["save_and_unload_parent", "load:browser-model"]
 
 
 def test_browser_agent_cannot_delegate_again():

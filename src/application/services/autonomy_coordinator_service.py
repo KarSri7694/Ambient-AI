@@ -14,7 +14,7 @@ from application.services.interaction_trace import interaction_trace
 from application.services.llm_interaction_service import InteractionSuspended
 from application.services.opportunity_judgment_service import OpportunityJudgmentService
 from application.services.resource_governor_service import ResourceUnavailableError
-from application.services.runtime_interrupt_service import WorkInterrupted
+from application.services.runtime_interrupt_service import ShutdownInProgress, WorkInterrupted
 from core.models import AmbientEvent, DelegatedTask, OpportunityCandidate, ProactiveInboxItem, VisualObservation
 
 
@@ -637,6 +637,11 @@ Do not repeat an action already reported as performed.
             reason = str(exc) or "Interrupted by local user"
             self.store.complete_event(event.event_id, status="interrupted", error_text=reason)
             self.logger.info("Ambient event %s was interrupted by local user.", event.event_id)
+            return event_result({"processed": True, "outcome": "interrupted", "reason": reason})
+        except ShutdownInProgress as exc:
+            reason = str(exc) or "Shutdown is in progress"
+            self.store.complete_event(event.event_id, status="interrupted", error_text=reason)
+            self.logger.info("Ambient event %s stopped during runtime shutdown.", event.event_id)
             return event_result({"processed": True, "outcome": "interrupted", "reason": reason})
         except Exception as exc:
             self.logger.exception("Autonomy event %s failed.", event.event_id)

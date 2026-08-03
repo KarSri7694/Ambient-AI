@@ -567,6 +567,31 @@ def test_force_shutdown_closes_active_llama_stream_and_http_client():
     assert closed == {"stream": True, "client": True}
 
 
+def test_shutdown_blocks_model_load_and_unload_before_executor(monkeypatch):
+    controller = RuntimeShutdownController()
+    adapter = LlamaCppAdapter("http://localhost:8080", shutdown_controller=controller)
+    calls = {"load": 0, "unload": 0}
+
+    def fake_load(*args, **kwargs):
+        calls["load"] += 1
+
+    def fake_unload(*args, **kwargs):
+        calls["unload"] += 1
+
+    monkeypatch.setattr(adapter, "load_model_sync", fake_load)
+    monkeypatch.setattr(adapter, "unload_model_sync", fake_unload)
+    controller.request_interrupt()
+
+    async def exercise():
+        with pytest.raises(ShutdownInProgress):
+            await adapter.load_model("main")
+        with pytest.raises(ShutdownInProgress):
+            await adapter.unload_model()
+
+    asyncio.run(exercise())
+    assert calls == {"load": 0, "unload": 0}
+
+
 def test_per_request_max_tokens_overrides_adapter_default():
     adapter = LlamaCppAdapter("http://localhost:8080", default_max_tokens=60000)
     captured = {}

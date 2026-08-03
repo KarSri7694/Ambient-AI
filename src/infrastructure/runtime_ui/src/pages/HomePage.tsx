@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  Archive, ArrowLeft, ArrowRight, Bot, Check, ChevronRight, Clock3, FileText,
+  Archive, ArrowLeft, ArrowRight, Bot, CalendarDays, Check, ChevronRight, Clock3, FileText,
   Inbox, ListTodo, RefreshCw, ShieldAlert, Sparkles, X,
 } from "lucide-react";
 import { getJson, sendJson } from "../api";
@@ -75,6 +75,7 @@ export function HomePage({ onNavigate }: { onNavigate: (path: string) => void })
       sendJson(`/api/autonomy/approvals/${id}/decision`, "POST", { approved }),
     onSuccess: () => {
       client.invalidateQueries({ queryKey: ["home"] });
+      client.invalidateQueries({ queryKey: ["approvals"] });
       client.invalidateQueries({ queryKey: ["proactive-inbox"] });
     },
   });
@@ -92,17 +93,18 @@ export function HomePage({ onNavigate }: { onNavigate: (path: string) => void })
   };
   const counts = data?.counts || {};
   const timeline = data?.timeline || [];
-  const attention = data?.attention || [];
+  const upcoming = data?.upcoming || [];
+  const urgent = data?.urgent || [];
   const briefing = data?.briefing;
   const briefingRefresh = data?.briefing_refresh || {};
   const hasBriefing = Boolean(briefing);
   const briefingIsFresh = hasBriefing && !data?.briefing_stale;
   const stats = useMemo(() => [
     { label: "Work completed", value: Number(counts.reports || 0) + Number(counts.activity_runs || 0), icon: Bot },
-    { label: "Proactive updates", value: counts.proactive_updates || 0, icon: Inbox },
+    { label: "Upcoming", value: counts.upcoming || upcoming.length || 0, icon: CalendarDays },
     { label: "Artifacts changed", value: counts.artifact_changes || 0, icon: Archive },
-    { label: "Needs attention", value: counts.attention || 0, icon: ShieldAlert },
-  ], [counts]);
+    { label: "Urgent", value: counts.urgent || urgent.length || 0, icon: ShieldAlert },
+  ], [counts, upcoming.length, urgent.length]);
 
   return <div className="home-page">
     <section className="home-hero">
@@ -143,9 +145,9 @@ export function HomePage({ onNavigate }: { onNavigate: (path: string) => void })
         {briefing && <>
           <div className="home-brief-columns">
             <BriefList title="What I accomplished" items={briefing.accomplishments} />
+            <BriefList title="Upcoming tasks and events" items={briefItems(upcoming)} />
             <BriefList title="What I learned for you" items={briefing.updates} />
-            <BriefList title="What did not work" items={briefing.failures} />
-            <BriefList title="What needs you" items={briefing.attention} />
+            <BriefList title="Urgent" items={briefItems(urgent, briefing.attention)} />
           </div>
           <p className="home-generated">
             Personalized from your local profile and prepared {formatDate(briefing.generated_at)}
@@ -179,13 +181,25 @@ export function HomePage({ onNavigate }: { onNavigate: (path: string) => void })
 
         <aside className="space-y-5">
           <section className="panel p-5">
-            <div className="home-section-head"><div><p className="eyebrow">Action center</p><h2>Needs attention</h2></div>{attention.length > 0 && <Badge tone="warn">{attention.length}</Badge>}</div>
-            {!attention.length && <p className="text-sm leading-6 text-muted">Nothing needs your decision right now.</p>}
+            <div className="home-section-head"><div><p className="eyebrow">Action center</p><h2>Urgent</h2></div>{urgent.length > 0 && <Badge tone="danger">{urgent.length}</Badge>}</div>
+            {!urgent.length && <p className="text-sm leading-6 text-muted">Nothing urgent needs your attention right now.</p>}
             <div className="space-y-3">
-              {attention.map((item: any) => <article className="home-attention" key={item.id}>
+              {urgent.map((item: any) => <article className="home-attention" key={item.id}>
                 <div className="flex flex-wrap items-center gap-2"><Badge tone={tone(item.status)}>{item.status.replaceAll("_", " ")}</Badge>{item.is_new && <Badge tone="good">New</Badge>}</div>
                 <h3>{item.title}</h3><p>{item.summary}</p>
                 {item.kind === "approval" ? <div className="mt-3 flex gap-2"><Button variant="primary" onClick={() => approval.mutate({ id: item.approval_id, approved: true })} disabled={approval.isPending}><Check size={15} />Approve</Button><Button variant="danger" onClick={() => approval.mutate({ id: item.approval_id, approved: false })} disabled={approval.isPending}><X size={15} />Deny</Button></div> : <Button className="mt-3" variant="ghost" onClick={() => onNavigate(item.destination)}>Inspect <ChevronRight size={15} /></Button>}
+              </article>)}
+            </div>
+          </section>
+
+          <section className="panel p-5">
+            <div className="home-section-head"><div><p className="eyebrow">Next up</p><h2>Upcoming</h2></div>{upcoming.length > 0 && <Badge>{upcoming.length}</Badge>}</div>
+            {!upcoming.length && <p className="text-sm leading-6 text-muted">No upcoming tasks or events are queued.</p>}
+            <div className="space-y-3">
+              {upcoming.map((item: any) => <article className="home-attention" key={item.id}>
+                <div className="flex flex-wrap items-center gap-2"><Badge>{item.kind.replaceAll("_", " ")}</Badge>{item.scheduled_for && <time>{formatDate(item.scheduled_for)}</time>}{item.is_new && <Badge tone="good">New</Badge>}</div>
+                <h3>{item.title}</h3><p>{item.summary}</p>
+                <Button className="mt-3" variant="ghost" onClick={() => onNavigate(item.destination)}>Inspect <ChevronRight size={15} /></Button>
               </article>)}
             </div>
           </section>
@@ -196,7 +210,7 @@ export function HomePage({ onNavigate }: { onNavigate: (path: string) => void })
               <Pulse label="Events processed" value={data.background?.events?.processed || 0} />
               <Pulse label="Events pending" value={data.background?.events?.pending || 0} />
               <Pulse label="Maintenance runs" value={data.background?.artifact_maintenance_runs || 0} />
-              <Pulse label="Queued tasks" value={counts.queued_tasks || 0} />
+              <Pulse label="Upcoming" value={counts.upcoming || upcoming.length || 0} />
             </div>
           </section>
 
@@ -212,6 +226,19 @@ export function HomePage({ onNavigate }: { onNavigate: (path: string) => void })
       </div>
     </>}
   </div>;
+}
+
+function briefItems(primary?: any[], fallback?: string[]): string[] {
+  const items = Array.isArray(primary) ? primary : [];
+  if (items.length) {
+    return items.map((item) => {
+      const title = String(item.title || "Untitled").trim();
+      const when = item.scheduled_for ? ` (${formatDate(item.scheduled_for)})` : "";
+      const summary = String(item.summary || "").trim();
+      return `${title}${when}${summary ? `: ${summary}` : ""}`;
+    });
+  }
+  return Array.isArray(fallback) ? fallback : [];
 }
 
 function BriefList({ title, items }: { title: string; items?: string[] }) {

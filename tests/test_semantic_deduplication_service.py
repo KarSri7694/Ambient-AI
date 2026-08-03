@@ -12,6 +12,7 @@ sys.path.insert(0, str(SRC_ROOT))
 
 from application.services.passive_observer_followup_service import PassiveObserverFollowupService
 from application.services.reflection_service import ReflectionService
+from application.services.runtime_interrupt_service import ShutdownInProgress
 from application.services.semantic_deduplication_service import SemanticDeduplicationService
 from core.models import VisualObservation
 from infrastructure.adapter.SQLiteMemoryAdapter import SQLiteMemoryAdapter
@@ -52,6 +53,11 @@ class FakeLLM:
             yield _FakeChunk(content=response)
 
         return _gen()
+
+
+class ShutdownLLM:
+    async def chat_completion_stream(self, *args, **kwargs):
+        raise ShutdownInProgress("Shutdown is in progress; no new llama.cpp request will be sent.")
 
 
 class FakeTaskQueue:
@@ -140,6 +146,32 @@ class SemanticDeduplicationServiceTests(unittest.TestCase):
         self.assertEqual(result["decision"], "duplicate_skip")
         self.assertEqual(result["duplicate_of_item_id"], "existing-1")
         self.assertEqual(result["matched_item"].raw_text, "Call mom tonight")
+
+    def test_shutdown_propagates_instead_of_fallback(self):
+        service = SemanticDeduplicationService(
+            memory=self.memory,
+            llm_provider=ShutdownLLM(),
+            enabled=True,
+            model="dedupe-model",
+        )
+        self.memory.add_semantic_dedupe_item(
+            dedupe_item_id="existing-1",
+            entity_kind="internal_task",
+            source_kind="seed",
+            raw_text="compare TV prices",
+            status="created",
+            ttl_expires_at="2099-01-01T00:00:00",
+        )
+
+        with self.assertRaises(ShutdownInProgress):
+            asyncio.run(
+                service.evaluate_candidate(
+                    entity_kind="internal_task",
+                    source_kind="test",
+                    text="compare TV prices again",
+                    model="dedupe-model",
+                )
+            )
 
     def test_invalid_json_falls_back_to_create_new(self):
         llm = FakeLLM(["not json"])

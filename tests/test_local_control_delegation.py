@@ -268,6 +268,31 @@ def test_filesystem_agent_resolves_relative_grants_before_prompting(tmp_path, mo
     ]
     assert json.dumps(str(tmp_path.resolve()))[1:-1] in user_messages[-1]
     assert '"."' not in user_messages[-1]
+    system_messages = [
+        message["content"]
+        for message in provider.calls[-1]["messages"]
+        if message["role"] == "system"
+    ]
+    assert "Runtime environment: Windows" in system_messages[-1]
+    assert "do not invent Linux paths" in system_messages[-1]
+
+
+def test_filesystem_agent_maps_stale_linux_home_grants_to_windows_paths(monkeypatch, tmp_path):
+    fake_home = tmp_path / "Users" / "Kartikeya Srivastava"
+    fake_home.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    monkeypatch.chdir(Path(__file__).resolve().parent.parent)
+
+    assert LLMInteractionService._normalize_filesystem_grant_path("/home/user/") == str(fake_home.resolve())
+    assert LLMInteractionService._normalize_filesystem_grant_path("/home/user/Documents/") == str((fake_home / "Documents").resolve(strict=False))
+    assert LLMInteractionService._normalize_filesystem_grant_path("/home/user/Desktop/") == str((fake_home / "Desktop").resolve(strict=False))
+    assert LLMInteractionService._normalize_filesystem_grant_path("/home/user/Downloads/") == str((fake_home / "Downloads").resolve(strict=False))
+    assert LLMInteractionService._normalize_filesystem_grant_path("/home/user/ambient_ai/").lower().endswith("ambient_ai")
+
+
+def test_filesystem_agent_rejects_other_linux_grants():
+    with pytest.raises(ValueError, match="Windows absolute paths"):
+        LLMInteractionService._normalize_filesystem_grant_path("/etc")
 
 
 def test_computer_session_allows_single_win_key_but_blocks_dangerous_chords(monkeypatch):

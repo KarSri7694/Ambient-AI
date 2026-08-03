@@ -89,6 +89,7 @@ _LOG_HANDLER: RuntimeLogBufferHandler | None = None
 _SERVER_THREAD: threading.Thread | None = None
 _SERVER: uvicorn.Server | None = None
 _SERVER_LOCK = threading.Lock()
+_SERVER_SHUTDOWN_EVENT = threading.Event()
 
 
 def configure_runtime_log_streaming(max_entries: int = 2000, debug_enabled: bool = False) -> RuntimeLogBuffer:
@@ -837,10 +838,23 @@ def create_runtime_log_app(
                     terminal_type = "done" if snapshot["status"] == "completed" else "error"
                     yield f"event: {terminal_type}\ndata: {json.dumps(snapshot, ensure_ascii=False)}\n\n"
                     return
-                while not await request.is_disconnected():
-                    try:
-                        event = await asyncio.to_thread(subscriber.get, True, 15.0)
-                    except queue.Empty:
+                while (
+                    not _SERVER_SHUTDOWN_EVENT.is_set()
+                    and not await request.is_disconnected()
+                ):
+                    event = None
+                    for _ in range(30):
+                        try:
+                            event = subscriber.get_nowait()
+                            break
+                        except queue.Empty:
+                            if (
+                                _SERVER_SHUTDOWN_EVENT.is_set()
+                                or await request.is_disconnected()
+                            ):
+                                return
+                            await asyncio.sleep(0.5)
+                    if event is None:
                         yield ": heartbeat\n\n"
                         continue
                     if event.get("type") == "snapshot_required":
@@ -1675,6 +1689,7 @@ def create_runtime_log_app(
     @app.get("/reports", response_class=HTMLResponse)
     @app.get("/artifacts", response_class=HTMLResponse)
     @app.get("/inbox", response_class=HTMLResponse)
+    @app.get("/approvals", response_class=HTMLResponse)
     @app.get("/recurring-tasks", response_class=HTMLResponse)
     @app.get("/chat", response_class=HTMLResponse)
     @app.get("/interactions", response_class=HTMLResponse)
@@ -1684,7 +1699,9 @@ def create_runtime_log_app(
     @app.get("/real-world-tests", response_class=HTMLResponse)
     @app.get("/processing-queue", response_class=HTMLResponse)
     @app.get("/training", response_class=HTMLResponse)
-    def view_logs() -> str:
+    def view_logs(request: Request) -> str:
+        if request.url.path == "/real-world-tests" and real_world_lab is None:
+            raise HTTPException(status_code=404, detail="real_world_lab_unavailable")
         return _load_dashboard_html()
 
     return app
@@ -1720,6 +1737,7 @@ def start_runtime_log_server(
         if host not in {"127.0.0.1", "localhost", "::1"}:
             raise RuntimeError("The unauthenticated runtime API may only bind to loopback.")
 
+        _SERVER_SHUTDOWN_EVENT.clear()
         app = create_runtime_log_app(
             log_buffer,
             report_store=report_store,
@@ -1765,6 +1783,7 @@ def start_runtime_log_server(
 def shutdown_runtime_log_server(*, join_timeout: float = 5.0, remove_log_handler: bool = False) -> None:
     global _SERVER_THREAD, _SERVER, _LOG_BUFFER, _LOG_HANDLER
     with _SERVER_LOCK:
+        _SERVER_SHUTDOWN_EVENT.set()
         server = _SERVER
         thread = _SERVER_THREAD
         if server is not None:
