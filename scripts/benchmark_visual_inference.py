@@ -113,14 +113,23 @@ def payload(captures: Iterable[Capture]) -> dict[str, Any]:
     }
 
 
-def batch_system_prompt() -> str:
+def batch_system_prompt(image_count: int) -> str:
     now = datetime.now()
     preamble = (
         f"Current day of week: {now.strftime('%A')}\n"
         f"Current date: {now.strftime('%Y-%m-%d')}\n"
         f"Current time: {now.strftime('%H:%M:%S')}\n\n"
     )
-    return preamble + PassiveObserverService.BATCH_ROUTER_PROMPT
+    contract = f"""
+IMPORTANT OUTPUT CONTRACT:
+- You received exactly {image_count} images and exactly {image_count} frame records.
+- Return exactly one observation JSON object for each image: exactly {image_count} items in
+  the `observations` array.
+- Each item must contain the matching zero-based `frame_index` from 0 through {image_count - 1}.
+- Never merge, summarize, or omit images. Do not return a single overall observation.
+- Process the images independently, then return the observations in frame_index order.
+"""
+    return preamble + PassiveObserverService.BATCH_ROUTER_PROMPT + contract
 
 
 def parse_json(text: str) -> dict[str, Any] | None:
@@ -166,7 +175,7 @@ async def request(adapter: LlamaCppAdapter, captures: list[Capture], model: str,
     started = time.perf_counter()
     image_paths = [str(item.path) for item in captures]
     messages = [
-        {"role": "system", "content": batch_system_prompt()},
+        {"role": "system", "content": batch_system_prompt(len(captures))},
         {"role": "user", "content": json.dumps(payload(captures), ensure_ascii=False)},
     ]
     completion = await asyncio.wait_for(
