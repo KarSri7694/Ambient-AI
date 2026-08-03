@@ -23,6 +23,7 @@ class AutonomyCoordinatorService:
     """Continuously turns context events into judged, policy-bounded proactive work."""
 
     APPROVED_BROWSER_IDLE_RETRY_SECONDS = 5
+    VISUAL_CAPTURE_EVENT_TYPE = "lightweight_visual_capture"
 
     INVESTIGATION_PROMPT = """You are Ambient AI's proactive investigator.
 
@@ -297,13 +298,25 @@ Do not repeat an action already reported as performed.
         personalization_context: str,
         event_callback=None,
         event_types: list[str] | None = None,
+        exclude_event_types: list[str] | None = None,
     ) -> dict[str, Any]:
         if self.mode == "disabled":
             return {"processed": False, "reason": "disabled"}
-        event = self.store.claim_next_event(
-            lease_seconds=self.event_lease_seconds,
-            event_types=event_types,
-        )
+        claim_kwargs = {
+            "lease_seconds": self.event_lease_seconds,
+            "event_types": event_types,
+        }
+        if exclude_event_types:
+            claim_kwargs["exclude_event_types"] = exclude_event_types
+        try:
+            event = self.store.claim_next_event(**claim_kwargs)
+        except TypeError:
+            if not exclude_event_types:
+                raise
+            event = self.store.claim_next_event(
+                lease_seconds=self.event_lease_seconds,
+                event_types=event_types,
+            )
         if event is None:
             return {"processed": False, "reason": "no_events"}
         self.logger.info(
@@ -692,6 +705,7 @@ Do not repeat an action already reported as performed.
         max_seconds: float = 90.0,
         should_preempt=None,
         event_callback=None,
+        exclude_event_types: list[str] | None = None,
     ) -> dict[str, Any]:
         started = time.monotonic()
         results: list[dict[str, Any]] = []
@@ -705,6 +719,7 @@ Do not repeat an action already reported as performed.
                 llm_service=llm_service,
                 personalization_context=personalization_context,
                 event_callback=event_callback,
+                exclude_event_types=exclude_event_types,
             )
             if not result.get("processed"):
                 break
@@ -726,6 +741,15 @@ Do not repeat an action already reported as performed.
 
     def has_ready_work(self) -> bool:
         return bool(getattr(self.store, "has_ready_events", lambda: True)())
+
+    def has_ready_downstream_work(self) -> bool:
+        checker = getattr(self.store, "has_ready_events", None)
+        if checker is None:
+            return self.has_ready_work()
+        try:
+            return bool(checker(exclude_event_types=[self.VISUAL_CAPTURE_EVENT_TYPE]))
+        except TypeError:
+            return self.has_ready_work()
 
     def has_ready_visual_work(self) -> bool:
         checker = getattr(self.store, "has_ready_events", None)

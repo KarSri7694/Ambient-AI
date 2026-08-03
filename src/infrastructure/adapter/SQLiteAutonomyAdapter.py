@@ -612,6 +612,7 @@ class SQLiteAutonomyAdapter(AutonomyStorePort):
         *,
         lease_seconds: int = 180,
         event_types: Optional[list[str]] = None,
+        exclude_event_types: Optional[list[str]] = None,
     ) -> Optional[AmbientEvent]:
         now = _utcnow()
         now_iso = _utciso(now)
@@ -632,6 +633,11 @@ class SQLiteAutonomyAdapter(AutonomyStorePort):
                 placeholders = ",".join("?" for _ in normalized_types)
                 type_clause = f"AND event_type IN ({placeholders})"
                 params.extend(normalized_types)
+            if exclude_event_types:
+                normalized_excluded = [str(value) for value in exclude_event_types if str(value)]
+                excluded_placeholders = ",".join("?" for _ in normalized_excluded)
+                type_clause += f"AND event_type NOT IN ({excluded_placeholders})"
+                params.extend(normalized_excluded)
             # Passive screenshots are a FIFO stream: process the oldest queued
             # screenshot first so a long backlog preserves temporal order. Other
             # autonomy work keeps its priority-aware ordering.
@@ -672,6 +678,7 @@ class SQLiteAutonomyAdapter(AutonomyStorePort):
         *,
         lease_seconds: int = 180,
         event_types: Optional[list[str]] = None,
+        exclude_event_types: Optional[list[str]] = None,
         limit: int = 1,
     ) -> list[AmbientEvent]:
         now = _utcnow()
@@ -695,6 +702,11 @@ class SQLiteAutonomyAdapter(AutonomyStorePort):
                 placeholders = ",".join("?" for _ in normalized_types)
                 type_clause = f"AND event_type IN ({placeholders})"
                 params.extend(normalized_types)
+            if exclude_event_types:
+                normalized_excluded = [str(value) for value in exclude_event_types if str(value)]
+                excluded_placeholders = ",".join("?" for _ in normalized_excluded)
+                type_clause += f"AND event_type NOT IN ({excluded_placeholders})"
+                params.extend(normalized_excluded)
             visual_only = bool(event_types) and set(normalized_types) == {"lightweight_visual_capture"}
             order_clause = (
                 "ORDER BY julianday(occurred_at) ASC, rowid ASC"
@@ -947,7 +959,11 @@ class SQLiteAutonomyAdapter(AutonomyStorePort):
             conn.commit()
         return self._event_from_row(interrupted) if interrupted else None
 
-    def has_ready_events(self, event_types: Optional[list[str]] = None) -> bool:
+    def has_ready_events(
+        self,
+        event_types: Optional[list[str]] = None,
+        exclude_event_types: Optional[list[str]] = None,
+    ) -> bool:
         type_clause = ""
         params: list[Any] = [_utciso()]
         if event_types:
@@ -955,6 +971,11 @@ class SQLiteAutonomyAdapter(AutonomyStorePort):
             placeholders = ",".join("?" for _ in normalized)
             type_clause = f"AND event_type IN ({placeholders})"
             params.extend(normalized)
+        if exclude_event_types:
+            normalized_excluded = [str(value) for value in exclude_event_types if str(value)]
+            placeholders = ",".join("?" for _ in normalized_excluded)
+            type_clause += f"AND event_type NOT IN ({placeholders})"
+            params.extend(normalized_excluded)
         with self._connect() as conn:
             row = conn.execute(
                 f"""SELECT 1 FROM ambient_events

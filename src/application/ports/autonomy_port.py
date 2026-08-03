@@ -17,6 +17,7 @@ class AutonomyStorePort(ABC):
         *,
         lease_seconds: int = 180,
         event_types: Optional[list[str]] = None,
+        exclude_event_types: Optional[list[str]] = None,
     ) -> Optional[AmbientEvent]:
         pass
 
@@ -25,11 +26,15 @@ class AutonomyStorePort(ABC):
         *,
         lease_seconds: int = 180,
         event_types: Optional[list[str]] = None,
+        exclude_event_types: Optional[list[str]] = None,
         limit: int = 1,
     ) -> list[AmbientEvent]:
         events: list[AmbientEvent] = []
         for _ in range(max(1, int(limit))):
-            event = self.claim_next_event(lease_seconds=lease_seconds, event_types=event_types)
+            kwargs = {"lease_seconds": lease_seconds, "event_types": event_types}
+            if exclude_event_types:
+                kwargs["exclude_event_types"] = exclude_event_types
+            event = self.claim_next_event(**kwargs)
             if event is None:
                 break
             events.append(event)

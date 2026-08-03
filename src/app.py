@@ -96,6 +96,10 @@ LLM_STREAM_RETRY_DELAY_SECONDS = CONFIG.get_float("runtime", "llm_stream_retry_d
 PARALLEL_CHAT_ENABLED = CONFIG.get_bool("runtime", "parallel_chat_enabled", True)
 PARALLEL_CHAT_RESERVE_SLOTS = max(1, CONFIG.get_int("runtime", "parallel_chat_reserve_slots", 1))
 PARALLEL_CHAT_USE_LOADED_MODEL = CONFIG.get_bool("runtime", "parallel_chat_use_loaded_model", True)
+ENABLE_PARALLEL_IMAGE_PROCESSING = CONFIG.get_bool(
+    "runtime", "enable_parallel_image_processing", False
+)
+PARALLEL_IMAGE_WORKERS = max(1, CONFIG.get_int("runtime", "parallel_image_workers", 3))
 VISION_API_BASE_URL = CONFIG.get_str("vision_runtime", "api_base_url", "").strip()
 VISION_API_KEY = CONFIG.get_str("vision_runtime", "api_key", "").strip() or API_KEY
 VISION_PRELOAD = CONFIG.get_bool("vision_runtime", "preload", True)
@@ -542,6 +546,8 @@ class AmbientRuntime:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._chat_wakeup_event = asyncio.Event()
         self._chat_dispatch_task: Optional[asyncio.Task] = None
+        self._parallel_image_tasks: list[asyncio.Task] = []
+        self._parallel_operations_task: Optional[asyncio.Task] = None
         self._tool_bridge: Optional[MCPToolAdapter] = None
         self._chat_resource_backoff_until = 0.0
         self._deferred_followup_observations: deque = deque()
@@ -1351,7 +1357,11 @@ class AmbientRuntime:
                 chat_event_broker=self.chat_event_broker,
                 task_store=task_queue,
                 max_pending_visual_per_context=PASSIVE_OBSERVER_MAX_PENDING_PER_CONTEXT,
-                visual_context_batch_size=PASSIVE_OBSERVER_VISUAL_CONTEXT_BATCH_SIZE,
+                visual_context_batch_size=(
+                    1
+                    if ENABLE_PARALLEL_IMAGE_PROCESSING
+                    else PASSIVE_OBSERVER_VISUAL_CONTEXT_BATCH_SIZE
+                ),
                 visual_context_batch_max_wait_seconds=PASSIVE_OBSERVER_VISUAL_CONTEXT_BATCH_MAX_WAIT_SECONDS,
                 visual_context_batch_flush_high_salience=PASSIVE_OBSERVER_VISUAL_CONTEXT_BATCH_FLUSH_HIGH_SALIENCE,
                 recurring_task_service=recurring_task_service if RECURRING_TASKS_ENABLED else None,
@@ -2356,6 +2366,109 @@ class AmbientRuntime:
         idle = int(capacity.get("idle") or 0)
         return max(1, idle - PARALLEL_CHAT_RESERVE_SLOTS)
 
+    async def _parallel_visual_worker(self, *, autonomy_coordinator) -> None:
+        """Continuously enrich capture events without blocking downstream work."""
+        while not self.stop_event.is_set():
+            if self.audio_active_event.is_set():
+                await asyncio.sleep(0.25)
+                continue
+            if not self._vision_ready:
+                try:
+                    if self._vision_llm is None:
+                        await asyncio.sleep(0.25)
+                        continue
+                    await self._vision_llm.load_model(PASSIVE_OBSERVER_MODEL)
+                    self._vision_ready = True
+                except Exception:
+                    self._vision_retry_after = time.monotonic() + 30.0
+                    await asyncio.sleep(0.25)
+                    continue
+            try:
+                with self.interrupt_controller.active(
+                    kind="parallel_visual_perception", model=PASSIVE_OBSERVER_MODEL
+                ):
+                    result = await autonomy_coordinator.process_next_visual_batch(max_events=1)
+                if not result.get("processed"):
+                    await asyncio.sleep(0.1)
+                else:
+                    logger.info(
+                        "Parallel visual worker completed %s capture event(s).",
+                        result.get("count") or 1,
+                    )
+            except (asyncio.CancelledError, WorkInterrupted):
+                raise
+            except Exception:
+                logger.exception("Parallel visual worker failed; retrying.")
+                await asyncio.sleep(0.25)
+
+    async def _parallel_operations_worker(
+        self,
+        *,
+        autonomy_coordinator,
+        llm_adapter,
+        llm_service,
+        user_context_service,
+    ) -> None:
+        """Run downstream agent operations sequentially as visual text arrives."""
+        while not self.stop_event.is_set():
+            if (
+                not autonomy_coordinator.has_ready_downstream_work()
+                or self.audio_active_event.is_set()
+            ):
+                await asyncio.sleep(0.1)
+                continue
+            request = InferenceRequest(
+                workload="ambient_inference_batch",
+                model_name=FOLLOWUP_EXECUTION_MODEL,
+                background=True,
+                user_active=not self._chat_turn_ready(),
+                priority=60,
+            )
+            lease = self.resource_governor.request_lease(request)
+            if not lease.acquired:
+                await asyncio.sleep(RESOURCE_DEFER_SECONDS)
+                continue
+            try:
+                if self._chat_turn_ready():
+                    await asyncio.sleep(0.1)
+                    continue
+                await self._ensure_runtime(
+                    llm_adapter=llm_adapter,
+                    services_initialized=bool(llm_adapter.status().get("loaded_model")),
+                    reason="processing parallel downstream visual operation",
+                    model_name=FOLLOWUP_EXECUTION_MODEL,
+                    role="ambient_inference_batch",
+                    background=True,
+                    user_active=not self._chat_turn_ready(),
+                )
+                with self.interrupt_controller.active(
+                    kind="parallel_autonomy_operation", model=FOLLOWUP_EXECUTION_MODEL
+                ):
+                    result = await autonomy_coordinator.process_batch(
+                        model=FOLLOWUP_EXECUTION_MODEL,
+                        llm_service=llm_service,
+                        personalization_context=user_context_service.build_prompt_context(
+                            include_semantic=True,
+                            max_chars=PERSONALIZATION_PROMPT_CONTEXT_CHARS,
+                        ),
+                        max_events=1,
+                        max_seconds=RESOURCE_BATCH_MAX_SECONDS,
+                        should_preempt=lambda: self.stop_event.is_set() or self._chat_turn_ready(),
+                        exclude_event_types=["lightweight_visual_capture"],
+                    )
+                if result.get("processed"):
+                    logger.info(
+                        "Parallel downstream worker processed %s event(s).",
+                        result.get("count") or 1,
+                    )
+            except (asyncio.CancelledError, WorkInterrupted):
+                raise
+            except Exception:
+                logger.exception("Parallel downstream worker failed; retrying.")
+                await asyncio.sleep(0.25)
+            finally:
+                lease.__exit__(None, None, None)
+
     async def run_loop(self):
         (
             llm_adapter,
@@ -2429,6 +2542,31 @@ class AmbientRuntime:
                 logger.info(
                     "Parallel direct-chat dispatcher enabled (reserve_slots=%s).",
                     PARALLEL_CHAT_RESERVE_SLOTS,
+                )
+            if ENABLE_PARALLEL_IMAGE_PROCESSING and autonomy_coordinator is not None:
+                configured_workers = self._passive_visual_parallelism()
+                worker_count = max(1, min(3, PARALLEL_IMAGE_WORKERS))
+                if PASSIVE_OBSERVER_VISUAL_INFERENCE_PARALLELISM not in {"", "1", "serial"}:
+                    worker_count = max(1, min(worker_count, configured_workers))
+                self._parallel_image_tasks = [
+                    asyncio.create_task(
+                        self._parallel_visual_worker(autonomy_coordinator=autonomy_coordinator),
+                        name=f"AmbientVisualWorker-{index + 1}",
+                    )
+                    for index in range(worker_count)
+                ]
+                self._parallel_operations_task = asyncio.create_task(
+                    self._parallel_operations_worker(
+                        autonomy_coordinator=autonomy_coordinator,
+                        llm_adapter=llm_adapter,
+                        llm_service=llm_service,
+                        user_context_service=user_context_service,
+                    ),
+                    name="AmbientSequentialOperations",
+                )
+                logger.info(
+                    "Parallel image pipeline enabled: chat=1, images=%s, operations=1.",
+                    worker_count,
                 )
             logger.info("Starting ambient runtime manager.")
 
@@ -2759,7 +2897,8 @@ class AmbientRuntime:
                         continue
 
                 if (
-                    PASSIVE_OBSERVER_ENABLED
+                    not ENABLE_PARALLEL_IMAGE_PROCESSING
+                    and PASSIVE_OBSERVER_ENABLED
                     and passive_observer is not None
                     and screenshot_queue is not None
                     and not screenshot_queue.is_empty()
@@ -2816,7 +2955,11 @@ class AmbientRuntime:
                             break
                         continue
 
-                if autonomy_coordinator is not None and autonomy_coordinator.has_ready_visual_work():
+                if (
+                    not ENABLE_PARALLEL_IMAGE_PROCESSING
+                    and autonomy_coordinator is not None
+                    and autonomy_coordinator.has_ready_visual_work()
+                ):
                     if (
                         self._vision_llm is not None
                         and not self._vision_ready
@@ -2900,7 +3043,11 @@ class AmbientRuntime:
                         break
                     continue
 
-                if autonomy_coordinator is not None and autonomy_coordinator.has_ready_work():
+                if (
+                    not ENABLE_PARALLEL_IMAGE_PROCESSING
+                    and autonomy_coordinator is not None
+                    and autonomy_coordinator.has_ready_work()
+                ):
                     inference_request = InferenceRequest(
                         workload="ambient_inference_batch",
                         model_name=FOLLOWUP_EXECUTION_MODEL,
@@ -3390,6 +3537,16 @@ class AmbientRuntime:
             logger.info("Ambient runtime loop cancelled during shutdown.")
         finally:
             self._stop_screenshot_capture_loop()
+            parallel_tasks = [
+                *self._parallel_image_tasks,
+                *([self._parallel_operations_task] if self._parallel_operations_task is not None else []),
+            ]
+            for task in parallel_tasks:
+                task.cancel()
+            if parallel_tasks:
+                await asyncio.gather(*parallel_tasks, return_exceptions=True)
+            self._parallel_image_tasks = []
+            self._parallel_operations_task = None
             if self._chat_dispatch_task is not None:
                 self._chat_dispatch_task.cancel()
                 await asyncio.gather(self._chat_dispatch_task, return_exceptions=True)

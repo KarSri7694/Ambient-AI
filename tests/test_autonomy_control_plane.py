@@ -1,6 +1,7 @@
 import asyncio
 import json
 import sys
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -239,6 +240,26 @@ def test_event_store_deduplicates_leases_and_recovers_expired_work(tmp_path):
     assert reclaimed is not None and reclaimed.event_id == claimed.event_id
     store.complete_event(reclaimed.event_id)
     assert store.claim_next_event() is None
+
+
+def test_event_store_excludes_visual_captures_from_downstream_claims(tmp_path):
+    store = SQLiteAutonomyAdapter(str(tmp_path / "autonomy.db"))
+    downstream = store.enqueue_event(_event(event_id="downstream-event"))
+    visual = replace(
+        _event(event_id="visual-event"),
+        event_type="lightweight_visual_capture",
+        source_kind="screen_capture",
+        source_ref="capture://00000000000000000000000000000001",
+        fingerprint="visual-capture-fingerprint",
+        priority=0.95,
+    )
+    store.enqueue_event(visual)
+
+    assert store.has_ready_events(exclude_event_types=["lightweight_visual_capture"]) is True
+    claimed = store.claim_next_event(exclude_event_types=["lightweight_visual_capture"])
+    assert claimed is not None
+    assert claimed.event_id == downstream.event_id
+    assert store.claim_next_event(event_types=["lightweight_visual_capture"]).event_id == visual.event_id
 
 
 def test_event_store_claims_offset_timestamp_as_same_instant(tmp_path):
