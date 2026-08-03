@@ -56,6 +56,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--max-output-tokens", type=int, default=256)
     parser.add_argument("--timeout", type=float, default=180.0)
+    parser.add_argument("--load-model", action="store_true", help="Ask the endpoint to load the model; default assumes it is already loaded")
     parser.add_argument("--output", type=Path, default=None, help="Optional JSON report path")
     return parser.parse_args()
 
@@ -227,7 +228,14 @@ async def main() -> None:
     counts = args.counts or [args.images]
     adapter = LlamaCppAdapter(endpoint, api_key=api_key, default_max_tokens=args.max_output_tokens)
     LOG.info("Using endpoint=%s model=%s capture_root=%s slots=%s", endpoint, model, root, args.slots)
-    await adapter.load_model(model)
+    if args.load_model:
+        await adapter.load_model(model)
+    else:
+        # Standalone llama-server commonly exposes only /v1/chat/completions.
+        # Mark the configured model ready so the adapter does not require the
+        # optional project router management endpoints.
+        adapter.currently_loaded_model = model
+        adapter._ready_model = model
     report: dict[str, Any] = {"endpoint": endpoint, "model": model, "capture_root": str(root), "slots": args.slots, "generated_at": datetime.now(timezone.utc).isoformat(), "cases": []}
     for count in counts:
         captures = find_captures(root, count)
