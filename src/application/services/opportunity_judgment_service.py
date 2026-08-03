@@ -41,6 +41,12 @@ Rules:
 - Do not propose sending, purchasing, deleting, publishing, changing credentials, or other irreversible work.
 - Scores must be numbers from 0 to 1.
 """
+    STALE_THREAD_PROMPT = """You assess a stale, privacy-scoped work thread for a secure ambient assistant.
+Return JSON only with: action (observe_only|defer|investigate_stale_thread|new_opportunity),
+thread_id, evidence_ids, confidence (0..1), and unresolved_evidence_gap.
+Use investigate_stale_thread only when the supplied open loop is concrete, routing is high-confidence,
+and a read-only investigation can close a named evidence gap. Never use browser/computer control or create external effects.
+"""
 
     def __init__(self, *, llm_provider: LLMProvider, logger: logging.Logger | None = None):
         self.llm = llm_provider
@@ -104,6 +110,34 @@ Rules:
             updated_at=now,
             metadata_json=json.dumps({"event_payload": payload}, ensure_ascii=False),
         )
+
+    async def judge_stale_thread_review(self, *, event: AmbientEvent, model: str, dossier: dict[str, Any]) -> dict[str, Any]:
+        """The only proactive judgment entrypoint for stale work; fail closed."""
+        payload = self._safe_payload(event.payload_json)
+        request = {"event": {"thread_id": payload.get("thread_id"), "evidence_ids": payload.get("evidence_ids", [])}, "dossier": dossier}
+        try:
+            if hasattr(self.llm, "load_model"):
+                await self.llm.load_model(model)
+            completion = await self.llm.chat_completion_stream(
+                model=model, messages=[{"role": "system", "content": self.STALE_THREAD_PROMPT}, {"role": "user", "content": json.dumps(request, ensure_ascii=False)}], tools=None, image="",
+            )
+            parsed = self._parse_json(await self._consume(completion))
+        except Exception:
+            self.logger.exception("Stale-thread judgment failed; deferring.")
+            parsed = {}
+        action = str(parsed.get("action") or "defer").strip().lower()
+        if action not in {"observe_only", "defer", "investigate_stale_thread", "new_opportunity"}:
+            action = "defer"
+        confidence = self._score(parsed.get("confidence"), 0.0)
+        gap = self._clean(parsed.get("unresolved_evidence_gap"))
+        # A named gap and strong routing are non-negotiable for automatic work.
+        if action in {"investigate_stale_thread", "new_opportunity"} and (confidence < 0.72 or not gap):
+            action = "defer"
+        return {
+            "action": action, "thread_id": str(parsed.get("thread_id") or payload.get("thread_id") or ""),
+            "evidence_ids": self._string_list(parsed.get("evidence_ids")) or self._string_list(payload.get("evidence_ids")),
+            "confidence": confidence, "unresolved_evidence_gap": gap,
+        }
 
     def qualifies_for_enrichment(self, candidate: OpportunityCandidate) -> bool:
         return (

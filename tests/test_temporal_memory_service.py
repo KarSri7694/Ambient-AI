@@ -132,3 +132,50 @@ def test_temporal_records_are_not_embedded_unless_explicitly_promoted(tmp_path):
     assert len(chunks) == 1
     assert chunks[0].source_type == "temporal_event"
     assert "structured final result" in chunks[0].content
+
+
+def test_ambiguous_visual_event_never_injects_prior_thread_history(tmp_path):
+    memory = SQLiteMemoryAdapter(str(tmp_path / "memory.db"), str(tmp_path / "memory"))
+    service = TemporalMemoryService(memory=memory)
+    service.record_ambient_event(
+        _event("seed", "2026-08-02T10:00:00", {
+            "activity": "Editing the ambient AI temporal service", "project_root": "D:/projects/ambient_ai",
+        })
+    )
+    ambiguous = service.record_enriched_visual_event(
+        _event("capture", "2026-08-02T10:05:00", {
+            "activity": "Reading a generic browser page", "domain": "github.com", "analysis_status": "model",
+            "continuation_relation": "unclear",
+        })
+    )
+
+    assert ambiguous.thread_id is None
+    context = service.build_context(query_text="generic browser page", current_event=ambiguous)
+    assert context["ambiguous"] is True
+    assert context["timeline"] == []
+
+
+def test_specific_anchor_routes_but_generic_domain_does_not(tmp_path):
+    memory = SQLiteMemoryAdapter(str(tmp_path / "memory.db"), str(tmp_path / "memory"))
+    service = TemporalMemoryService(memory=memory)
+    seed = service.record_ambient_event(
+        _event("seed", "2026-08-02T10:00:00", {
+            "activity": "Implement temporal routing", "project_root": "D:/projects/ambient_ai",
+            "domain": "github.com",
+        })
+    )
+    resolved = service.record_enriched_visual_event(
+        _event("same-project", "2026-08-02T10:05:00", {
+            "activity": "Implement temporal routing", "project_root": "D:/projects/ambient_ai",
+            "analysis_status": "model", "continuation_relation": "continues",
+        })
+    )
+    generic = service.record_enriched_visual_event(
+        _event("generic-domain", "2026-08-02T10:06:00", {
+            "activity": "Reading github", "domain": "github.com", "analysis_status": "model",
+            "continuation_relation": "continues",
+        })
+    )
+
+    assert resolved.thread_id == seed.thread_id
+    assert generic.thread_id is None

@@ -25,12 +25,25 @@ class PassiveObserverService:
 
     FULL_OBSERVER_PROMPT = """You are the passive visual observer for an ambient personal agent.
 
-Look at the current screenshot, and return JSON only with exactly these fields:
+Look at the current screenshot, and return JSON only with these fields:
 {
   "app_page": "short app/site and page/screen description combined into one line",
   "summary": "1-2 sentence concrete summary of what is on screen",
   "detailed_description": "information-rich detail about what is visible",
   "inferred_user_activity": "what the user seems to be doing or trying to do",
+  "work_extraction": {
+    "canonical_activity": "short normalized activity or empty",
+    "project_or_task": "specific project/task or empty",
+    "operation": "editing|reviewing|testing|researching|communicating|other|unknown",
+    "work_phase": "planning|in_progress|review|verification|blocked|completed|unknown",
+    "entities": ["visible specific entities only"],
+    "artifact_anchors": ["specific file, ticket, branch, document id, or URL only"],
+    "completion_evidence": ["visible/tool-confirmed evidence only"],
+    "blocker_evidence": ["visible error or blocker evidence only"],
+    "open_loop_candidates": ["concrete unresolved loop only"],
+    "continuation_relation": "continues|resumes|new|unclear",
+    "confidence": 0.0
+  },
   "maybe_require_a_reminder": "true or false, if the user might need a reminder about something on screen",
   "reminder_context": {
     "message_to_user": "if maybe_require_a_reminder is true, provide the reminder text to send to the user",
@@ -41,7 +54,7 @@ Look at the current screenshot, and return JSON only with exactly these fields:
 Rules:
 - If you see anything important on screen that the user might need to remember, set maybe_require_a_reminder to true and provide reminder_context.message_to_user.
 - Fill reminder_context.due_date only when the screenshot provides enough evidence to infer a concrete due datetime.
-- Return only those six fields. Do not add any other keys.
+- work_extraction is a fallible hypothesis. Use unclear rather than inventing continuity; text such as "done" is not completion evidence by itself.
 - When the screen contains a chat or messaging interface, extract all the visible information most importantly infer if the user made any commitments or decisions, or something of importance is told to the user.  
 - Prefer visible facts over speculation.
 - Use app_page as a compact combined label such as "Amazon.in / TV product listing page" or "VS Code / Python file editor".
@@ -67,6 +80,7 @@ the screenshot and supplied accessibility text. Do not explain your reasoning.""
                     "app_page", "summary", "detailed_description", "inferred_user_activity",
                     "maybe_require_a_reminder", "reminder_context", "salient_facts",
                     "salience", "needs_deep_analysis",
+                    "work_extraction",
                 ],
                 "properties": {
                     "app_page": {"type": "string", "maxLength": 160},
@@ -89,6 +103,22 @@ the screenshot and supplied accessibility text. Do not explain your reasoning.""
                     },
                     "salience": {"type": "string", "enum": ["low", "medium", "high"]},
                     "needs_deep_analysis": {"type": "boolean"},
+                    "work_extraction": {
+                        "type": "object", "additionalProperties": False,
+                        "required": ["canonical_activity", "project_or_task", "operation", "work_phase", "entities", "artifact_anchors", "completion_evidence", "blocker_evidence", "open_loop_candidates", "continuation_relation", "confidence"],
+                        "properties": {
+                            "canonical_activity": {"type": "string", "maxLength": 220}, "project_or_task": {"type": "string", "maxLength": 220},
+                            "operation": {"type": "string", "enum": ["editing", "reviewing", "testing", "researching", "communicating", "other", "unknown"]},
+                            "work_phase": {"type": "string", "enum": ["planning", "in_progress", "review", "verification", "blocked", "completed", "unknown"]},
+                            "entities": {"type": "array", "maxItems": 8, "items": {"type": "string", "maxLength": 180}},
+                            "artifact_anchors": {"type": "array", "maxItems": 8, "items": {"type": "string", "maxLength": 300}},
+                            "completion_evidence": {"type": "array", "maxItems": 5, "items": {"type": "string", "maxLength": 240}},
+                            "blocker_evidence": {"type": "array", "maxItems": 5, "items": {"type": "string", "maxLength": 240}},
+                            "open_loop_candidates": {"type": "array", "maxItems": 5, "items": {"type": "string", "maxLength": 240}},
+                            "continuation_relation": {"type": "string", "enum": ["continues", "resumes", "new", "unclear"]},
+                            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                        },
+                    },
                 },
             },
         },
@@ -262,6 +292,7 @@ the screenshot and supplied accessibility text. Do not explain your reasoning.""
             analysis_model=str(parsed.get("_analysis_model") or self.fast_model or model),
             needs_deep_analysis=bool(parsed.get("needs_deep_analysis")),
             source_capture_event_id=source_capture_event_id,
+            work_extraction=parsed.get("work_extraction") if isinstance(parsed.get("work_extraction"), dict) else {},
         )
         if not self.persist_observations:
             self.logger.debug(

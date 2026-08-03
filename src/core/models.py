@@ -386,6 +386,9 @@ class VisualObservation:
     analysis_model: Optional[str] = None
     needs_deep_analysis: bool = False
     source_capture_event_id: Optional[str] = None
+    # Structured visual extraction remains explicitly fallible and is copied to
+    # canonical temporal evidence only after routing validation.
+    work_extraction: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -503,6 +506,55 @@ class TemporalWorkThread:
     entities: List[str] = field(default_factory=list)
     open_loops: List[str] = field(default_factory=list)
     metadata_json: str = "{}"
+    # These fields deliberately remain separate.  A work item may be open while
+    # the observer is unable to say whether the user is currently engaging with it.
+    work_state: str = "active"
+    engagement_state: str = "unknown"
+    routing_confidence: float = 0.0
+
+
+@dataclass(frozen=True)
+class TemporalThreadAnchor:
+    """Normalized, privacy-scoped identifier that can safely route a work event."""
+    thread_id: str
+    anchor_kind: str
+    anchor_value: str
+    specificity: float = 0.0
+    privacy_label: str = ""
+    created_at: str = ""
+
+
+@dataclass(frozen=True)
+class TemporalThreadCheckpoint:
+    """An immutable, bounded summary of verified progress in a work thread."""
+    checkpoint_id: str
+    thread_id: str
+    first_event_id: str
+    last_event_id: str
+    occurred_at: str
+    summary: str
+    goal: str = ""
+    verified_progress: List[str] = field(default_factory=list)
+    unresolved_loops: List[str] = field(default_factory=list)
+    artifacts: List[str] = field(default_factory=list)
+    work_state: str = "active"
+    evidence_ids: List[str] = field(default_factory=list)
+    provenance: str = "verified_evidence"
+    confidence: float = 0.0
+    metadata_json: str = "{}"
+    created_at: str = ""
+
+
+@dataclass(frozen=True)
+class ThreadResolution:
+    """Auditable result of confidence-gated work-thread routing."""
+    winner: Optional[TemporalWorkThread] = None
+    alternatives: List[dict] = field(default_factory=list)
+    score_components: dict = field(default_factory=dict)
+    confidence: float = 0.0
+    reasons: List[str] = field(default_factory=list)
+    ambiguous: bool = False
+    no_match: bool = False
 
 
 @dataclass(frozen=True)

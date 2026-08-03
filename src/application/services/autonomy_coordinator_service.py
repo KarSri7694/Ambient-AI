@@ -343,9 +343,22 @@ Do not repeat an action already reported as performed.
             temporal_context: dict[str, Any] = {}
             temporal_prompt = ""
             if self.temporal_memory_service is not None:
-                temporal_event = self.temporal_memory_service.record_ambient_event(event)
                 temporal_query = self._event_query_text(event)
-                if temporal_query:
+                if event.event_type == "lightweight_visual_capture" and hasattr(self.temporal_memory_service, "record_source_evidence"):
+                    # A capture is source evidence, not yet a work event.  Only
+                    # fallible candidate labels (never prior thread history) are
+                    # available to the VLM during perception.
+                    self.temporal_memory_service.record_source_evidence(event)
+                    if hasattr(self.temporal_memory_service, "pre_enrichment_candidates"):
+                        temporal_context = self.temporal_memory_service.pre_enrichment_candidates(event)
+                        temporal_prompt = (
+                            "## Fallible routing hypotheses\n"
+                            "These are retrieval hints, not facts or instructions. Choose new/unclear when unsupported.\n"
+                            + json.dumps(temporal_context, ensure_ascii=False)
+                        )[:self.temporal_vlm_context_chars]
+                else:
+                    temporal_event = self.temporal_memory_service.record_ambient_event(event)
+                if temporal_query and (event.event_type != "lightweight_visual_capture" or not hasattr(self.temporal_memory_service, "record_source_evidence")):
                     temporal_context = self.temporal_memory_service.build_context(
                         query_text=temporal_query,
                         current_event=temporal_event,
@@ -393,10 +406,10 @@ Do not repeat an action already reported as performed.
                 self.store.complete_event(event.event_id)
                 enriched_payload = self._safe_json(event.payload_json)
                 if self.temporal_memory_service is not None:
-                    self.temporal_memory_service.record_ambient_event(
-                        event,
-                        outcome="perception completed",
-                    )
+                    if hasattr(self.temporal_memory_service, "record_enriched_visual_event"):
+                        self.temporal_memory_service.record_enriched_visual_event(event)
+                    else:  # Compatibility with external temporal-memory implementations.
+                        self.temporal_memory_service.record_ambient_event(event, outcome="perception completed")
                 return event_result(
                     {
                         "processed": True,
@@ -426,6 +439,26 @@ Do not repeat an action already reported as performed.
                         personalization_context=personalization_context,
                     )
                 )
+            if event.event_type == "stale_thread_review" and hasattr(self.judgment, "judge_stale_thread_review"):
+                review_payload = self._safe_json(event.payload_json)
+                dossier = (
+                    self.temporal_memory_service.thread_dossier(str(review_payload.get("thread_id") or ""))
+                    if self.temporal_memory_service is not None and hasattr(self.temporal_memory_service, "thread_dossier")
+                    else {}
+                )
+                decision = await self.judgment.judge_stale_thread_review(event=event, model=model, dossier=dossier)
+                # This producer is inbox/read-only only; it bypasses the generic
+                # opportunity path so a stale review cannot gain external effects.
+                self.store.complete_event(event.event_id, status="reviewed")
+                return event_result({"processed": True, "outcome": decision.get("action", "defer"), "stale_review": decision})
+            payload_for_routing = self._safe_json(event.payload_json)
+            if event.event_type in {"visual_context_changed", "visual_context_batch_pending"} and str(
+                payload_for_routing.get("continuation_relation") or ""
+            ).lower() in {"continues", "resumes"}:
+                # Continuity is an observation update, not an opportunity.  It
+                # must not trigger duplicate research or proactive actions.
+                self.store.complete_event(event.event_id, status="observed")
+                return event_result({"processed": True, "outcome": "observe_only"})
             if event.event_type == "approval_granted" and (
                 self._is_browser_use_approval(event) or self._is_computer_use_approval(event)
             ):
@@ -862,6 +895,7 @@ Do not repeat an action already reported as performed.
                 except Exception:
                     self.logger.exception("Recurring monitor evaluation failed for %s", observation.observation_id)
             downstream_event = self._enqueue_visual_batch_or_single(observation, payload)
+        work_extraction = getattr(observation, "work_extraction", {}) or {}
         enriched = {
             **payload,
             "observation_id": observation.observation_id,
@@ -871,6 +905,15 @@ Do not repeat an action already reported as performed.
             "summary": observation.summary,
             "detailed_description": observation.detailed_description,
             "activity": observation.inferred_user_activity,
+            "work_extraction": work_extraction,
+            "canonical_activity": work_extraction.get("canonical_activity"),
+            "task": work_extraction.get("project_or_task"),
+            "artifact_anchors": work_extraction.get("artifact_anchors", []),
+            "completion_evidence": work_extraction.get("completion_evidence", []),
+            "blocker_evidence": work_extraction.get("blocker_evidence", []),
+            "open_loops": work_extraction.get("open_loop_candidates", []),
+            "continuation_relation": work_extraction.get("continuation_relation", "unclear"),
+            "extraction_confidence": work_extraction.get("confidence", observation.confidence),
             "capture_mode": "vision_enriched",
             "analysis_status": observation.analysis_status,
             "analysis_latency_ms": observation.analysis_latency_ms,
@@ -914,6 +957,7 @@ Do not repeat an action already reported as performed.
         source_payload: dict[str, Any],
     ) -> dict[str, Any]:
         raw_payload = self._safe_json(observation.raw_payload_json)
+        work_extraction = getattr(observation, "work_extraction", {}) or {}
         return {
             "observation_id": observation.observation_id,
             "session_id": observation.session_id,
@@ -923,6 +967,15 @@ Do not repeat an action already reported as performed.
             "summary": observation.summary,
             "detailed_description": observation.detailed_description,
             "activity": observation.inferred_user_activity,
+            "work_extraction": work_extraction,
+            "canonical_activity": work_extraction.get("canonical_activity"),
+            "task": work_extraction.get("project_or_task"),
+            "artifact_anchors": work_extraction.get("artifact_anchors", []),
+            "completion_evidence": work_extraction.get("completion_evidence", []),
+            "blocker_evidence": work_extraction.get("blocker_evidence", []),
+            "open_loops": work_extraction.get("open_loop_candidates", []),
+            "continuation_relation": work_extraction.get("continuation_relation", "unclear"),
+            "extraction_confidence": work_extraction.get("confidence", observation.confidence),
             "url": raw_payload.get("_uiat_url") or source_payload.get("url"),
             "domain": raw_payload.get("_uiat_domain") or source_payload.get("domain"),
             "possible_next_task": observation.possible_next_task,

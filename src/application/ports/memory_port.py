@@ -18,6 +18,8 @@ from core.models import (
     VisualUserFact,
     VisualSession,
     TemporalMemoryEvent,
+    TemporalThreadAnchor,
+    TemporalThreadCheckpoint,
     TemporalWorkThread,
 )
 
@@ -385,4 +387,22 @@ class MemoryPort(ABC):
         active_after: Optional[str] = None,
         limit: int = 50,
     ) -> List[TemporalWorkThread]:
+        pass
+
+    @abstractmethod
+    def upsert_temporal_thread_anchors(self, anchors: List[TemporalThreadAnchor]) -> None:
+        pass
+
+    @abstractmethod
+    def find_temporal_thread_anchors(
+        self, *, anchors: List[tuple[str, str]], privacy_label: str = "", limit: int = 12
+    ) -> List[TemporalThreadAnchor]:
+        pass
+
+    @abstractmethod
+    def append_temporal_checkpoint(self, checkpoint: TemporalThreadCheckpoint) -> TemporalThreadCheckpoint:
+        pass
+
+    @abstractmethod
+    def list_temporal_thread_checkpoints(self, *, thread_id: str, limit: int = 5) -> List[TemporalThreadCheckpoint]:
         pass

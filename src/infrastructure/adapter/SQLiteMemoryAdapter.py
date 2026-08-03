@@ -26,6 +26,8 @@ from core.models import (
     SpeakerRecord,
     TranscriptEvidence,
     TemporalMemoryEvent,
+    TemporalThreadAnchor,
+    TemporalThreadCheckpoint,
     TemporalWorkThread,
     UserProfileFacet,
     VisualObservation,
@@ -374,6 +376,84 @@ class SQLiteMemoryAdapter(MemoryPort):
             )
             cursor.execute(
                 """
+                CREATE TABLE IF NOT EXISTS temporal_thread_anchors (
+                    thread_id TEXT NOT NULL,
+                    anchor_kind TEXT NOT NULL,
+                    anchor_value TEXT NOT NULL,
+                    specificity REAL NOT NULL DEFAULT 0,
+                    privacy_label TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(thread_id, anchor_kind, anchor_value),
+                    FOREIGN KEY(thread_id) REFERENCES temporal_work_threads(thread_id)
+                )
+                """
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_temporal_anchors_lookup ON temporal_thread_anchors(anchor_kind, anchor_value, privacy_label)"
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS temporal_thread_checkpoints (
+                    checkpoint_id TEXT PRIMARY KEY,
+                    thread_id TEXT NOT NULL,
+                    first_event_id TEXT NOT NULL,
+                    last_event_id TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    goal TEXT NOT NULL DEFAULT '',
+                    verified_progress TEXT NOT NULL DEFAULT '[]',
+                    unresolved_loops TEXT NOT NULL DEFAULT '[]',
+                    artifacts TEXT NOT NULL DEFAULT '[]',
+                    work_state TEXT NOT NULL,
+                    evidence_ids TEXT NOT NULL DEFAULT '[]',
+                    provenance TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(thread_id) REFERENCES temporal_work_threads(thread_id)
+                )
+                """
+            )
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_temporal_checkpoints_thread ON temporal_thread_checkpoints(thread_id, occurred_at DESC)")
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS temporal_source_evidence (
+                    source_evidence_id TEXT PRIMARY KEY,
+                    source_type TEXT NOT NULL,
+                    source_ref TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL,
+                    privacy_label TEXT NOT NULL DEFAULT '',
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    confidence REAL NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'unassigned',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS temporal_stale_reviews (
+                    thread_id TEXT PRIMARY KEY,
+                    idle_window_id TEXT NOT NULL,
+                    reviewed_at TEXT NOT NULL,
+                    FOREIGN KEY(thread_id) REFERENCES temporal_work_threads(thread_id)
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS temporal_routing_constraints (
+                    anchor_kind TEXT NOT NULL,
+                    anchor_value TEXT NOT NULL,
+                    constraint_kind TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(anchor_kind, anchor_value, constraint_kind)
+                )
+                """
+            )
+            cursor.execute(
+                """
                 CREATE TABLE IF NOT EXISTS semantic_dedupe_items (
                     dedupe_item_id TEXT PRIMARY KEY,
                     entity_kind TEXT NOT NULL,
@@ -652,6 +732,10 @@ class SQLiteMemoryAdapter(MemoryPort):
         )
 
     def _temporal_thread_from_row(self, row: sqlite3.Row) -> TemporalWorkThread:
+        try:
+            metadata = json.loads(row["metadata_json"] or "{}")
+        except json.JSONDecodeError:
+            metadata = {}
         return TemporalWorkThread(
             thread_id=row["thread_id"],
             topic_key=row["topic_key"],
@@ -664,6 +748,9 @@ class SQLiteMemoryAdapter(MemoryPort):
             entities=json.loads(row["entities"] or "[]"),
             open_loops=json.loads(row["open_loops"] or "[]"),
             metadata_json=row["metadata_json"],
+            work_state=str(metadata.get("work_state") or row["state"] or "active"),
+            engagement_state=str(metadata.get("engagement_state") or "unknown"),
+            routing_confidence=float(metadata.get("routing_confidence") or 0.0),
         )
 
     def _load_sqlite_vec_extension(self, conn: sqlite3.Connection) -> None:
@@ -1056,6 +1143,166 @@ class SQLiteMemoryAdapter(MemoryPort):
         with self._managed_connection() as conn:
             rows = conn.execute(query, params).fetchall()
         return [self._temporal_thread_from_row(row) for row in rows]
+
+    # Temporal routing helpers intentionally use exact, normalized identifiers
+    # rather than semantic text.  This keeps private capture scope enforcement at
+    # the storage boundary as well as in the service layer.
+    def upsert_temporal_thread_anchors(self, anchors: List[TemporalThreadAnchor]) -> None:
+        if not anchors:
+            return
+        now = self._now()
+        with self._managed_connection() as conn:
+            conn.executemany(
+                """INSERT INTO temporal_thread_anchors
+                   (thread_id, anchor_kind, anchor_value, specificity, privacy_label, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(thread_id, anchor_kind, anchor_value) DO UPDATE SET
+                     specificity=excluded.specificity, privacy_label=excluded.privacy_label""",
+                [
+                    (anchor.thread_id, anchor.anchor_kind, anchor.anchor_value,
+                     float(anchor.specificity), anchor.privacy_label or "", anchor.created_at or now)
+                    for anchor in anchors
+                ],
+            )
+
+    def find_temporal_thread_anchors(
+        self, *, anchors: List[tuple[str, str]], privacy_label: str = "", limit: int = 12
+    ) -> List[TemporalThreadAnchor]:
+        if not anchors:
+            return []
+        clauses = " OR ".join("(anchor_kind = ? AND anchor_value = ?)" for _ in anchors)
+        params: List[object] = [part for anchor in anchors for part in anchor]
+        # Empty is a public/default scope. Sensitive evidence may only retrieve
+        # same-scope records and never leak into a differently scoped event.
+        if privacy_label:
+            clauses = f"({clauses}) AND privacy_label = ?"
+            params.append(privacy_label)
+        else:
+            clauses = f"({clauses}) AND privacy_label = ''"
+        params.append(max(1, int(limit)))
+        with self._managed_connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM temporal_thread_anchors WHERE " + clauses + " ORDER BY specificity DESC LIMIT ?",
+                params,
+            ).fetchall()
+        return [
+            TemporalThreadAnchor(
+                thread_id=row["thread_id"], anchor_kind=row["anchor_kind"], anchor_value=row["anchor_value"],
+                specificity=float(row["specificity"]), privacy_label=row["privacy_label"], created_at=row["created_at"],
+            ) for row in rows
+        ]
+
+    def append_temporal_checkpoint(self, checkpoint: TemporalThreadCheckpoint) -> TemporalThreadCheckpoint:
+        now = self._now()
+        with self._managed_connection() as conn:
+            conn.execute(
+                """INSERT OR IGNORE INTO temporal_thread_checkpoints (
+                    checkpoint_id, thread_id, first_event_id, last_event_id, occurred_at, summary, goal,
+                    verified_progress, unresolved_loops, artifacts, work_state, evidence_ids, provenance,
+                    confidence, metadata_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (checkpoint.checkpoint_id, checkpoint.thread_id, checkpoint.first_event_id, checkpoint.last_event_id,
+                 checkpoint.occurred_at, checkpoint.summary, checkpoint.goal,
+                 json.dumps(checkpoint.verified_progress), json.dumps(checkpoint.unresolved_loops),
+                 json.dumps(checkpoint.artifacts), checkpoint.work_state, json.dumps(checkpoint.evidence_ids),
+                 checkpoint.provenance, float(checkpoint.confidence), checkpoint.metadata_json or "{}", checkpoint.created_at or now),
+            )
+            row = conn.execute("SELECT * FROM temporal_thread_checkpoints WHERE checkpoint_id = ?", (checkpoint.checkpoint_id,)).fetchone()
+        return self._temporal_checkpoint_from_row(row)
+
+    def list_temporal_thread_checkpoints(self, *, thread_id: str, limit: int = 5) -> List[TemporalThreadCheckpoint]:
+        with self._managed_connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM temporal_thread_checkpoints WHERE thread_id = ? ORDER BY occurred_at DESC LIMIT ?",
+                (thread_id, max(1, int(limit))),
+            ).fetchall()
+        return [self._temporal_checkpoint_from_row(row) for row in rows]
+
+    def _temporal_checkpoint_from_row(self, row: sqlite3.Row) -> TemporalThreadCheckpoint:
+        return TemporalThreadCheckpoint(
+            checkpoint_id=row["checkpoint_id"], thread_id=row["thread_id"], first_event_id=row["first_event_id"],
+            last_event_id=row["last_event_id"], occurred_at=row["occurred_at"], summary=row["summary"], goal=row["goal"],
+            verified_progress=json.loads(row["verified_progress"] or "[]"), unresolved_loops=json.loads(row["unresolved_loops"] or "[]"),
+            artifacts=json.loads(row["artifacts"] or "[]"), work_state=row["work_state"],
+            evidence_ids=json.loads(row["evidence_ids"] or "[]"), provenance=row["provenance"],
+            confidence=float(row["confidence"]), metadata_json=row["metadata_json"], created_at=row["created_at"],
+        )
+
+    def append_temporal_source_evidence(
+        self, *, source_evidence_id: str, source_type: str, source_ref: str, occurred_at: str,
+        privacy_label: str, payload_json: str, confidence: float, status: str = "unassigned"
+    ) -> None:
+        now = self._now()
+        with self._managed_connection() as conn:
+            conn.execute(
+                """INSERT INTO temporal_source_evidence
+                   (source_evidence_id, source_type, source_ref, occurred_at, privacy_label, payload_json, confidence, status, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(source_evidence_id) DO UPDATE SET payload_json=excluded.payload_json,
+                     confidence=excluded.confidence, status=excluded.status, updated_at=excluded.updated_at""",
+                (source_evidence_id, source_type, source_ref, occurred_at, privacy_label or "", payload_json or "{}", float(confidence), status, now, now),
+            )
+
+    def mark_temporal_source_evidence(self, source_evidence_id: str, status: str) -> None:
+        with self._managed_connection() as conn:
+            conn.execute("UPDATE temporal_source_evidence SET status = ?, updated_at = ? WHERE source_evidence_id = ?", (status, self._now(), source_evidence_id))
+
+    def temporal_observer_is_healthy(self, *, observed_after: str) -> bool:
+        with self._managed_connection() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM temporal_source_evidence WHERE source_type LIKE 'lightweight_visual%' AND occurred_at >= ? LIMIT 1",
+                (observed_after,),
+            ).fetchone()
+        return row is not None
+
+    def add_temporal_routing_constraint(self, *, anchor_kind: str, anchor_value: str, constraint_kind: str) -> None:
+        with self._managed_connection() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO temporal_routing_constraints(anchor_kind, anchor_value, constraint_kind, created_at) VALUES (?, ?, ?, ?)",
+                (anchor_kind, anchor_value, constraint_kind, self._now()),
+            )
+
+    def list_temporal_routing_constraints(self, *, constraint_kind: str = "") -> List[tuple[str, str]]:
+        query = "SELECT anchor_kind, anchor_value FROM temporal_routing_constraints"
+        params: List[object] = []
+        if constraint_kind:
+            query += " WHERE constraint_kind = ?"
+            params.append(constraint_kind)
+        with self._managed_connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [(row["anchor_kind"], row["anchor_value"]) for row in rows]
+
+    def claim_temporal_stale_review(self, *, thread_id: str, idle_window_id: str, cooldown_after: str) -> bool:
+        with self._managed_connection() as conn:
+            row = conn.execute("SELECT reviewed_at FROM temporal_stale_reviews WHERE thread_id = ?", (thread_id,)).fetchone()
+            if row is not None and str(row["reviewed_at"]) >= cooldown_after:
+                return False
+            conn.execute(
+                """INSERT INTO temporal_stale_reviews(thread_id, idle_window_id, reviewed_at) VALUES (?, ?, ?)
+                   ON CONFLICT(thread_id) DO UPDATE SET idle_window_id=excluded.idle_window_id, reviewed_at=excluded.reviewed_at""",
+                (thread_id, idle_window_id, self._now()),
+            )
+        return True
+
+    def reassign_temporal_event(self, *, temporal_event_id: str, new_thread_id: str | None) -> None:
+        """Atomically move one canonical event and repair both affected thread heads."""
+        with self._managed_connection() as conn:
+            row = conn.execute("SELECT thread_id FROM temporal_memory_events WHERE temporal_event_id = ?", (temporal_event_id,)).fetchone()
+            if row is None:
+                return
+            old_thread_id = row["thread_id"]
+            conn.execute("UPDATE temporal_memory_events SET thread_id = ?, updated_at = ? WHERE temporal_event_id = ?", (new_thread_id, self._now(), temporal_event_id))
+            for thread_id in {old_thread_id, new_thread_id} - {None}:
+                head = conn.execute(
+                    "SELECT temporal_event_id, occurred_at, content, state FROM temporal_memory_events WHERE thread_id = ? ORDER BY occurred_at DESC LIMIT 1",
+                    (thread_id,),
+                ).fetchone()
+                if head is None:
+                    continue
+                conn.execute(
+                    "UPDATE temporal_work_threads SET last_event_id = ?, last_activity_at = ?, summary = ?, state = ? WHERE thread_id = ?",
+                    (head["temporal_event_id"], head["occurred_at"], str(head["content"])[:1000], head["state"], thread_id),
+                )
 
     def _write_index(self) -> None:
         speakers = [

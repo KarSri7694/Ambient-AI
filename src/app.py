@@ -337,6 +337,10 @@ TEMPORAL_MEMORY_RETRIEVAL_LIMIT = CONFIG.get_int("temporal_memory", "retrieval_l
 TEMPORAL_MEMORY_RERANK_LIMIT = CONFIG.get_int("temporal_memory", "rerank_limit", 8)
 TEMPORAL_MEMORY_THREAD_INACTIVITY_HOURS = CONFIG.get_int("temporal_memory", "thread_inactivity_hours", 8)
 TEMPORAL_MEMORY_VLM_CONTEXT_CHARS = CONFIG.get_int("temporal_memory", "vlm_context_chars", 1800)
+TEMPORAL_MEMORY_ROUTING_ACCEPTANCE_SCORE = CONFIG.get_float("temporal_memory", "routing_acceptance_score", 0.72)
+TEMPORAL_MEMORY_ROUTING_WINNER_MARGIN = CONFIG.get_float("temporal_memory", "routing_winner_margin", 0.08)
+TEMPORAL_MEMORY_STALE_AFTER_MINUTES = CONFIG.get_int("temporal_memory", "stale_after_minutes", 15)
+TEMPORAL_MEMORY_STALE_IDLE_MINUTES = CONFIG.get_int("temporal_memory", "stale_idle_minutes", 3)
 TEMPORAL_MEMORY_WORK_INSTRUCTION = CONFIG.get_str(
     "temporal_memory",
     "work_retrieval_instruction",
@@ -1108,6 +1112,10 @@ class AmbientRuntime:
             rerank_limit=TEMPORAL_MEMORY_RERANK_LIMIT,
             thread_inactivity_hours=TEMPORAL_MEMORY_THREAD_INACTIVITY_HOURS,
             work_retrieval_instruction=TEMPORAL_MEMORY_WORK_INSTRUCTION,
+            routing_acceptance_score=TEMPORAL_MEMORY_ROUTING_ACCEPTANCE_SCORE,
+            routing_winner_margin=TEMPORAL_MEMORY_ROUTING_WINNER_MARGIN,
+            stale_after_minutes=TEMPORAL_MEMORY_STALE_AFTER_MINUTES,
+            idle_after_minutes=TEMPORAL_MEMORY_STALE_IDLE_MINUTES,
         )
         if TEMPORAL_MEMORY_ENABLED:
             try:
@@ -2349,6 +2357,7 @@ class AmbientRuntime:
         services_initialized = False
         last_browser_approval_fallback_check_at = 0.0
         last_recurring_todoist_sync_at = 0.0
+        temporal_stale_service = getattr(autonomy_coordinator, "temporal_memory_service", None)
 
         try:
             self.stop_event.clear()
@@ -3032,6 +3041,21 @@ class AmbientRuntime:
                         continue
 
                 proactive_idle_cycle_key = f"{datetime.now().astimezone().date().isoformat()}-{idle_window_id}"
+                if user_idle_now and autonomy_coordinator is not None and temporal_stale_service is not None:
+                    try:
+                        observer_healthy = bool(getattr(temporal_stale_service, "observer_is_healthy", lambda: False)())
+                        reviews = temporal_stale_service.stale_thread_reviews(
+                            user_idle_seconds=system_idle_service.get_idle_seconds(), observer_healthy=observer_healthy,
+                            idle_window_id=proactive_idle_cycle_key,
+                        )
+                        for review in reviews:
+                            autonomy_coordinator.enqueue_event(
+                                event_type="stale_thread_review", source_kind="temporal_memory",
+                                source_ref=f"temporal://{review['thread_id']}", occurred_at=datetime.now(timezone.utc).isoformat(),
+                                payload=review, confidence=0.8, privacy_label="", priority=0.45,
+                            )
+                    except Exception:
+                        logger.exception("Stale-thread review scheduling failed.")
                 if (
                     user_idle_now
                     and autonomy_coordinator is not None
