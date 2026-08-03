@@ -54,7 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--counts", type=int, nargs="+", default=None, help="Override image counts; default is --images")
     parser.add_argument("--slots", type=int, default=3, help="Maximum concurrent llama-server requests (default: 3)")
     parser.add_argument("--repeat", type=int, default=1)
-    parser.add_argument("--max-output-tokens", type=int, default=256)
+    parser.add_argument("--max-output-tokens", type=int, default=8192)
     parser.add_argument("--timeout", type=float, default=180.0)
     parser.add_argument("--load-model", action="store_true", help="Ask the endpoint to load the model; default assumes it is already loaded")
     parser.add_argument("--output", type=Path, default=None, help="Optional JSON report path")
@@ -171,7 +171,13 @@ async def consume(completion: Any) -> tuple[str, dict[str, Any]]:
     return "".join(text_parts), usage
 
 
-async def request(adapter: LlamaCppAdapter, captures: list[Capture], model: str, timeout: float) -> dict[str, Any]:
+async def request(
+    adapter: LlamaCppAdapter,
+    captures: list[Capture],
+    model: str,
+    timeout: float,
+    max_output_tokens: int,
+) -> dict[str, Any]:
     started = time.perf_counter()
     image_paths = [str(item.path) for item in captures]
     messages = [
@@ -185,7 +191,7 @@ async def request(adapter: LlamaCppAdapter, captures: list[Capture], model: str,
             tools=None,
             image=image_paths,
             temperature=0.1,
-            max_tokens=256 * max(1, len(image_paths)),
+            max_tokens=max(1, int(max_output_tokens)),
             response_format=PassiveObserverService.BATCH_RESPONSE_SCHEMA,
             chat_template_kwargs={"enable_thinking": False},
             request_timeout_seconds=timeout,
@@ -207,13 +213,21 @@ async def request(adapter: LlamaCppAdapter, captures: list[Capture], model: str,
     }
 
 
-async def run_mode(adapter: LlamaCppAdapter, captures: list[Capture], mode: str, slots: int, model: str, timeout: float) -> dict[str, Any]:
+async def run_mode(
+    adapter: LlamaCppAdapter,
+    captures: list[Capture],
+    mode: str,
+    slots: int,
+    model: str,
+    timeout: float,
+    max_output_tokens: int,
+) -> dict[str, Any]:
     started = time.perf_counter()
     semaphore = asyncio.Semaphore(slots)
 
     async def limited(group: list[Capture]) -> dict[str, Any]:
         async with semaphore:
-            return await request(adapter, group, model, timeout)
+            return await request(adapter, group, model, timeout, max_output_tokens)
 
     if mode == "parallel":
         results = await asyncio.gather(*(limited([item]) for item in captures))
@@ -252,7 +266,15 @@ async def main() -> None:
         for repeat in range(args.repeat):
             LOG.info("Benchmarking %s images, repeat %s/%s", count, repeat + 1, args.repeat)
             for mode in ("parallel", "batch", "combined"):
-                result = await run_mode(adapter, captures, mode, max(1, args.slots), model, args.timeout)
+                result = await run_mode(
+                    adapter,
+                    captures,
+                    mode,
+                    max(1, args.slots),
+                    model,
+                    args.timeout,
+                    args.max_output_tokens,
+                )
                 result["repeat"] = repeat + 1
                 case["runs"].append(result)
                 LOG.info("%s: total=%.0fms request_sum=%.0fms valid=%s", mode, result["total_ms"], result["sum_request_ms"], all(item["json_valid"] for item in result["results"]))
