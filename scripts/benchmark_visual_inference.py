@@ -128,6 +128,11 @@ IMPORTANT OUTPUT CONTRACT:
 - Each item must contain the matching zero-based `frame_index` from 0 through {image_count - 1}.
 - Never merge, summarize, or omit images. Do not return a single overall observation.
 - Process the images independently, then return the observations in frame_index order.
+- Keep the user activity brief: one short sentence, maximum 120 characters.
+- Keep `summary` to one short sentence, maximum 160 characters.
+- Keep `detailed_description` factual and compact, maximum 300 characters.
+- Return at most three salient facts per image and keep each fact short.
+- Keep `work_extraction` concise; use empty arrays when no concrete evidence is visible.
 """
     return preamble + PassiveObserverService.BATCH_ROUTER_PROMPT + contract
 
