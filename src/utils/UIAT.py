@@ -518,6 +518,19 @@ def scan_window(window: auto.Control, mode: str = "interactive_only") -> list:
                 end_y = start_y + length_y
                 bbox = (start_x, start_y, end_x, end_y)
 
+                try:
+                    control_type = str(control.ControlTypeName or "unknown")
+                except Exception:
+                    control_type = "unknown"
+                try:
+                    enabled = bool(control.IsEnabled)
+                except Exception:
+                    enabled = True
+                try:
+                    is_password = bool(control.IsPassword)
+                except Exception:
+                    is_password = False
+
                 results.append((
                     clean_name,
                     start_x,
@@ -527,6 +540,11 @@ def scan_window(window: auto.Control, mode: str = "interactive_only") -> list:
                     end_x,
                     end_y,
                     bbox,
+                    control_type,
+                    enabled,
+                    is_writable(control),
+                    _safe_control_value(control),
+                    is_password,
                 ))
             except Exception:
                 continue
@@ -566,16 +584,7 @@ def print_compact_bbox_table(results: list) -> None:
 
     serial = 0
     for row in results:
-        (
-            name,
-            start_x,
-            start_y,
-            length_x,
-            length_y,
-            end_x,
-            end_y,
-            bbox,
-        ) = row
+        name, start_x, start_y, length_x, length_y, end_x, end_y, bbox = row[:8]
 
         truncated_name = name[:MAX_ITEM_NAME_CHARS]
         serial += 1
@@ -647,6 +656,11 @@ def inspect_foreground_window(mode: str = "interactive_only") -> dict:
             "end_x": row[5],
             "end_y": row[6],
             "bbox": row[7],
+            "control_type": row[8] if len(row) > 8 else "unknown",
+            "enabled": row[9] if len(row) > 9 else True,
+            "editable": row[10] if len(row) > 10 else False,
+            "value": row[11][:MAX_ITEM_NAME_CHARS] if len(row) > 11 else "",
+            "is_password": row[12] if len(row) > 12 else False,
         }
         for row in rows
     ]

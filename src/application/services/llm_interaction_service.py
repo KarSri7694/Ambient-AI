@@ -241,7 +241,8 @@ class LLMInteractionService:
         "- You receive a fresh full-screen screenshot before every model turn. Treat that screenshot as the current desktop state.\n"
         "- After each action, wait for the next turn's screenshot before deciding the next action.\n"
         "- Mouse coordinates must use Gemma-style normalized 0..1000 coordinates, where (0,0) is top-left and (1000,1000) is bottom-right.\n"
-        "- computer_inspect only reports observation metadata; do not rely on UI Automation or accessibility trees.\n"
+        "- Use computer_inspect when you need semantic control names, editable fields, or foreground-window details, especially after navigation, dialogs, or uncertain visual targeting.\n"
+        "- UI Automation output is intentionally compact and may be truncated or stale. Use the fresh screenshot to verify every target and treat pixels as authoritative when UIA conflicts with the screen.\n"
         "- Do not use shell commands, system shutdown/logout/lock, credential entry, payment, checkout, "
         "or destructive file-manager actions.\n"
         "- Do not bypass authentication, CAPTCHA, two-factor authentication, security warnings, or confirmation screens.\n"
@@ -289,6 +290,9 @@ class LLMInteractionService:
         computer_task_timeout_seconds: float = 180.0,
         computer_max_actions_per_task: int = 40,
         computer_screenshot_dir: str = ".ambient_data/computer/screenshots",
+        computer_uiat_max_items: int = 40,
+        computer_uiat_max_chars: int = 6000,
+        computer_uiat_name_max_chars: int = 120,
         computer_enabled: bool = False,
         local_control_approval_ttl_minutes: int = 30,
         scheduled_task_service: Optional[ScheduledTaskService] = None,
@@ -323,6 +327,9 @@ class LLMInteractionService:
         self.computer_task_timeout_seconds = computer_task_timeout_seconds
         self.computer_max_actions_per_task = computer_max_actions_per_task
         self.computer_screenshot_dir = computer_screenshot_dir
+        self.computer_uiat_max_items = computer_uiat_max_items
+        self.computer_uiat_max_chars = computer_uiat_max_chars
+        self.computer_uiat_name_max_chars = computer_uiat_name_max_chars
         self.computer_enabled = computer_enabled
         self.local_control_approval_ttl_minutes = max(1, int(local_control_approval_ttl_minutes))
         self.scheduled_task_service = scheduled_task_service
@@ -1149,6 +1156,9 @@ class LLMInteractionService:
                 max_actions=self.computer_max_actions_per_task,
                 screenshot_dir=self.computer_screenshot_dir,
                 read_only=read_only,
+                uiat_max_items=self.computer_uiat_max_items,
+                uiat_max_chars=self.computer_uiat_max_chars,
+                uiat_name_max_chars=self.computer_uiat_name_max_chars,
             )
             child_frame_pushed = False
             computer_result = ""
@@ -1259,6 +1269,8 @@ class LLMInteractionService:
                 "- You receive a fresh full-screen screenshot before every model turn. Treat that screenshot as the current desktop state.\n"
                 "- Use the provided computer_* tools only; do not answer with raw coordinates unless calling a tool.\n"
                 "- Mouse coordinates must use normalized 0..1000 coordinates, where (0,0) is top-left and (1000,1000) is bottom-right.\n"
+                "- Use computer_inspect when semantic control names or foreground-window details are needed after navigation or an unexpected dialog.\n"
+                "- UI Automation output is compact and may be truncated or stale; verify targets against the fresh screenshot.\n"
                 "- Prefer short action sequences: inspect screenshot, act once, wait for the next screenshot, then continue.\n"
                 "- Do not use shell commands, system shutdown/logout/lock, credential entry, payment, checkout, or destructive file-manager actions.\n"
                 "- Do not bypass authentication, CAPTCHA, two-factor authentication, security warnings, or confirmation screens.\n"
@@ -1271,6 +1283,8 @@ class LLMInteractionService:
                 "- Use the screenshot attached to each turn as the authoritative desktop state.\n"
                 "- Call exactly one computer_* tool per step unless finishing.\n"
                 "- Use normalized 0..1000 coordinates for all mouse actions.\n"
+                "- Use computer_inspect for semantic control names, editable fields, or foreground-window details when screenshot-only targeting is uncertain.\n"
+                "- UI Automation output is bounded and secondary to the fresh screenshot; re-check pixels before acting if they disagree.\n"
                 "- Do not repeat an action if the previous screenshot did not visibly change; replan or inspect.\n"
                 "- Do not use shell commands, system shutdown/logout/lock, credential entry, payment, checkout, or destructive file-manager actions.\n"
                 "- When complete or blocked, call finish_computer_task exactly once.\n"

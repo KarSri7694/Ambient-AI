@@ -262,6 +262,9 @@ COMPUTER_MAX_ACTIONS_PER_TASK = CONFIG.get_int("computer", "max_actions_per_task
 COMPUTER_SCREENSHOT_DIR = CONFIG.get_str(
     "computer", "screenshot_dir", str(USER_DATA_DIR / "computer" / "screenshots")
 )
+COMPUTER_UIAT_MAX_ITEMS = CONFIG.get_int("computer", "uiat_max_items", 40)
+COMPUTER_UIAT_MAX_CHARS = CONFIG.get_int("computer", "uiat_max_chars", 6000)
+COMPUTER_UIAT_NAME_MAX_CHARS = CONFIG.get_int("computer", "uiat_name_max_chars", 120)
 from infrastructure.plain_capture_store import PlainCaptureStore
 CHAT_HISTORY_MESSAGE_LIMIT = CONFIG.get_int("chat", "history_message_limit", 40)
 CHAT_STREAM_CHECKPOINT_SECONDS = CONFIG.get_float("chat", "stream_checkpoint_seconds", 0.25)
@@ -1155,6 +1158,9 @@ class AmbientRuntime:
             filesystem_max_list_entries=FILESYSTEM_MAX_LIST_ENTRIES,
             computer_agent_model=COMPUTER_AGENT_MODEL,
             computer_agent_family=COMPUTER_AGENT_FAMILY,
+            computer_uiat_max_items=COMPUTER_UIAT_MAX_ITEMS,
+            computer_uiat_max_chars=COMPUTER_UIAT_MAX_CHARS,
+            computer_uiat_name_max_chars=COMPUTER_UIAT_NAME_MAX_CHARS,
             computer_task_timeout_seconds=COMPUTER_TASK_TIMEOUT_SECONDS,
             computer_max_actions_per_task=COMPUTER_MAX_ACTIONS_PER_TASK,
             computer_screenshot_dir=COMPUTER_SCREENSHOT_DIR,

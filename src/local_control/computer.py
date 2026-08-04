@@ -73,12 +73,21 @@ class ComputerControlSession:
         max_actions: int = 40,
         screenshot_dir: str | Path = ".ambient_data/computer/screenshots",
         read_only: bool = False,
+        uiat_max_items: int = 40,
+        uiat_max_chars: int = 6000,
+        uiat_name_max_chars: int = 120,
+        uiat_inspector: Any = None,
     ):
         self.max_actions = max(1, int(max_actions))
         self.actions = 0
         self.screenshot_dir = Path(screenshot_dir)
         self.last_screenshot_path = ""
+        self.last_action = ""
         self.read_only = bool(read_only)
+        self.uiat_max_items = max(1, int(uiat_max_items))
+        self.uiat_max_chars = max(512, int(uiat_max_chars))
+        self.uiat_name_max_chars = max(24, int(uiat_name_max_chars))
+        self.uiat_inspector = uiat_inspector
         self.stop = EmergencyStopController()
         self.stop.start()
         self._allowed_tool_names = {
@@ -98,7 +107,7 @@ class ComputerControlSession:
         tools = [
             self._tool(
                 "computer_inspect",
-                "Return current visual-observation metadata. A fresh screenshot is automatically attached to every computer-use model turn; use that screenshot for inspection instead of UI Automation.",
+                "Return compact current desktop metadata and bounded UI Automation hints. Use after navigation, for semantic control names/editable fields, or when a dialog makes screenshot-only targeting uncertain. A fresh screenshot is still attached every model turn and is authoritative.",
                 {},
                 [],
             ),
@@ -194,6 +203,7 @@ class ComputerControlSession:
                 result = self._pyautogui_call("press", key)
             else:
                 raise ValueError(f"Computer tool '{tool_name}' is not allowed.")
+            self.last_action = tool_name
         finally:
             self.stop.check()
         return result
@@ -256,16 +266,117 @@ class ComputerControlSession:
             width, height = self._screen_size()
         except Exception:
             pass
-        return json.dumps(
-            {
+        payload = {
                 "status": "ok",
                 "observation": "fresh_screenshot_attached_each_model_turn",
                 "latest_screenshot_path": self.last_screenshot_path,
                 "coordinate_system": "Use normalized 0..1000 x/y coordinates for all mouse actions.",
                 "screen_size": {"width": width, "height": height},
-            },
-            ensure_ascii=False,
-        )
+                "progress": {
+                    "actions_used": self.actions,
+                    "actions_remaining": max(0, self.max_actions - self.actions),
+                    "last_action": self.last_action or None,
+                },
+                "ui_automation": self._bounded_uiat_snapshot(),
+            }
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+    def _bounded_uiat_snapshot(self) -> dict[str, Any]:
+        """Read UIA only on explicit inspection and bound it before it enters context."""
+        try:
+            if self.uiat_inspector is not None:
+                raw = self.uiat_inspector()
+            else:
+                from utils import UIAT
+
+                raw = UIAT.inspect_foreground_window(mode="interactive_only")
+        except Exception as exc:
+            return {"ok": False, "error": "uiat_unavailable", "detail": str(exc)[:160]}
+
+        if not isinstance(raw, dict):
+            return {"ok": False, "error": "uiat_invalid_payload"}
+
+        raw_items = list(raw.get("visible_items") or [])
+        indexed_items = list(enumerate(raw_items))
+
+        def priority(entry: tuple[int, Any]) -> tuple[int, int]:
+            index, item = entry
+            if not isinstance(item, dict):
+                return (0, -index)
+            name = str(item.get("name") or "").lower()
+            control_type = str(item.get("control_type") or "").lower()
+            score = 0
+            if any(marker in control_type for marker in ("edit", "button", "menu", "dialog")):
+                score += 4
+            if any(marker in name for marker in ("dialog", "ok", "cancel", "save", "submit", "close", "error", "warning")):
+                score += 3
+            if item.get("editable") or item.get("contains_dialog"):
+                score += 2
+            return (score, -index)
+
+        indexed_items.sort(key=priority, reverse=True)
+        items: list[dict[str, Any]] = []
+        truncated = False
+        for _, raw_item in indexed_items:
+            if not isinstance(raw_item, dict):
+                continue
+            name = str(raw_item.get("name") or "").strip()
+            if not name:
+                continue
+            item = {
+                "name": name[: self.uiat_name_max_chars],
+                "control_type": str(raw_item.get("control_type") or "unknown")[:48],
+                "enabled": bool(raw_item.get("enabled", True)),
+                "editable": bool(raw_item.get("editable", False)),
+                "bbox": raw_item.get("bbox"),
+            }
+            value = str(raw_item.get("value") or "").strip()
+            if value and not bool(raw_item.get("is_password")):
+                item["value"] = value[: self.uiat_name_max_chars]
+            elif raw_item.get("is_password"):
+                item["value_redacted"] = True
+            candidate = {
+                "ok": bool(raw.get("ok", False)),
+                "window_title": str(raw.get("window_title") or "")[:160],
+                "window_class": str(raw.get("window_class") or "")[:120],
+                "process_name": str(raw.get("process_name") or "")[:120],
+                "foreground_url": str(raw.get("foreground_url") or "")[:240] or None,
+                "contains_dialog": bool(raw.get("contains_dialog")),
+                "contains_notification": bool(raw.get("contains_notification")),
+                "total_items": len(raw_items),
+                "returned_items": len(items) + 1,
+                "items": [*items, item],
+            }
+            if len(json.dumps(candidate, ensure_ascii=False, separators=(",", ":"))) > self.uiat_max_chars:
+                truncated = True
+                break
+            items.append(item)
+            if len(items) >= self.uiat_max_items:
+                truncated = len(items) < len(raw_items)
+                break
+
+        result = {
+            "ok": bool(raw.get("ok", False)),
+            "window_title": str(raw.get("window_title") or "")[:160],
+            "window_class": str(raw.get("window_class") or "")[:120],
+            "process_name": str(raw.get("process_name") or "")[:120],
+            "foreground_url": str(raw.get("foreground_url") or "")[:240] or None,
+            "contains_dialog": bool(raw.get("contains_dialog")),
+            "contains_notification": bool(raw.get("contains_notification")),
+            "total_items": len(raw_items),
+            "returned_items": len(items),
+            "items": items,
+        }
+        if truncated:
+            result["truncated"] = True
+            result["truncation_note"] = "UIA truncated; verify against the screenshot."
+            while (
+                len(json.dumps(result, ensure_ascii=False, separators=(",", ":"))) > self.uiat_max_chars
+                and result["items"]
+            ):
+                result["items"].pop()
+                result["returned_items"] = len(result["items"])
+        return result
 
     def capture_screenshot_for_model(self) -> str:
         self.stop.check()
