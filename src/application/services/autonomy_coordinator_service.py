@@ -990,7 +990,15 @@ Do not repeat an action already reported as performed.
         metadata = payload.get("metadata")
         if isinstance(metadata, dict):
             parts.extend(str(value) for value in metadata.values())
-        return " ".join(str(part).strip() for part in parts if str(part or "").strip())[:6000]
+        unique_parts: list[str] = []
+        seen: set[str] = set()
+        for part in parts:
+            text = " ".join(str(part or "").split()).strip()
+            key = text.lower()
+            if text and key not in seen:
+                seen.add(key)
+                unique_parts.append(text)
+        return " ".join(unique_parts)[:6000]
 
     async def _enrich_lightweight_visual(
         self,

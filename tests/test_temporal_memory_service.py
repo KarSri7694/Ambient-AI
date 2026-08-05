@@ -89,6 +89,27 @@ def test_work_retrieval_is_temporal_post_ranked_and_chronological(tmp_path):
     assert "do not repeat" in context["suppression_hint"].lower()
 
 
+def test_exact_duplicate_work_facts_do_not_create_extra_temporal_ids_or_prompt_lines(tmp_path):
+    memory = SQLiteMemoryAdapter(str(tmp_path / "memory.db"), str(tmp_path / "memory"))
+    service = TemporalMemoryService(memory=memory)
+    payload = {
+        "activity": "Reviewing the Ambient Agent daily progress report and pending personal-source sweeps",
+        "detailed_description": "The dashboard flags two incomplete personal-source sweeps for rapid user review.",
+        "project_root": "D:/projects/ambient_ai",
+    }
+    first = service.record_ambient_event(_event("first", "2026-08-05T10:00:00", payload))
+    second = service.record_ambient_event(_event("second", "2026-08-05T10:01:00", payload))
+
+    assert second.temporal_event_id == first.temporal_event_id
+    assert len(memory.get_temporal_events(thread_ids=[first.thread_id], limit=20)) == 1
+
+    prompt = service.build_prompt_context(
+        query_text=first.content,
+        current_event=first,
+    )
+    assert prompt.count("Reviewing the Ambient Agent daily progress report") == 1
+
+
 def test_old_temporal_detail_is_compacted_into_searchable_summary(tmp_path):
     memory = SQLiteMemoryAdapter(str(tmp_path / "memory.db"), str(tmp_path / "memory"))
     service = TemporalMemoryService(memory=memory, detailed_retention_days=30)
