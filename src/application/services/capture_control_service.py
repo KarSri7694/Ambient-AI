@@ -94,7 +94,15 @@ class CaptureControlService:
         window_title = str(context.get("window_title") or "").strip()
         window_class = str(context.get("window_class") or "").strip()
         url = str(context.get("url") or context.get("foreground_url") or "").strip()
-        domain = self.normalize_domain(context.get("domain") or context.get("domain_hint") or url)
+        domain = ""
+        for domain_candidate in (
+            context.get("domain"),
+            context.get("domain_hint"),
+            url,
+        ):
+            domain = self.normalize_domain(domain_candidate)
+            if domain:
+                break
 
         with self._lock:
             matched_rule = None
@@ -185,6 +193,8 @@ class CaptureControlService:
         raw = str(value or "").strip().lower().rstrip(".")
         if not raw:
             return ""
+        if raw.startswith("*."):
+            raw = raw[2:]
         candidate = raw if "://" in raw else f"//{raw}"
         try:
             hostname = (urlsplit(candidate).hostname or "").strip().lower().rstrip(".")
@@ -192,6 +202,10 @@ class CaptureControlService:
             return ""
         if not hostname or any(char.isspace() for char in hostname):
             return ""
+        # Treat www.example.com and example.com as the same site for privacy
+        # rules. Subdomains are matched separately by evaluate_context.
+        if hostname.startswith("www."):
+            hostname = hostname[4:]
         try:
             return hostname.encode("idna").decode("ascii")
         except UnicodeError:
@@ -206,7 +220,10 @@ class CaptureControlService:
                 continue
             if len(item) > 200 or any(char in item for char in "\r\n\0"):
                 raise ValueError(f"invalid application exclusion: {value!r}")
-            normalized.add(item)
+            # Users commonly paste an executable path from Task Manager or
+            # Explorer. Store its basename so it matches UI Automation's
+            # process_name regardless of installation directory.
+            normalized.add(cls._process_basename(item) if "\\" in item or "/" in item else item)
         return normalized
 
     @classmethod
@@ -240,16 +257,29 @@ class CaptureControlService:
         app_stem = Path(app_base).stem.lower() if app_base else app
         window_cls = window_class.strip().lower()
 
-        if normalized_rule.endswith(".exe"):
-            return normalized_rule in {process, app_base}
-        if normalized_rule in {process, process_stem, app, app_base, app_stem, window_cls}:
-            return True
+        rule_base = cls._process_basename(normalized_rule)
+        rule_stem = Path(rule_base).stem.lower() if rule_base else normalized_rule
+        rule_tokens = cls._normalize_app_text(normalized_rule)
+        rule_stem_tokens = cls._normalize_app_text(rule_stem)
+        candidates = (process, process_stem, app, app_base, app_stem, window_cls, window_title)
 
-        # Window titles are only a fallback. Token boundaries prevent a rule
-        # such as "mail" from matching an unrelated word such as "thumbnail".
-        title_tokens = cls._APP_BOUNDARY.sub(" ", window_title.lower()).strip()
-        rule_tokens = cls._APP_BOUNDARY.sub(" ", normalized_rule).strip()
-        return bool(rule_tokens and re.search(rf"(?:^|\s){re.escape(rule_tokens)}(?:$|\s)", title_tokens))
+        # Match against every foreground identifier, not only the window
+        # title. UI Automation frequently reports "Google Chrome" as the app
+        # while the process is chrome.exe, and reports the browser title when
+        # the process name is unavailable.
+        for candidate in candidates:
+            candidate_tokens = cls._normalize_app_text(candidate)
+            if not candidate_tokens:
+                continue
+            for target in (rule_tokens, rule_stem_tokens):
+                if target and re.search(rf"(?:^|\s){re.escape(target)}(?:$|\s)", candidate_tokens):
+                    return True
+        return False
+
+    @classmethod
+    def _normalize_app_text(cls, value) -> str:
+        raw = str(value or "").strip().lower().replace("\\", " ").replace("/", " ")
+        return cls._APP_BOUNDARY.sub(" ", raw).strip()
 
     @staticmethod
     def _process_basename(value) -> str:

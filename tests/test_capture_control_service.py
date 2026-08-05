@@ -56,6 +56,27 @@ def test_context_matching_supports_processes_arbitrary_hosts_and_safe_title_boun
     assert not service.is_excluded(window_title="Thumbnail editor")
 
 
+def test_app_exclusions_match_ui_automation_aliases_and_executable_paths():
+    service = CaptureControlService(
+        excluded_apps=[r"C:\Program Files\Google\Chrome\chrome.exe", "Visual Studio Code"],
+    )
+
+    assert service.is_excluded(process_name="chrome.exe", app_name="Google Chrome")
+    assert service.is_excluded(
+        process_name="code.exe",
+        app_name="Code",
+        window_title="settings.json - Visual Studio Code",
+    )
+    assert not service.is_excluded(app_name="Notepad", window_title="Mail thumbnail editor")
+
+
+def test_domain_exclusions_canonicalize_www_and_fall_back_from_bad_hint():
+    service = CaptureControlService(excluded_domains=["www.example.com"])
+
+    assert service.is_excluded(domain="login.example.com")
+    assert service.is_excluded(domain="not a hostname", url="https://www.example.com/account")
+
+
 def test_queued_capture_policy_is_not_reapplied_after_the_policy_changes(tmp_path):
     control = CaptureControlService(excluded_apps=["Signal"])
     observer = PassiveObserverService(
