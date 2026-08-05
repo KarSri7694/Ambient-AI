@@ -609,6 +609,7 @@ class AmbientRuntime:
         }
         self._artifact_maintenance_retry_after = 0.0
         self._daily_briefing_service: DailyBriefingService | None = None
+        self._manual_daily_briefing_requested = threading.Event()
         self.interrupt_controller = RuntimeInterruptController()
         self.shutdown_controller = RuntimeShutdownController()
         self._shutdown_llm_adapters: list[LlamaCppAdapter] = []
@@ -779,6 +780,13 @@ class AmbientRuntime:
         if self._daily_briefing_service is None:
             raise RuntimeError("daily_briefing_unavailable")
         return self._daily_briefing_service.snapshot(date_value=date_value, since=since)
+
+    def request_daily_briefing_refresh(self) -> dict:
+        if self._daily_briefing_service is None:
+            return {"ok": False, "accepted": False, "error": "daily_briefing_unavailable"}
+        self._manual_daily_briefing_requested.set()
+        self._notify_chat_queued()
+        return {"ok": True, "accepted": True, "status": "queued"}
 
     def _notify_chat_queued(self) -> None:
         """Wake the runtime loop without interrupting an active model request."""
@@ -3567,12 +3575,14 @@ class AmbientRuntime:
                             break
                         continue
 
+                manual_briefing_requested = self._manual_daily_briefing_requested.is_set()
                 if (
-                    user_idle_now
+                    (user_idle_now or manual_briefing_requested)
                     and not autonomy_backlog_ready
                     and self._daily_briefing_service is not None
-                    and self._daily_briefing_service.is_due()
+                    and (manual_briefing_requested or self._daily_briefing_service.is_due())
                 ):
+                    self._manual_daily_briefing_requested.clear()
                     try:
                         services_initialized = await self._ensure_runtime(
                             llm_adapter=llm_adapter,
@@ -3584,7 +3594,9 @@ class AmbientRuntime:
                             user_active=False,
                         )
                         async with self._async_gpu_lock:
-                            briefing_result = await self._daily_briefing_service.refresh_if_due()
+                            briefing_result = await self._daily_briefing_service.refresh_if_due(
+                                force=manual_briefing_requested
+                            )
                         if briefing_result.get("ran"):
                             logger.info("Home daily briefing refresh: %s", briefing_result)
                     except Exception:

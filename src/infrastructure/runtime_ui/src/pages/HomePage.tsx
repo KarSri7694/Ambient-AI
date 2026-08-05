@@ -79,6 +79,10 @@ export function HomePage({ onNavigate }: { onNavigate: (path: string) => void })
       client.invalidateQueries({ queryKey: ["proactive-inbox"] });
     },
   });
+  const briefingRefreshMutation = useMutation({
+    mutationFn: () => sendJson("/api/home/briefing/refresh", "POST"),
+    onSuccess: () => client.invalidateQueries({ queryKey: ["home"] }),
+  });
   const data = query.data;
   const today = data?.today || clientToday;
   const selectDate = (value: string) => {
@@ -121,7 +125,15 @@ export function HomePage({ onNavigate }: { onNavigate: (path: string) => void })
         <span>{new Date(`${selectedDate}T12:00:00`).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}</span>
         <Button variant="secondary" disabled={selectedDate >= today} onClick={() => selectDate(moveDate(selectedDate, 1))} aria-label="Next day"><ArrowRight size={16} /></Button>
         {(manualDate || selectedDate !== today) && <Button variant="ghost" onClick={selectToday}>Today</Button>}
-        <Button variant="ghost" onClick={() => query.refetch()} disabled={query.isFetching} aria-label="Refresh Home"><RefreshCw className={query.isFetching ? "animate-spin" : ""} size={16} /></Button>
+        <Button
+          variant="ghost"
+          onClick={() => briefingRefreshMutation.mutate()}
+          disabled={briefingRefreshMutation.isPending || briefingRefresh.running}
+          aria-label="Refresh daily digest"
+          title="Refresh daily digest"
+        >
+          <RefreshCw className={briefingRefreshMutation.isPending || briefingRefresh.running ? "animate-spin" : ""} size={16} />
+        </Button>
       </div>
     </section>
 

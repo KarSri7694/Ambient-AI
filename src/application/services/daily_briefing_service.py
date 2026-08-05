@@ -101,10 +101,10 @@ class DailyBriefingService:
             },
         }
 
-    async def refresh_if_due(self) -> dict[str, Any]:
+    async def refresh_if_due(self, *, force: bool = False) -> dict[str, Any]:
         if not self.enabled or not self.model:
             return {"ran": False, "reason": "disabled"}
-        if self._retry_after and datetime.now(timezone.utc) < self._retry_after:
+        if not force and self._retry_after and datetime.now(timezone.utc) < self._retry_after:
             return {"ran": False, "reason": "retry_backoff"}
         local_now = datetime.now().astimezone()
         # The visible current-day briefing must never be blocked by a historical
@@ -115,9 +115,9 @@ class DailyBriefingService:
             if not collected["meaningful"]:
                 continue
             cached = self.autonomy_store.get_daily_briefing(selected.isoformat())
-            if cached and cached.get("source_watermark") == collected["watermark"]:
+            if not force and cached and cached.get("source_watermark") == collected["watermark"]:
                 continue
-            if cached and selected == local_now.date():
+            if not force and cached and selected == local_now.date():
                 generated = self._parse_timestamp(cached.get("generated_at"))
                 if generated and (datetime.now(timezone.utc) - generated).total_seconds() < self.cooldown_minutes * 60:
                     continue

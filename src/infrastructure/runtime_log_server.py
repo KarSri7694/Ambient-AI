@@ -409,6 +409,15 @@ def create_runtime_log_app(
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
 
+    @app.post("/api/home/briefing/refresh")
+    def refresh_home_briefing() -> dict[str, Any]:
+        if runtime_control is None or not hasattr(runtime_control, "request_daily_briefing_refresh"):
+            raise HTTPException(status_code=503, detail="daily_briefing_unavailable")
+        result = runtime_control.request_daily_briefing_refresh()
+        if not result.get("ok"):
+            raise HTTPException(status_code=503, detail=result.get("error", "daily_briefing_unavailable"))
+        return result
+
     @app.get("/api/real-world/suites")
     def get_real_world_suites() -> dict[str, Any]:
         if real_world_lab is None:
