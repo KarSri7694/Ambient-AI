@@ -1816,6 +1816,24 @@ class SQLiteMemoryAdapter(MemoryPort):
     def save_working_memory(self, content: str) -> None:
         self.working_memory_path.write_text(content, encoding="utf-8")
 
+    def append_working_memory(self, content: str) -> bool:
+        """Append a non-empty working-memory entry unless it is an exact duplicate.
+
+        Returns ``True`` when the file changed. The append is intentionally
+        line-oriented so the reflection service can continue to clean the file
+        as normal markdown working memory.
+        """
+        entry = str(content or "").strip()
+        if not entry:
+            return False
+        existing = self.get_working_memory().rstrip()
+        existing_lines = {line.strip() for line in existing.splitlines() if line.strip()}
+        if entry in existing_lines:
+            return False
+        updated = f"{existing}\n{entry}\n" if existing else f"{entry}\n"
+        self.save_working_memory(updated)
+        return True
+
     def get_working_memory(self) -> str:
         if not self.working_memory_path.exists():
             return ""

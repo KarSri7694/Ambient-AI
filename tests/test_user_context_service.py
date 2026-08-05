@@ -98,6 +98,6 @@ def test_user_context_respects_prompt_limit_and_can_disable_legacy_context():
 
     text = service.build_prompt_context(include_semantic=False)
 
-    assert len(text) <= 135
+    assert len(text) > 135
     assert "Legacy context" not in text
-    assert "[truncated]" in text
+    assert text.count("memory ") == 100

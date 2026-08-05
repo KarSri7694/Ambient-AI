@@ -206,6 +206,44 @@ def get_current_datetime():
     """
     return datetime.datetime.now().isoformat()
 
+
+@mcp.tool
+def write_to_memory(
+    content: Annotated[
+        str,
+        "A concise user preference, durable personal fact, active concern, or useful working-memory note to remember",
+    ],
+    category: Annotated[
+        str,
+        "Memory category: preference, fact, concern, plan, or reminder",
+    ] = "fact",
+):
+    """Write a concise user-related note to the durable MEMORY.md file.
+
+    Use this only for information about the user that will improve future
+    assistance. Do not store secrets, credentials, raw transcripts, or
+    speculative claims. Exact duplicate entries are ignored.
+    """
+    entry = str(content or "").strip()
+    if not entry:
+        return {"status": "error", "message": "content must not be empty"}
+    normalized_category = str(category or "fact").strip().lower()
+    allowed_categories = {"preference", "fact", "concern", "plan", "reminder"}
+    if normalized_category not in allowed_categories:
+        return {
+            "status": "error",
+            "message": f"category must be one of: {', '.join(sorted(allowed_categories))}",
+        }
+    memory = SQLiteMemoryAdapter(db_path=MEMORY_DB_PATH, memory_root=MEMORY_ROOT)
+    formatted_entry = f"- **{normalized_category}:** {entry}"
+    changed = memory.append_working_memory(formatted_entry)
+    return {
+        "status": "saved" if changed else "duplicate",
+        "category": normalized_category,
+        "content": entry,
+        "path": str(memory.working_memory_path),
+    }
+
 @mcp.tool
 def add_task(content :Annotated[str, "The content of the reminder/to-do to be added"] ,
              due_datetime : Annotated[str, "Due date and time in YYYY-MM-DDTHH:MM:SS format"],

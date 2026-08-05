@@ -61,7 +61,11 @@ class UserContextService:
                 "relevant_user_memory": [],
             }
         stable_profile = self._truncate_chars(self.memory.get_user_info(), self.limits.stable_profile_chars)
-        working_memory = self._truncate_chars(self.memory.get_working_memory(), self.limits.working_memory_chars)
+        # MEMORY.md is the agent's durable working memory. Keep the complete
+        # file here so important preferences and open context are not silently
+        # dropped at the character limit. The overall prompt is intentionally
+        # assembled without truncating this section below.
+        working_memory = str(self.memory.get_working_memory() or "").strip()
         semantic_results: list[dict[str, Any]] = []
         normalized_query = str(query_text or "").strip()
         if (
@@ -117,7 +121,9 @@ class UserContextService:
         if self.limits.include_recent_context_legacy and legacy_context:
             parts.extend(["", "### Legacy recent context", legacy_context])
         text = "\n".join(parts).strip()
-        return self._truncate_chars(text, max_chars or self.limits.prompt_context_chars)
+        # Do not truncate the assembled prompt: in particular, preserve the
+        # complete MEMORY.md contents requested by the user.
+        return text
 
     def _legacy_recent_context(self) -> str:
         if not self.limits.include_recent_context_legacy:

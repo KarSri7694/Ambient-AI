@@ -55,7 +55,7 @@ def _write_report(output_dir: Path, *, preflight: dict[str, object], tuning: dic
             f"- Run status: {tuning.get('status')}",
             f"- Run id: {tuning.get('run_id')}",
             f"- Completed candidates: {len(completed)}",
-            f"- Best median TTFT: {(latest.get('summary') or {}).get('ttft_seconds_median')}",
+            f"- Best median client time to first visible token: {(latest.get('summary') or {}).get('ttft_seconds_median')}",
             f"- Best chars/sec: {(latest.get('summary') or {}).get('chars_per_second_median')}",
             "",
             "Artifacts: preflight.json, rocm_tuning.json, rocm_tuning.csv, tuned_models_preset.ini",
