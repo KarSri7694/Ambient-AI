@@ -105,6 +105,74 @@ def test_queued_capture_policy_is_not_reapplied_after_the_policy_changes(tmp_pat
     assert queued_route == "fast_model"
 
 
+def test_capture_boundary_blocks_excluded_apps_and_domains_before_pixels(tmp_path):
+    class ScreenCapture:
+        def __init__(self):
+            self.calls = 0
+
+        def capture_screenshot(self, output_path):
+            self.calls += 1
+            Path(output_path).write_bytes(b"pixels")
+            return output_path
+
+    control = CaptureControlService(
+        excluded_apps=["Visual Studio Code"],
+        excluded_domains=["netflix.com"],
+    )
+    capture = ScreenCapture()
+    observer = PassiveObserverService(
+        memory=SimpleNamespace(),
+        llm_provider=SimpleNamespace(),
+        screen_capture=capture,
+        screenshot_root=str(tmp_path / "screens"),
+        capture_control=control,
+    )
+
+    assert observer.capture_screenshot(context={
+        "process_name": "Code.exe",
+        "app_name": "Visual Studio Code",
+    }) is None
+    assert observer.capture_screenshot(context={
+        "process_name": "firefox.exe",
+        "url": "https://www.netflix.com/browse",
+    }) is None
+    assert capture.calls == 0
+
+
+def test_capture_boundary_rechecks_foreground_after_the_loop_context_was_collected(tmp_path):
+    class ScreenCapture:
+        def __init__(self):
+            self.calls = 0
+
+        def capture_screenshot(self, output_path):
+            self.calls += 1
+            Path(output_path).write_bytes(b"pixels")
+            return output_path
+
+    class UIAT:
+        def inspect_foreground_window(self):
+            return {
+                "process_name": "firefox.exe",
+                "window_title": "Netflix â€” Mozilla Firefox",
+                "foreground_url": "https://www.netflix.com/browse",
+            }
+
+    capture = ScreenCapture()
+    observer = PassiveObserverService(
+        memory=SimpleNamespace(),
+        llm_provider=SimpleNamespace(),
+        screen_capture=capture,
+        screenshot_root=str(tmp_path / "screens"),
+        capture_control=CaptureControlService(excluded_domains=["netflix.com"]),
+        uiat_adapter=UIAT(),
+    )
+    stale_context = {"process_name": "explorer.exe", "app_name": "File Explorer"}
+
+    assert observer.capture_screenshot(context=stale_context) is None
+    assert stale_context["domain"] == "www.netflix.com"
+    assert capture.calls == 0
+
+
 def test_firefox_accessibility_toolbar_url_reaches_domain_policy(tmp_path):
     control = CaptureControlService(excluded_domains=["127.0.0.1", "netflix.com"])
     observer = PassiveObserverService(

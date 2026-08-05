@@ -244,7 +244,41 @@ Keep summaries brief and preserve the input order."""
         if self.interrupt_checker is not None:
             self.interrupt_checker()
 
-    def capture_screenshot(self) -> str:
+    def capture_screenshot(self, *, context: Dict[str, Any] | None = None) -> str | None:
+        """Capture pixels only after a final foreground-policy check.
+
+        The runtime loop performs an earlier check to avoid unnecessary work,
+        but this method is also used by direct observation callers.  Keeping a
+        second check at the capture boundary prevents either path from taking a
+        screenshot when the foreground window changed to an excluded app or
+        domain between metadata collection and capture.
+        """
+        if self.capture_control is not None:
+            # The loop's context may be a few milliseconds old. Re-inspect the
+            # foreground here so a tab/app switch cannot slip pixels through
+            # between its first policy check and the actual screen capture.
+            fresh_context = self.capture_lightweight_context()
+            has_foreground_identity = any(
+                fresh_context.get(key)
+                for key in ("process_name", "app_name", "window_title", "url", "domain")
+            )
+            capture_context = fresh_context if has_foreground_identity else dict(context or {})
+            if isinstance(context, dict) and has_foreground_identity:
+                context.clear()
+                context.update(capture_context)
+            decision = self.capture_control.evaluate_context(capture_context)
+            if isinstance(context, dict):
+                context["capture_decision"] = decision
+            if decision["excluded"]:
+                self.logger.info(
+                    "Blocked screenshot at capture boundary: %s exclusion %r matched process=%r app=%r domain=%r.",
+                    decision.get("match_type"),
+                    decision.get("matched_rule"),
+                    capture_context.get("process_name"),
+                    capture_context.get("app_name"),
+                    capture_context.get("domain") or capture_context.get("url"),
+                )
+                return None
         screenshot_path = self._capture_path()
         return str(Path(self.screen_capture.capture_screenshot(str(screenshot_path))))
 
@@ -417,11 +451,27 @@ Keep summaries brief and preserve the input order."""
         return observations
 
     async def observe(self, *, model: str, recent_context: str) -> Optional[VisualObservation]:
-        screenshot_path = self.capture_screenshot()
+        context = self.capture_lightweight_context()
+        screenshot_path = self.capture_screenshot(context=context)
+        if screenshot_path is None:
+            return None
         return await self.process_screenshot(
             screenshot_path=screenshot_path,
             model=model,
             recent_context=recent_context,
+            uiat_context_override={
+                "window_title": context.get("window_title"),
+                "window_class": context.get("window_class"),
+                "process_id": context.get("process_id"),
+                "process_name": context.get("process_name"),
+                "app_hint": context.get("app_name"),
+                "foreground_url": context.get("url"),
+                "domain_hint": context.get("domain"),
+                "visible_text_summary": context.get("accessible_text"),
+                "contains_dialog": context.get("contains_dialog"),
+                "contains_notification": context.get("contains_notification"),
+                "capture_policy_applied": True,
+            },
         )
 
     def _observation_from_parsed(

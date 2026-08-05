@@ -1508,8 +1508,6 @@ class AmbientRuntime:
                         )
                         self._screenshot_capture_stop_event.wait(capture_interval_seconds)
                         continue
-                    lightweight_context["capture_policy_applied"] = True
-                    lightweight_context["capture_decision"] = capture_decision
                     if system_idle_service.is_user_idle() and not (
                         RECURRING_TASKS_ENABLED
                         and RECURRING_TASKS_IDLE_SCREEN_MONITORING
@@ -1522,7 +1520,16 @@ class AmbientRuntime:
                         self._screenshot_capture_stop_event.wait(capture_interval_seconds)
                         continue
 
-                    screenshot_path = passive_observer.capture_screenshot()
+                    screenshot_path = passive_observer.capture_screenshot(context=lightweight_context)
+                    if screenshot_path is None:
+                        # The foreground changed after the loop's first check.
+                        # capture_screenshot rechecked policy immediately before
+                        # taking pixels and rejected the new excluded context.
+                        self._screenshot_capture_stop_event.wait(capture_interval_seconds)
+                        continue
+                    capture_decision = lightweight_context.get("capture_decision", capture_decision)
+                    lightweight_context["capture_policy_applied"] = True
+                    lightweight_context["capture_decision"] = capture_decision
                     queued = screenshot_queue.enqueue(
                         screenshot_path,
                         retain=autonomy_coordinator is None,
