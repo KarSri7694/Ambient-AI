@@ -140,6 +140,7 @@ class RecurringTask:
     status: str
     interval_seconds: int
     next_run_at: str
+    schedule_time_local: str | None = None
     monitor_condition: str = ""
     stop_condition: str = ""
     source_scope_json: str = "{}"

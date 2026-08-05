@@ -76,3 +76,23 @@ def test_todoist_sync_requires_ambient_label(tmp_path):
     task = service.list()[0]
     assert task.origin_kind == "todoist"
     assert task.interval_seconds == 7200
+
+
+def test_daily_schedule_uses_requested_local_wall_clock_time(tmp_path):
+    service = _service(tmp_path)
+    task = service.create(
+        title="Daily rates", instruction="Find rates at 10:00 AM daily", task_kind="interval",
+        interval_seconds=86400,
+    )
+    assert task.schedule_time_local == "10:00"
+    assert task.next_run_at.endswith("+00:00")
+    assert task.next_run_at != task.created_at
+
+
+def test_manual_run_can_reactivate_cancelled_task_but_not_completed(tmp_path):
+    service = _service(tmp_path)
+    task = service.create(title="Rates", instruction="Find rates", task_kind="interval")
+    service.set_status(task.task_id, "cancelled")
+    assert service.store.run_recurring_task_now(task.task_id).status == "active"
+    service.set_status(task.task_id, "completed")
+    assert service.store.run_recurring_task_now(task.task_id) is None

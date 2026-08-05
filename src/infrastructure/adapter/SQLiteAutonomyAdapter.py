@@ -278,6 +278,7 @@ class SQLiteAutonomyAdapter(AutonomyStorePort):
                     status TEXT NOT NULL,
                     interval_seconds INTEGER NOT NULL,
                     next_run_at TEXT NOT NULL,
+                    schedule_time_local TEXT,
                     monitor_condition TEXT NOT NULL DEFAULT '',
                     stop_condition TEXT NOT NULL DEFAULT '',
                     source_scope_json TEXT NOT NULL DEFAULT '{}',
@@ -345,6 +346,11 @@ class SQLiteAutonomyAdapter(AutonomyStorePort):
                 conn.execute(
                     "ALTER TABLE daily_briefings ADD COLUMN failures_json TEXT NOT NULL DEFAULT '[]'"
                 )
+            recurring_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(recurring_tasks)").fetchall()
+            }
+            if "schedule_time_local" not in recurring_columns:
+                conn.execute("ALTER TABLE recurring_tasks ADD COLUMN schedule_time_local TEXT")
             self.recovered_future_capture_timestamps = self._repair_future_capture_timestamps(conn)
 
     @staticmethod
@@ -1611,15 +1617,16 @@ class SQLiteAutonomyAdapter(AutonomyStorePort):
         with self._lock, self._connect() as conn:
             conn.execute(
                 """INSERT INTO recurring_tasks(task_id,title,instruction,task_kind,source_kind,status,
-                   interval_seconds,next_run_at,monitor_condition,stop_condition,source_scope_json,
+                   interval_seconds,next_run_at,schedule_time_local,monitor_condition,stop_condition,source_scope_json,
                    safe_actions_json,origin_kind,origin_ref,last_result_json,created_at,updated_at,
                    last_run_at,completed_at)
                    VALUES (:task_id,:title,:instruction,:task_kind,:source_kind,:status,:interval_seconds,
-                   :next_run_at,:monitor_condition,:stop_condition,:source_scope_json,:safe_actions_json,
+                   :next_run_at,:schedule_time_local,:monitor_condition,:stop_condition,:source_scope_json,:safe_actions_json,
                    :origin_kind,:origin_ref,:last_result_json,:created_at,:updated_at,:last_run_at,:completed_at)
                    ON CONFLICT(task_id) DO UPDATE SET title=excluded.title,instruction=excluded.instruction,
                    task_kind=excluded.task_kind,source_kind=excluded.source_kind,status=excluded.status,
                    interval_seconds=excluded.interval_seconds,next_run_at=excluded.next_run_at,
+                   schedule_time_local=excluded.schedule_time_local,
                    monitor_condition=excluded.monitor_condition,stop_condition=excluded.stop_condition,
                    source_scope_json=excluded.source_scope_json,safe_actions_json=excluded.safe_actions_json,
                    origin_kind=excluded.origin_kind,origin_ref=excluded.origin_ref,
@@ -1666,7 +1673,7 @@ class SQLiteAutonomyAdapter(AutonomyStorePort):
     def run_recurring_task_now(self, task_id: str) -> RecurringTask | None:
         with self._lock, self._connect() as conn:
             cursor = conn.execute(
-                "UPDATE recurring_tasks SET status='active', next_run_at=?, updated_at=? WHERE task_id=? AND status NOT IN ('cancelled','completed')",
+                "UPDATE recurring_tasks SET status='active', next_run_at=?, completed_at=NULL, updated_at=? WHERE task_id=? AND status NOT IN ('completed')",
                 (_utciso(), _utciso(), task_id),
             )
             if not cursor.rowcount:

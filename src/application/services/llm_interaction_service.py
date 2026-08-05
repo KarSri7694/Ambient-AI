@@ -2184,6 +2184,7 @@ class LLMInteractionService:
                         task_kind=str(tool_args.get("task_kind", "")),
                         source_kind=str(tool_args.get("source_kind", "screen")),
                         interval_seconds=int(tool_args.get("interval_seconds", 1800) or 1800),
+                        schedule_time_local=str(tool_args.get("schedule_time_local", "") or ""),
                         monitor_condition=str(tool_args.get("monitor_condition", "")),
                         stop_condition=str(tool_args.get("stop_condition", "")),
                         source_scope=source_scope,

@@ -525,7 +525,8 @@ class AmbientRuntime:
         "standalone task and an absolute ISO 8601 date-time. If the requested time is ambiguous, ask a short "
         "clarifying question instead of guessing. For a request to monitor a condition until it changes or "
         "to repeat work at an interval, call create_recurring_task with a factual completion condition, a "
-        "bounded interval, and only explicitly requested safe actions. Execute explicitly requested immediate tasks now."
+        "bounded interval, and only explicitly requested safe actions. For daily requests with a wall-clock time, "
+        "also pass schedule_time_local in the user's local time (for example 10:00 AM). Execute explicitly requested immediate tasks now."
     )
 
     def __init__(   

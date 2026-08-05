@@ -1137,7 +1137,7 @@ def create_runtime_log_app(
             if task is None:
                 raise HTTPException(status_code=404, detail="recurring_task_not_runnable")
             return {"ok": True, "task": _as_dict(task)}
-        mapping = {"pause": "paused", "resume": "active", "cancel": "cancelled"}
+        mapping = {"pause": "paused", "resume": "active", "restart": "active", "cancel": "cancelled"}
         if action not in mapping:
             raise HTTPException(status_code=400, detail="unsupported_action")
         task = autonomy_store.update_recurring_task_status(task_id, mapping[action])

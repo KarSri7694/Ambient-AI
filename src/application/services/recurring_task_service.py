@@ -26,6 +26,37 @@ def _iso(value: datetime | None = None) -> str:
     return (value or _utcnow()).isoformat()
 
 
+def _normalize_schedule_time(value: str) -> str | None:
+    match = re.fullmatch(r"\s*(\d{1,2})(?::(\d{2}))?\s*([ap]m)?\s*", str(value or ""), re.IGNORECASE)
+    if not match:
+        return None
+    hour = int(match.group(1))
+    minute = int(match.group(2) or 0)
+    meridiem = (match.group(3) or "").lower()
+    if minute > 59 or (not meridiem and hour > 23) or (meridiem and not 1 <= hour <= 12):
+        return None
+    if meridiem:
+        hour = (hour % 12) + (12 if meridiem == "pm" else 0)
+    return f"{hour:02d}:{minute:02d}"
+
+
+def _time_from_instruction(instruction: str) -> str | None:
+    match = re.search(r"\b(?:at|around|by)\s+(\d{1,2})(?::(\d{2}))?\s*([ap]m)\b", instruction, re.IGNORECASE)
+    if not match:
+        return None
+    hour, minute, meridiem = match.groups()
+    return _normalize_schedule_time(f"{hour}:{minute or '00'} {meridiem}")
+
+
+def _next_local_time(schedule_time: str, *, now: datetime | None = None) -> datetime:
+    local_now = (now or _utcnow()).astimezone()
+    hour, minute = (int(part) for part in schedule_time.split(":"))
+    candidate = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if candidate <= local_now:
+        candidate += timedelta(days=1)
+    return candidate.astimezone(timezone.utc)
+
+
 class RecurringTaskService:
     """Coordinates interval tasks and monitor state using the autonomy store."""
 
@@ -59,6 +90,7 @@ class RecurringTaskService:
         task_kind: str,
         source_kind: str = "screen",
         interval_seconds: int | None = None,
+        schedule_time_local: str | None = None,
         monitor_condition: str = "",
         stop_condition: str = "",
         source_scope: dict[str, Any] | None = None,
@@ -77,7 +109,11 @@ class RecurringTaskService:
         if len(self.store.list_recurring_tasks(status="active", limit=self.max_active_tasks + 1)) >= self.max_active_tasks:
             raise RuntimeError(f"maximum active recurring tasks reached ({self.max_active_tasks})")
         seconds = max(self.minimum_interval_seconds, int(interval_seconds or self.default_interval_seconds))
-        now = _iso()
+        normalized_time = _normalize_schedule_time(schedule_time_local) or (
+            _time_from_instruction(normalized_instruction) if kind == "interval" else None
+        )
+        now_dt = _utcnow()
+        now = _iso(now_dt)
         task = RecurringTask(
             task_id=uuid.uuid4().hex,
             title=str(title or normalized_instruction[:100]).strip()[:160],
@@ -86,7 +122,8 @@ class RecurringTaskService:
             source_kind=str(source_kind or "screen").strip().lower(),
             status="active",
             interval_seconds=seconds,
-            next_run_at=now,
+            next_run_at=_iso(_next_local_time(normalized_time, now=now_dt) if normalized_time else now_dt),
+            schedule_time_local=normalized_time,
             monitor_condition=str(monitor_condition or "").strip(),
             stop_condition=str(stop_condition or "").strip(),
             source_scope_json=json.dumps(source_scope or {}, ensure_ascii=False),
@@ -117,7 +154,11 @@ class RecurringTaskService:
 
     def mark_run_finished(self, task: RecurringTask, *, result: dict[str, Any], status: str = "active") -> RecurringTask | None:
         now = _utcnow()
-        next_run = now + timedelta(seconds=max(self.minimum_interval_seconds, task.interval_seconds))
+        next_run = (
+            _next_local_time(task.schedule_time_local, now=now)
+            if task.schedule_time_local
+            else now + timedelta(seconds=max(self.minimum_interval_seconds, task.interval_seconds))
+        )
         return self.store.record_recurring_task_run(
             task.task_id,
             result=result,

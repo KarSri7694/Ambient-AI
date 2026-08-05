@@ -699,6 +699,7 @@ async def create_recurring_task(
     task_kind: Annotated[str, "interval for repeated work, monitor for a change/condition"],
     source_kind: Annotated[str, "screen, gmail, calendar, or another approved read-only source"] = "screen",
     interval_seconds: Annotated[int, "How often to check or run, at least 10 seconds"] = 1800,
+    schedule_time_local: Annotated[str, "Optional local wall-clock time for daily tasks, HH:MM or h:MM AM/PM"] = "",
     monitor_condition: Annotated[str, "For monitors, the factual condition that ends the wait"] = "",
     stop_condition: Annotated[str, "Optional additional condition that cancels monitoring"] = "",
     source_scope: Annotated[dict, "Optional foreground source binding: app_name, process_name, domain"] = {},
