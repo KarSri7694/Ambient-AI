@@ -3,10 +3,10 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-from config import CONFIG
+from config import CONFIG, DEFAULT_USER_DATA_DIR
 
 
-USER_DATA_DIR = Path(CONFIG.get_str("runtime", "user_data_dir", "D:\\USER_DATA"))
+USER_DATA_DIR = Path(CONFIG.get_str("runtime", "user_data_dir", str(DEFAULT_USER_DATA_DIR)))
 DB_FILE = str(USER_DATA_DIR / "database" / "night_queue.db")
 
 def init_db():

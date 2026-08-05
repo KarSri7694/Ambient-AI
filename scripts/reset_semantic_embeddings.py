@@ -43,7 +43,7 @@ def _load_sqlite_vec(conn: sqlite3.Connection) -> None:
 def _resolve_memory_db(config_path: Path) -> Path:
     parser = configparser.ConfigParser()
     parser.read(config_path, encoding="utf-8")
-    user_data_dir = Path(parser.get("runtime", "user_data_dir", fallback=r"D:\USER_DATA"))
+    user_data_dir = Path(parser.get("runtime", "user_data_dir", fallback=str(Path.home() / "AmbientAI" / "data")))
     return user_data_dir / "database" / "memory.db"
 
 

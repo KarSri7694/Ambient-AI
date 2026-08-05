@@ -23,13 +23,14 @@ from utils.threading_util import run_async
 import yt_dlp
 from application.services.semantic_deduplication_service import SemanticDeduplicationService
 from application.services.ddgs_search_service import DdgsSearchService
-from config import CONFIG
+from config import CONFIG, DEFAULT_USER_DATA_DIR, PROJECT_ROOT
 from infrastructure.adapter.LoggingLLMProvider import LoggingLLMProvider
 from infrastructure.adapter.llamaCppAdapter import LlamaCppAdapter
 from infrastructure.adapter.SQLiteInteractionLogAdapter import SQLiteInteractionLogAdapter
 from infrastructure.adapter.SQLiteMemoryAdapter import SQLiteMemoryAdapter
 import csv
 import subprocess
+from pathlib import Path
 
 mcp = FastMCP("My MCP Server")
 
@@ -41,10 +42,10 @@ FIRECRAWL_API_KEY = CONFIG.get_str("firecrawl", "api_key", "").strip()
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 SCOPES = ['https://www.googleapis.com/auth/calendar.events']
-USER_DATA_DIR = CONFIG.get_str("runtime", "user_data_dir", "D:\\USER_DATA")
-MEMORY_DB_PATH = os.path.join(USER_DATA_DIR, "database", "memory.db")
-MEMORY_ROOT = os.path.join(USER_DATA_DIR, "memory")
-INTERACTION_LOG_DB_PATH = os.path.join(USER_DATA_DIR, "database", "interaction_logs.db")
+USER_DATA_DIR = Path(CONFIG.get_str("runtime", "user_data_dir", str(DEFAULT_USER_DATA_DIR))).expanduser()
+MEMORY_DB_PATH = str(USER_DATA_DIR / "database" / "memory.db")
+MEMORY_ROOT = str(USER_DATA_DIR / "memory")
+INTERACTION_LOG_DB_PATH = str(USER_DATA_DIR / "database" / "interaction_logs.db")
 SEMANTIC_DEDUPE_MODEL = CONFIG.get_model("model", CONFIG.get_str("runtime", "default_model", ""), section="semantic_dedupe")
 SEMANTIC_DEDUPE_ENABLED = CONFIG.get_bool("semantic_dedupe", "enabled", True)
 SEMANTIC_DEDUPE_CANDIDATE_LIMIT = CONFIG.get_int("semantic_dedupe", "candidate_limit", 8)
@@ -129,7 +130,7 @@ def _record_skipped_candidate(
 
 def read_model_details() -> list[dict[str, str]]:
     """Load model metadata from the project-local model registry."""
-    details_path = os.path.join("D:\\Projects\\ambient_ai", "model_details.csv")
+    details_path = PROJECT_ROOT / "model_details.csv"
     models: list[dict[str, str]] = []
     if not os.path.exists(details_path):
         return models
@@ -153,8 +154,9 @@ def read_model_details() -> list[dict[str, str]]:
     return models
 
 def connect_facts_db():
-    db_path = os.path.join("D:\\Projects\\ambient_ai\\database", "facts.db")
-    conn = sqlite3.connect(db_path)
+    db_path = USER_DATA_DIR / "database" / "facts.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
     cursor = conn.cursor()
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS facts (
@@ -169,8 +171,12 @@ def connect_facts_db():
 
 def get_calendar_service():
     creds = None
-    token_path = os.path.join("D:\\Projects\\ambient_ai", 'token.pickle')
-    creds_path = os.path.join("D:\\Projects\\ambient_ai", 'credentials.json')  # put OAuth client secrets here
+    token_path = Path(CONFIG.get_str("integrations", "google_token_path", str(PROJECT_ROOT / "token.pickle"))).expanduser()
+    creds_path = Path(CONFIG.get_str("integrations", "google_credentials_path", str(PROJECT_ROOT / "credentials.json"))).expanduser()
+    if not token_path.is_absolute():
+        token_path = PROJECT_ROOT / token_path
+    if not creds_path.is_absolute():
+        creds_path = PROJECT_ROOT / creds_path
 
     if os.path.exists(token_path):
         with open(token_path, 'rb') as token_file:
@@ -566,7 +572,7 @@ def powershell_terminal(
             capture_output=True,
             text=True,
             timeout=30,
-            cwd=r"D:\Projects\ambient_ai",
+            cwd=str(PROJECT_ROOT),
         )
     except subprocess.TimeoutExpired:
         return "Command timed out after 30 seconds."
@@ -696,7 +702,7 @@ async def use_filesystem(
     ],
     granted_paths: Annotated[
         list[str],
-        "Absolute Windows file or folder paths explicitly granted by the user for this task, e.g. C:\\Users\\Kartikeya Srivastava\\Documents or D:\\projects\\ambient_ai. Do not use Linux paths such as /home/user.",
+        "Absolute Windows file or folder paths explicitly granted by the user for this task. Do not use Linux paths such as /home/user.",
     ],
 ) -> str:
     """

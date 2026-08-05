@@ -3,7 +3,7 @@
 Examples:
     python scripts/benchmark_visual_inference.py
     python scripts/benchmark_visual_inference.py --counts 1 2 3 6 --repeat 2
-    python scripts/benchmark_visual_inference.py --capture-root D:/USERS_DATA/captures
+    python scripts/benchmark_visual_inference.py --capture-root <capture-root>
 
 The script is intentionally standalone. It does not start app.py, mutate the
 capture directory, or change runtime configuration. It reports wall-clock
@@ -252,7 +252,7 @@ async def main() -> None:
     endpoint = args.endpoint or config_value(config, "vision_runtime", "api_base_url", "") or config_value(config, "runtime", "api_base_url", "http://127.0.0.1:8080")
     api_key = args.api_key or config_value(config, "vision_runtime", "api_key", "") or config_value(config, "runtime", "api_key", "testkey")
     model = args.model or config_value(config, "models", "passive_observer_model", config_value(config, "runtime", "default_model", "Qwen3.5-4B"))
-    root = args.capture_root or Path(config_value(config, "privacy", "capture_root", "D:/USERS_DATA/captures"))
+    root = args.capture_root or Path(config_value(config, "privacy", "capture_root", str(Path.home() / "AmbientAI" / "data" / "captures")))
     counts = args.counts or [args.images]
     adapter = LlamaCppAdapter(endpoint, api_key=api_key, default_max_tokens=args.max_output_tokens)
     LOG.info("Using endpoint=%s model=%s capture_root=%s slots=%s", endpoint, model, root, args.slots)

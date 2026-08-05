@@ -169,7 +169,8 @@ class ASR:
             speaker_mapping (dict): Mapping of speaker labels to identified names.
         '''
         if self.encoder is None:
-            self.encoder = EncoderClassifier.from_hparams(source="D:\\Projects\\ambient_ai\\spkrec-ecapa-voxceleb", run_opts={"device": "cuda"})
+            model_path = Path(__file__).resolve().parents[2] / "spkrec-ecapa-voxceleb"
+            self.encoder = EncoderClassifier.from_hparams(source=str(model_path), run_opts={"device": "cuda"})
         waveform, samplerate = torchaudio.load(audio_file)
         total_sample = waveform.shape[1]
         speaker_audio_tensor = defaultdict(list)
@@ -239,7 +240,8 @@ class ASR:
             audio_file (str): Path to the audio file to process.
         '''
         if self.encoder is None:
-            EncoderClassifier.from_hparams(source="D:\\Projects\\ambient_ai\\spkrec-ecapa-voxceleb", run_opts={"device": "cuda"} )
+            model_path = Path(__file__).resolve().parents[2] / "spkrec-ecapa-voxceleb"
+            self.encoder = EncoderClassifier.from_hparams(source=str(model_path), run_opts={"device": "cuda"})
         buffer = io.BytesIO()
         waveform, samplerate = torchaudio.load(audio_file)
         with self.connect_db() as conn:

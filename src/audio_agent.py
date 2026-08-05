@@ -20,7 +20,7 @@ from infrastructure.adapter.ecapaVoxcelebAdapter import EcapaVoxcelebAdapter
 from infrastructure.adapter.SQLiteVoiceAdapter import SQLiteVoiceAdapter
 from application.services.system_idle_service import SystemIdleService
 from core.models import AmbientEvent, DiarizationResult, InferenceRequest, TranscriptionResult
-from config import CONFIG
+from config import CONFIG, DEFAULT_USER_DATA_DIR
 from infrastructure.accelerator import empty_accelerator_cache, enable_fast_cuda_math, resolve_torch_device
 
 enable_fast_cuda_math()
@@ -31,7 +31,7 @@ logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(levelname)s - %
 current_dir = Path(__file__).parent
 project_root = current_dir.parent
 
-USER_DATA_DIR = Path(CONFIG.get_str("runtime", "user_data_dir", "D:\\USER_DATA"))
+USER_DATA_DIR = Path(CONFIG.get_str("runtime", "user_data_dir", str(DEFAULT_USER_DATA_DIR)))
 UPLOAD_DIR = Path(CONFIG.get_str("audio", "uploads_dir", str(USER_DATA_DIR / "uploads")))
 VOICE_DB = CONFIG.get_str("audio", "voice_db", "database/voice_database.db")
 TRANSCRIPTIONS_DIR = Path(CONFIG.get_str("audio", "transcriptions_dir", str(USER_DATA_DIR / "transcriptions")))

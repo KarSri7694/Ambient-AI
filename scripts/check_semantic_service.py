@@ -192,7 +192,7 @@ if __name__ == "__main__":
         print(f"\nFAIL: semantic endpoint request failed: {exc}", file=sys.stderr)
         print(
             "Start the semantic server, for example:\n"
-            "  llama-server --models-preset d:\\Projects\\ambient_ai\\models_preset.ini --port 8081",
+            "  llama-server --models-preset <project-root>\\models_preset.ini --port 8081",
             file=sys.stderr,
         )
         raise SystemExit(1)

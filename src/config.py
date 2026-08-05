@@ -1,9 +1,16 @@
 import configparser
+import os
 from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-CONFIG_PATH = PROJECT_ROOT / "config.ini"
+DEFAULT_USER_DATA_DIR = Path(
+    os.environ.get("AMBIENT_USER_DATA_DIR", str(Path.home() / "AmbientAI" / "data"))
+).expanduser()
+_configured_path = os.environ.get("AMBIENT_CONFIG_PATH", "").strip()
+CONFIG_PATH = Path(_configured_path).expanduser() if _configured_path else PROJECT_ROOT / "config.ini"
+if not CONFIG_PATH.exists():
+    CONFIG_PATH = PROJECT_ROOT / "config.example.ini"
 
 
 class AppConfig:

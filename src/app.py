@@ -2,6 +2,7 @@ import asyncio
 import gc
 import json
 import logging
+import os
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -74,7 +75,7 @@ from infrastructure.runtime_log_server import (
     shutdown_runtime_log_server,
     start_runtime_log_server,
 )
-from config import CONFIG
+from config import CONFIG, DEFAULT_USER_DATA_DIR, PROJECT_ROOT
 import night_mode
 from utils.todoist_helper import TodoistHelper
 
@@ -123,7 +124,7 @@ FILESYSTEM_AGENT_MODEL = CONFIG.get_model("filesystem_agent_model", FOLLOWUP_EXE
 COMPUTER_AGENT_MODEL = CONFIG.get_model("computer_agent_model", FOLLOWUP_EXECUTION_MODEL)
 CHAT_MODEL = CONFIG.get_model("chat_model", FOLLOWUP_EXECUTION_MODEL)
 LIGHTWEIGHT_CHAT_MODEL = CONFIG.get_model("lightweight_chat_model", "")
-USER_DATA_DIR = Path(CONFIG.get_str("runtime", "user_data_dir", "D:\\USER_DATA"))
+USER_DATA_DIR = Path(CONFIG.get_str("runtime", "user_data_dir", str(DEFAULT_USER_DATA_DIR)))
 PROJECT_ROOT = Path(__file__).parent.parent
 MEMORY_ROOT = USER_DATA_DIR / "memory"
 MEMORY_DB_PATH = USER_DATA_DIR / "database" / "memory.db"
@@ -131,7 +132,7 @@ INTERACTION_LOG_DB_PATH = USER_DATA_DIR / "database" / "interaction_logs.db"
 AUTONOMY_DB_PATH = USER_DATA_DIR / "database" / "autonomy.db"
 CHAT_DB_PATH = Path(CONFIG.get_str("chat", "db_path", str(USER_DATA_DIR / "database" / "chat.db")))
 BENCHMARK_DB_PATH = Path(CONFIG.get_str("benchmarking", "db_path", str(PROJECT_ROOT / "database" / "benchmarking.db")))
-TRAINING_DATA_ROOT = Path(CONFIG.get_str("training_data", "root", "D:\\TRAINING_DATA"))
+TRAINING_DATA_ROOT = Path(CONFIG.get_str("training_data", "root", str(USER_DATA_DIR / "training")))
 TRAINING_DATA_DB_PATH = Path(
     CONFIG.get_str("training_data", "db_path", str(TRAINING_DATA_ROOT / "database" / "training_data.db"))
 )
@@ -226,9 +227,19 @@ RECURRING_TASKS_TODOIST_LABEL = CONFIG.get_str("recurring_tasks", "todoist_label
 RECURRING_TASKS_TODOIST_SYNC_SECONDS = CONFIG.get_float("recurring_tasks", "todoist_sync_seconds", 60.0)
 LOG_API_ENABLED = CONFIG.get_bool("log_api", "enabled", True)
 LOG_API_HOST = CONFIG.get_str("log_api", "host", "0.0.0.0")
-LOG_API_PORT = CONFIG.get_int("log_api", "port", 8765)
+LOG_API_PORT = int(os.environ.get("AMBIENT_LOG_API_PORT", CONFIG.get_int("log_api", "port", 8765)))
 LOG_API_BUFFER_SIZE = CONFIG.get_int("log_api", "buffer_size", 2000)
-MCP_CONFIG_PATH = CONFIG.get_str("runtime", "mcp_config_path", "mcp.json")
+_mcp_override = os.environ.get("AMBIENT_MCP_CONFIG_PATH") if "AMBIENT_MCP_CONFIG_PATH" in os.environ else None
+_mcp_config_path = Path(
+    _mcp_override if _mcp_override is not None else CONFIG.get_str("runtime", "mcp_config_path", "mcp.json")
+).expanduser()
+if not _mcp_config_path.is_absolute():
+    _mcp_config_path = PROJECT_ROOT / _mcp_config_path
+if not _mcp_config_path.exists() and _mcp_config_path.name == "mcp.json":
+    _example_mcp_path = PROJECT_ROOT / "mcp.example.json"
+    if _example_mcp_path.exists():
+        _mcp_config_path = _example_mcp_path
+MCP_CONFIG_PATH = str(_mcp_config_path) if _mcp_config_path.exists() else ""
 BROWSER_MCP_SERVER_NAME = CONFIG.get_str("browser", "server_name", "playwright")
 BROWSER_BACKEND = CONFIG.get_str("browser", "backend", "fara_visual").strip().lower()
 BROWSER_AGENT_FAMILY = CONFIG.get_str("browser", "agent_family", "fara").strip().lower()
@@ -530,6 +541,10 @@ class AmbientRuntime:
     ):
         self.queue = transcription_queue
         self.gpu_lock = gpu_lock or threading.Lock()
+        # Async runtime tasks must not hold a blocking threading lock across
+        # await: a competing task would block the event loop and prevent the
+        # holder from resuming to release it.
+        self._async_gpu_lock = asyncio.Lock()
         self.audio_active_event = audio_active_event or threading.Event()
         self.llm_active_event = llm_active_event or threading.Event()
         self.chat_store = chat_store
@@ -1668,7 +1683,7 @@ class AmbientRuntime:
                                 event_callback=on_event,
                             )
                     else:
-                        with self.gpu_lock:
+                        async with self._async_gpu_lock:
                             result = await chat_service.run_interaction(
                                 user_input=user_message["content"],
                                 system_prompt=self.CHAT_SYSTEM_PROMPT,
@@ -1778,7 +1793,7 @@ class AmbientRuntime:
                     "scheduled_lateness_seconds": lateness_seconds,
                 },
             ):
-                with self.gpu_lock:
+                async with self._async_gpu_lock:
                     result = await llm_service.run_interaction(
                         user_input=task.description,
                         system_prompt=self.FOLLOWUP_EXECUTION_PROMPT,
@@ -1896,7 +1911,7 @@ class AmbientRuntime:
                 if "local_note" in safe_actions and name in {"document_create", "document_edit"}:
                     allowed_tool_names.add(name)
             with interaction_trace("recurring_task", {"recurring_task_id": task.task_id, "kind": task.task_kind}):
-                with self.gpu_lock:
+                async with self._async_gpu_lock:
                     result = await llm_service.run_interaction(
                         user_input=(
                             f"This is a recurring {task.task_kind} task. Execute only the approved, "
@@ -1927,13 +1942,25 @@ class AmbientRuntime:
     ) -> None:
         """Keep direct chat responsive while the main loop handles ambient work."""
         while not self.stop_event.is_set():
-            handled, _ = await self._process_pending_chat_turn(
-                llm_adapter=llm_adapter,
-                llm_service=llm_service,
-                services_initialized=bool(llm_adapter.status().get("loaded_model")),
-                parallel=True,
-                autonomy_coordinator=autonomy_coordinator,
-            )
+            try:
+                # This task is a long-lived scheduler.  In particular, status()
+                # may perform a remote model-state read, so keep it inside the
+                # recovery boundary as well as the per-turn processing call.
+                # A transient router/database failure must not permanently kill
+                # the dispatcher and leave queued chat turns stranded.
+                handled, _ = await self._process_pending_chat_turn(
+                    llm_adapter=llm_adapter,
+                    llm_service=llm_service,
+                    services_initialized=bool(llm_adapter.status().get("loaded_model")),
+                    parallel=True,
+                    autonomy_coordinator=autonomy_coordinator,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Direct chat dispatcher iteration failed; retrying.")
+                await asyncio.sleep(0.25)
+                continue
             if handled:
                 await asyncio.sleep(0)
                 continue
@@ -2009,7 +2036,7 @@ class AmbientRuntime:
                     reason="running manually requested reflection service",
                     model_name=REFLECTION_MODEL,
                 )
-                with self.gpu_lock:
+                async with self._async_gpu_lock:
                     result = await reflection_service.run(model=REFLECTION_MODEL)
             logger.info(
                 "Manual reflection completed: generated=%s queued=%s skipped=%s.",
@@ -2109,7 +2136,7 @@ class AmbientRuntime:
                         background=False,
                         user_active=True,
                     )
-                    with self.gpu_lock:
+                    async with self._async_gpu_lock:
                         result = await user_biodata_service.update_biodata(model=USER_BIODATA_MODEL)
             processed_count = len(result.get("processed_observation_ids", []))
             entry_count = len(result.get("entries", []))
@@ -2210,7 +2237,7 @@ class AmbientRuntime:
                     background=not manual,
                     user_active=user_active,
                 )
-                with self.gpu_lock:
+                async with self._async_gpu_lock:
                     result = await service.run(trigger_kind=trigger_kind)
             self._artifact_maintenance_retry_after = 0.0
             with self._artifact_maintenance_lock:
@@ -2278,7 +2305,7 @@ class AmbientRuntime:
                     background=True,
                     user_active=user_active,
                 )
-                with self.gpu_lock:
+                async with self._async_gpu_lock:
                     biodata_result = await user_biodata_service.update_biodata(
                         model=USER_BIODATA_MODEL
                     )
@@ -2327,7 +2354,7 @@ class AmbientRuntime:
                     background=True,
                     user_active=False,
                 )
-                with self.gpu_lock:
+                async with self._async_gpu_lock:
                     reflection_result = await reflection_service.run_if_due(model=REFLECTION_MODEL)
             self._automatic_reflection_retry_after = 0.0
             ran = bool(reflection_result.get("ran"))
@@ -2846,7 +2873,7 @@ class AmbientRuntime:
                                 )
                                 llm_service.reset_context()
                                 try:
-                                    with self.gpu_lock:
+                                    async with self._async_gpu_lock:
                                         result = await llm_service.run_interaction(
                                             user_input=transcript_text,
                                             system_prompt=self.TRANSCRIPT_EXECUTION_PROMPT,
@@ -2908,7 +2935,7 @@ class AmbientRuntime:
                             )
                             llm_service.reset_context()
                             try:
-                                with self.gpu_lock:
+                                async with self._async_gpu_lock:
                                     result = await llm_service.run_interaction(
                                         user_input=task.get("content", ""),
                                         system_prompt=self.TODOIST_EXECUTION_PROMPT,
@@ -2952,7 +2979,7 @@ class AmbientRuntime:
                                 reason="processing queued passive-observer screenshots",
                                 model_name=PASSIVE_OBSERVER_MODEL,
                             )
-                            with self.gpu_lock:
+                            async with self._async_gpu_lock:
                                 observations = await passive_observer.process_screenshot_batch(
                                     screenshots=[
                                         {
@@ -3044,7 +3071,7 @@ class AmbientRuntime:
                                 "results": processed_results,
                             }
                         else:
-                            with self.gpu_lock:
+                            async with self._async_gpu_lock:
                                 visual_result = await _process_visual_batch()
                         if visual_result.get("processed"):
                             biodata_context_events_since_update += int(visual_result.get("count") or 1)
@@ -3105,7 +3132,7 @@ class AmbientRuntime:
                                 "autonomy_resource_batch",
                                 {"user_idle": user_idle_now, "resource_preset": self.resource_governor.preset},
                             ):
-                                with self.gpu_lock:
+                                async with self._async_gpu_lock:
                                     if self._chat_turn_ready():
                                         autonomy_result = {
                                             "processed": False,
@@ -3329,7 +3356,7 @@ class AmbientRuntime:
                             background=True,
                             user_active=False,
                         )
-                        with self.gpu_lock:
+                        async with self._async_gpu_lock:
                             sweep_result = await proactive_sweep_service.run_if_due(
                                 idle_cycle_key=proactive_idle_cycle_key
                             )
@@ -3364,7 +3391,7 @@ class AmbientRuntime:
                                 reason="processing deferred always-on passive follow-up",
                                 model_name=PASSIVE_FOLLOWUP_MODEL,
                             )
-                            with self.gpu_lock:
+                            async with self._async_gpu_lock:
                                 followup_result = await passive_followup.process_observations(
                                     observations=[observation],
                                     model=PASSIVE_FOLLOWUP_MODEL,
@@ -3396,7 +3423,7 @@ class AmbientRuntime:
                             )
                             llm_service.reset_context()
                             try:
-                                with self.gpu_lock:
+                                async with self._async_gpu_lock:
                                     result = await llm_service.run_interaction(
                                         user_input=activity,
                                         system_prompt=self.FOLLOWUP_EXECUTION_PROMPT,
@@ -3419,7 +3446,7 @@ class AmbientRuntime:
                                 reason="running passive observer follow-up",
                                 model_name=PASSIVE_FOLLOWUP_MODEL,
                             )
-                            with self.gpu_lock:
+                            async with self._async_gpu_lock:
                                 followup_result = await passive_followup.maybe_queue_followup(
                                     model=PASSIVE_FOLLOWUP_MODEL
                                 )
@@ -3462,7 +3489,7 @@ class AmbientRuntime:
                             )
                             llm_service.reset_context()
                             try:
-                                with self.gpu_lock:
+                                async with self._async_gpu_lock:
                                     result = await llm_service.run_interaction(
                                         user_input=task.description,
                                         system_prompt=self.FOLLOWUP_EXECUTION_PROMPT,
@@ -3494,7 +3521,7 @@ class AmbientRuntime:
                                 reason="running reflection service",
                                 model_name=REFLECTION_MODEL,
                             )
-                            with self.gpu_lock:
+                            async with self._async_gpu_lock:
                                 reflection_result = await reflection_service.run_if_due(model=REFLECTION_MODEL)
                             idle_unit_attempted = bool(reflection_result.get("ran"))
                             idle_unit_completed = idle_unit_attempted
@@ -3550,7 +3577,7 @@ class AmbientRuntime:
                             background=True,
                             user_active=False,
                         )
-                        with self.gpu_lock:
+                        async with self._async_gpu_lock:
                             briefing_result = await self._daily_briefing_service.refresh_if_due()
                         if briefing_result.get("ran"):
                             logger.info("Home daily briefing refresh: %s", briefing_result)
@@ -3789,3 +3816,4 @@ if __name__ == "__main__":
         if runtime_log_started:
             shutdown_runtime_log_server(join_timeout=10.0, remove_log_handler=True)
         gc.collect()
+

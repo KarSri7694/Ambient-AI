@@ -3,11 +3,16 @@ import sqlite3
 import os
 import uuid
 import datetime
+from pathlib import Path
+from config import CONFIG, DEFAULT_USER_DATA_DIR
+
+USER_DATA_DIR = Path(CONFIG.get_str("runtime", "user_data_dir", str(DEFAULT_USER_DATA_DIR))).expanduser()
 mcp = FastMCP()
 
 def connect_db():
-    db_path = os.path.join("D:\\Projects\\ambient_ai\\database", "finance.db")
-    conn = sqlite3.connect(db_path)
+    db_path = USER_DATA_DIR / "database" / "finance.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
     cursor = conn.cursor()
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS transactions (

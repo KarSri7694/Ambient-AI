@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+import sys
 from contextlib import AsyncExitStack
 from typing import List, Dict, Any, Optional
 
@@ -44,6 +45,16 @@ def resolve_server_config(server_config: Dict[str, Any]) -> Dict[str, Any]:
             str(name): expand_environment_references(str(value))
             for name, value in configured_env.items()
         }
+
+    # On Windows, a bare ``fastmcp`` command can resolve to a globally
+    # installed Python environment instead of the environment running Ambient.
+    # That causes servers with project-only dependencies (notably MCP_tools.py)
+    # to exit before the MCP handshake. Prefer the sibling executable of the
+    # active interpreter when it is available.
+    if command.lower() in {"fastmcp", "fastmcp.exe"}:
+        venv_fastmcp = os.path.join(os.path.dirname(sys.executable), "fastmcp.exe")
+        if os.path.isfile(venv_fastmcp):
+            command = venv_fastmcp
     return {"command": command, "args": args, "env": env}
 
 

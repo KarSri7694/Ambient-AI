@@ -223,7 +223,7 @@ class LLMInteractionService:
         "You are a dedicated read-only filesystem sub-agent working on one delegated task.\n"
         "\n"
         "Rules:\n"
-        "- You are operating in a Windows environment. Valid paths look like C:\\Users\\Name\\Documents or D:\\projects\\ambient_ai.\n"
+                "- You are operating in a Windows environment. Use valid absolute Windows paths from the user's granted scope.\n"
         "- Operate only inside the user-granted paths available to your tools.\n"
         "- Filesystem tools require absolute paths. Start from the resolved granted roots in the task message; do not use '.', '/', '~', '/home', or guessed Linux paths.\n"
         "- Prefer fs_search_text on a resolved granted root when the task asks to find files or text recursively.\n"
@@ -1336,8 +1336,7 @@ class LLMInteractionService:
             f"Current day of week: {now.strftime('%A')}\n"
             f"Current date: {now.strftime('%Y-%m-%d')}\n"
             f"Current time: {now.strftime('%H:%M:%S')}\n\n"
-            "Runtime environment: Windows. Use Windows paths such as "
-            "C:\\Users\\Kartikeya Srivastava\\Documents and D:\\projects\\ambient_ai; "
+            "Runtime environment: Windows. Use the user's actual Windows paths and the configured project root; "
             "do not invent Linux paths such as /home/user.\n\n"
         )
         return preamble + system_prompt
@@ -1365,7 +1364,7 @@ class LLMInteractionService:
         if value.startswith("/"):
             raise ValueError(
                 "use_filesystem granted_paths must use Windows absolute paths in this runtime, "
-                "for example C:\\Users\\Kartikeya Srivastava\\Documents or D:\\projects\\ambient_ai."
+                "for example the user's Documents folder or the configured project root."
             )
         path = Path(raw_path).expanduser()
         return str(path.resolve(strict=False))

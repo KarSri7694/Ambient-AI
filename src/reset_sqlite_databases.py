@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
-from config import CONFIG
+from config import CONFIG, DEFAULT_USER_DATA_DIR
 import night_mode
 from infrastructure.adapter.SQLiteBenchmarkAdapter import SQLiteBenchmarkAdapter
 from infrastructure.adapter.SQLiteInteractionLogAdapter import SQLiteInteractionLogAdapter
@@ -13,14 +13,14 @@ from infrastructure.adapter.SQLiteTrainingDataAdapter import SQLiteTrainingDataA
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-USER_DATA_DIR = Path(CONFIG.get_str("runtime", "user_data_dir", "D:\\USER_DATA"))
+USER_DATA_DIR = Path(CONFIG.get_str("runtime", "user_data_dir", str(DEFAULT_USER_DATA_DIR)))
 MEMORY_ROOT = USER_DATA_DIR / "memory"
 MEMORY_DB_PATH = USER_DATA_DIR / "database" / "memory.db"
 INTERACTION_LOG_DB_PATH = USER_DATA_DIR / "database" / "interaction_logs.db"
 BENCHMARK_DB_PATH = Path(
     CONFIG.get_str("benchmarking", "db_path", str(PROJECT_ROOT / "database" / "benchmarking.db"))
 )
-TRAINING_DATA_ROOT = Path(CONFIG.get_str("training_data", "root", "D:\\TRAINING_DATA"))
+TRAINING_DATA_ROOT = Path(CONFIG.get_str("training_data", "root", str(USER_DATA_DIR / "training")))
 TRAINING_DATA_DB_PATH = Path(
     CONFIG.get_str("training_data", "db_path", str(TRAINING_DATA_ROOT / "database" / "training_data.db"))
 )

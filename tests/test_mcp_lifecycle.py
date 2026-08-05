@@ -431,6 +431,36 @@ def test_chat_enqueue_wakes_async_runtime_wait():
     assert asyncio.run(exercise()) is False
 
 
+def test_chat_dispatcher_survives_transient_residency_status_failure():
+    class _Adapter:
+        calls = 0
+
+        def status(self):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("transient router status failure")
+            return {"loaded_model": "chat-model"}
+
+    async def exercise():
+        runtime = AmbientRuntime(transcription_queue=queue.Queue())
+        adapter = _Adapter()
+        processed = []
+
+        async def process_pending(**kwargs):
+            processed.append(True)
+            runtime.stop_event.set()
+            return False, True
+
+        runtime._process_pending_chat_turn = process_pending
+        await runtime._chat_dispatch_loop(
+            llm_adapter=adapter,
+            llm_service=object(),
+        )
+        return adapter.calls, len(processed)
+
+    assert asyncio.run(exercise()) == (2, 1)
+
+
 def test_restore_chat_residency_keeps_chat_loaded_without_blocking_window(monkeypatch):
     runtime = AmbientRuntime(transcription_queue=queue.Queue())
     llm = _FakeModelManager()

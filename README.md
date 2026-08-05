@@ -96,16 +96,31 @@ The exact active tool surface depends on the servers listed in [mcp.json](mcp.js
 - A Windows environment for the current idle detection and MSS-based screen capture path
 
 ## Installation
+
+The supported desktop setup is Windows 10/11 with Python 3.11 or newer. Run
+these commands from the repository root in PowerShell.
+
+### 1. Create the environment
+
 ```powershell
-git clone <your-repo>
-cd ambient_ai
-python -m venv venv
-.\venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+git clone https://github.com/KarSri7694/Ambient-AI.git
+cd Ambient-AI
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m pip install -r requirements-windows-desktop.txt
 ```
 
-`requirements.txt` is intentionally a safe default and does not install CUDA,
-ROCm, or Windows desktop automation packages. For hardware-specific installs use:
+If PowerShell blocks activation, run this once and activate the environment
+again:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
+
+The base requirements use CPU PyTorch by default. For hardware-specific setups,
+use one target per virtual environment:
 
 ```powershell
 python scripts\install_requirements.py --target windows-cpu
@@ -113,7 +128,46 @@ python scripts\install_requirements.py --target nvidia-cuda
 python scripts\install_requirements.py --target rocm-windows
 ```
 
-On Radeon Cloud Linux:
+### 2. Create local configuration files
+
+```powershell
+Copy-Item config.example.ini config.ini
+Copy-Item mcp.example.json mcp.json
+```
+
+Edit `config.ini` for the llama-server URL, API key, model names, and data
+directory. `config.ini` and `mcp.json` are local files and must not contain
+committed secrets. If you already have a working `config.ini`, copy it into the
+repository instead of overwriting it with the example.
+
+Set only the credentials for MCP services you use:
+
+```powershell
+$env:TODOIST_API_TOKEN = "..."
+$env:GEMINI_API_KEY = "..."
+$env:TAVILY_API_KEY = "..."
+```
+
+### 3. Install browser support
+
+```powershell
+python -m playwright install chromium
+```
+
+Install Node.js 20 LTS or newer if `mcp.json` uses the Tavily or Playwright
+`npx` servers. Check with `node --version` and `npm --version`.
+
+### 4. Verify the installation
+
+```powershell
+python -m pip check
+python -m compileall -q src scripts
+python -m pytest -q tests/test_mcp_lifecycle.py
+```
+
+The MCP lifecycle test should pass before starting the full runtime.
+
+For Radeon Cloud Linux:
 
 ```bash
 python3 -m venv .venv
@@ -133,7 +187,7 @@ Important environment variables:
 $env:API_BASE_URL="http://localhost:8080"
 $env:SEMANTIC_API_BASE_URL="http://localhost:8081"
 $env:PASSIVE_OBSERVER_ENABLED="true"   # optional
-$env:USER_DATA_DIR="D:\USER_DATA"      # optional
+$env:USER_DATA_DIR="$env:USERPROFILE\\AmbientAI\\data"      # optional
 ```
 
 Important runtime defaults in `src/app.py` and `config.example.ini`:
@@ -146,13 +200,17 @@ Important runtime defaults in `src/app.py` and `config.example.ini`:
 - 120 weighted tool calls/hour, 60 web queries/day, and 30 inbox cards/day
 
 ### MCP Configuration
-The runtime reads MCP server definitions from [mcp.json](mcp.json).
+The runtime reads MCP server definitions from [mcp.json](mcp.json). The example
+configuration points `local_tools` and `finance` at the project’s FastMCP
+servers. On Windows, Ambient AI resolves the `fastmcp` command to the active
+virtual environment, so project dependencies do not need to be installed in a
+global Python environment.
 
 At minimum, verify:
 
 - the path to `src/MCP_tools.py`
 - the path to `src/finance_tools.py`
-- any required environment variables such as `GEMINI_API_KEY`, `SERPAPI_API_KEY`, or `TODOIST_API_TOKEN`
+- any required environment variables such as `GEMINI_API_KEY`, `TAVILY_API_KEY`, or `TODOIST_API_TOKEN`
 
 The default `[browser] backend = fara_visual` runs a visible, dedicated local
 Chromium profile. The main model sees only `use_browser(task)` and the user must
