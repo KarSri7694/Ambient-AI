@@ -247,6 +247,26 @@ def test_use_browser_creates_pending_approval_without_running_agent(tmp_path):
     assert provider.events == []
 
 
+def test_browser_agent_can_be_disabled_without_removing_the_tool_implementation(tmp_path):
+    provider = _BrowserRequestProvider()
+    main_bridge = _MainToolBridge()
+    browser_bridge = _BrowserBridge()
+    store = SQLiteAutonomyAdapter(str(tmp_path / "autonomy.db"))
+    service = LLMInteractionService(
+        llm_provider=provider,
+        tool_bridge=main_bridge,
+        browser_tool_bridge=browser_bridge,
+        browser_enabled=False,
+        browser_agent_model="browser-model",
+        browser_headless=True,
+        capability_policy=CapabilityPolicyService(store=store),
+    )
+
+    asyncio.run(service.initialize_tools())
+    assert [tool["function"]["name"] for tool in service._tools_for_agent_depth(0)] == ["demo"]
+    assert browser_bridge.sessions == []
+
+
 def test_browser_agent_isolates_tools_and_restores_parent_after_approval():
     provider = _BrowserFlowProvider()
     browser_bridge = _BrowserBridge()

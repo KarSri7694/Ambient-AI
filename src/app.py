@@ -241,6 +241,7 @@ if not _mcp_config_path.exists() and _mcp_config_path.name == "mcp.json":
         _mcp_config_path = _example_mcp_path
 MCP_CONFIG_PATH = str(_mcp_config_path) if _mcp_config_path.exists() else ""
 BROWSER_MCP_SERVER_NAME = CONFIG.get_str("browser", "server_name", "playwright")
+BROWSER_ENABLED = CONFIG.get_bool("browser", "enabled", True)
 BROWSER_BACKEND = CONFIG.get_str("browser", "backend", "fara_visual").strip().lower()
 BROWSER_AGENT_FAMILY = CONFIG.get_str("browser", "agent_family", "fara").strip().lower()
 BROWSER_TASK_TIMEOUT_SECONDS = CONFIG.get_float("browser", "task_timeout_seconds", 180.0)
@@ -1065,7 +1066,10 @@ class AmbientRuntime:
             absence_threshold_minutes=RECURRING_TASKS_ABSENCE_THRESHOLD_MINUTES,
             toast_notifier=_recurring_toast,
         )
-        if BROWSER_BACKEND == "fara_visual":
+        browser_tool_bridge = None
+        if not BROWSER_ENABLED:
+            logger.info("Browser agent disabled by [browser] enabled=false; browser tool will remain unavailable.")
+        elif BROWSER_BACKEND == "fara_visual":
             browser_tool_bridge = FaraVisualBrowserAdapter(
                 llm_provider=logged_llm,
                 profile_dir=BROWSER_PROFILE_DIR,
@@ -1164,6 +1168,7 @@ class AmbientRuntime:
             llm_provider=logged_llm,
             tool_bridge=tool_bridge,
             browser_tool_bridge=browser_tool_bridge,
+            browser_enabled=BROWSER_ENABLED,
             browser_agent_model=BROWSER_AGENT_MODEL,
             browser_task_timeout_seconds=BROWSER_TASK_TIMEOUT_SECONDS,
             browser_headless=BROWSER_HEADLESS,
@@ -1930,7 +1935,7 @@ class AmbientRuntime:
             logger.exception("Recurring task %s failed", task.task_id)
             recurring_task_service.mark_run_finished(task, result={"status": "failed", "error": str(exc)[:1000]}, status="failed")
         finally:
-            chat_service.reset_context()
+            llm_service.reset_context()
         return True, services_initialized
 
     async def _chat_dispatch_loop(

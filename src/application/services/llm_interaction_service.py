@@ -278,6 +278,7 @@ class LLMInteractionService:
         llm_provider: LLMProvider,
         tool_bridge: ToolBridgePort,
         browser_tool_bridge: Optional[BrowserToolBridgePort] = None,
+        browser_enabled: bool = True,
         browser_agent_model: Optional[str] = None,
         browser_task_timeout_seconds: float = 180.0,
         browser_headless: bool = False,
@@ -315,6 +316,7 @@ class LLMInteractionService:
         self.llm = llm_provider
         self.tool_bridge = tool_bridge
         self.browser_tool_bridge = browser_tool_bridge
+        self.browser_enabled = bool(browser_enabled)
         self.browser_agent_model = browser_agent_model
         self.browser_task_timeout_seconds = browser_task_timeout_seconds
         self.browser_headless = browser_headless
@@ -540,6 +542,13 @@ class LLMInteractionService:
                 filtered_tools.append(tool)
             tools = filtered_tools
 
+        if not self.browser_enabled:
+            tools = [
+                tool
+                for tool in tools
+                if tool.get("function", {}).get("name") != "use_browser"
+            ]
+
         if agent_depth > 0:
             tools = [
                 tool
@@ -634,6 +643,8 @@ class LLMInteractionService:
     ) -> str:
         if agent_depth != 0:
             raise RuntimeError("use_browser can only be called by the root agent.")
+        if not self.browser_enabled:
+            raise RuntimeError("Browser agent is disabled by configuration.")
         if not task.strip():
             raise ValueError("use_browser requires a non-empty task.")
         if self.browser_tool_bridge is None:
@@ -938,6 +949,8 @@ class LLMInteractionService:
     ) -> str:
         if agent_depth != 0:
             raise RuntimeError("use_browser can only be called by the root agent.")
+        if not self.browser_enabled:
+            raise RuntimeError("Browser agent is disabled by configuration.")
         if not task.strip():
             raise ValueError("use_browser requires a non-empty task.")
         if self.browser_tool_bridge is None:
