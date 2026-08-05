@@ -385,6 +385,14 @@ class ArtifactOrganizer:
         return len(rows)
 
     def maintenance_status(self, *, min_changes: int, interval_hours: float) -> dict[str, Any]:
+        """Return whether the persisted maintenance schedule has reached its next run.
+
+        Maintenance is invoked from the runtime's tight idle loop, so ``due`` must
+        represent a schedule boundary rather than a level-triggered change count.
+        In particular, edits made while a run is finishing must not immediately
+        schedule another run in the same idle window.  The change count remains
+        useful telemetry, but the daily interval is the cooldown boundary.
+        """
         with self._connection() as conn:
             last = conn.execute(
                 "SELECT * FROM artifact_maintenance_runs ORDER BY started_at DESC LIMIT 1"
@@ -418,16 +426,11 @@ class ArtifactOrganizer:
                 )
             except ValueError:
                 elapsed_hours = None
-        continuation = bool(last_success and last_success["continuation_required"])
         due_reasons: list[str] = []
         if last_success is None:
             due_reasons.append("initial_scan")
-        if changed_count >= max(1, int(min_changes)):
-            due_reasons.append("artifact_changes")
         if elapsed_hours is not None and elapsed_hours >= max(1.0, float(interval_hours)):
             due_reasons.append("daily_interval")
-        if continuation:
-            due_reasons.append("continuation")
         return {
             "active_count": active_count,
             "archived_count": archived_count,

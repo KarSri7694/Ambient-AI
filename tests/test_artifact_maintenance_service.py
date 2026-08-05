@@ -92,3 +92,31 @@ def test_maintenance_merges_only_llm_confirmed_same_thread(tmp_path):
     history = organizer.list_maintenance_history()
     assert history["runs"][0]["status"] == "completed"
     assert history["merges"][0]["canonical_artifact_id"] in {first["artifact_id"], second["artifact_id"]}
+
+
+def test_maintenance_due_is_not_retriggered_by_artifact_changes_before_daily_interval(tmp_path):
+    organizer = ArtifactOrganizer(tmp_path)
+    organizer.save_new(
+        title="Existing note",
+        summary="A note already in the library.",
+        detailed_report="Existing details.",
+        source_ref="test/one",
+    )
+    run_id = organizer.start_maintenance_run("idle")
+    organizer.finish_maintenance_run(run_id, status="completed")
+
+    # Simulate reports arriving after the completed run. The idle loop may call
+    # maintenance_status many times before the next daily boundary.
+    for index in range(3):
+        organizer.save_new(
+            title=f"New note {index}",
+            summary="A newly created note.",
+            detailed_report="New details.",
+            source_ref=f"test/new-{index}",
+        )
+
+    status = organizer.maintenance_status(min_changes=3, interval_hours=24)
+
+    assert status["changed_count"] >= 3
+    assert status["due"] is False
+    assert status["due_reasons"] == []
