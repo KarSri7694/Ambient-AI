@@ -341,6 +341,7 @@ class LLMInteractionService:
         self._filesystem_lock = asyncio.Lock()
         self._computer_lock = asyncio.Lock()
         self._retained_browser_sessions: List[BrowserToolSessionPort] = []
+        self._retained_browser_sessions_by_approval: Dict[str, BrowserToolSessionPort] = {}
         self.reporter_model = reporter_model
         self.capability_policy = capability_policy
         self.semantic_memory = semantic_memory
@@ -402,6 +403,8 @@ class LLMInteractionService:
         """Close browser sessions deliberately retained by finish_browser_task."""
         sessions = list(self._retained_browser_sessions)
         self._retained_browser_sessions.clear()
+        sessions.extend(self._retained_browser_sessions_by_approval.values())
+        self._retained_browser_sessions_by_approval.clear()
         for session in sessions:
             try:
                 await session.cleanup()
@@ -432,6 +435,7 @@ class LLMInteractionService:
         child._filesystem_lock = asyncio.Lock()
         child._computer_lock = asyncio.Lock()
         child._retained_browser_sessions = []
+        child._retained_browser_sessions_by_approval = {}
         return child
 
     def get_context(self) -> List[Dict[str, Any]]:
@@ -662,7 +666,10 @@ class LLMInteractionService:
             primary_error: Optional[BaseException] = None
             try:
                 self._check_interrupted()
-                if self._retained_browser_sessions:
+                if approval_id and approval_id in self._retained_browser_sessions_by_approval:
+                    browser_session = self._retained_browser_sessions_by_approval.pop(approval_id)
+                    self.logger.info("Resuming retained browser session for approval %s.", approval_id)
+                elif self._retained_browser_sessions:
                     browser_session = self._retained_browser_sessions.pop()
                     self.logger.info("Reusing retained browser session.")
                 else:
@@ -675,7 +682,7 @@ class LLMInteractionService:
                 self._check_interrupted()
                 if callable(visual_runner):
                     self.logger.info(
-                        "Starting Fara visual browser task with model %s.",
+                        "Starting agent-agnostic visual browser task with model %s.",
                         self.browser_agent_model,
                     )
                     browser_result = await asyncio.wait_for(
@@ -686,6 +693,12 @@ class LLMInteractionService:
                         ),
                         timeout=self.browser_task_timeout_seconds,
                     )
+                    try:
+                        visual_status = str(json.loads(browser_result).get("status") or "")
+                    except (TypeError, json.JSONDecodeError):
+                        visual_status = ""
+                    if visual_status == "needs_user_input":
+                        exit_browser = False
                 else:
                     # Compatibility path for the legacy browser MCP backend.
                     browser_tools = await browser_session.get_all_tools()
@@ -738,7 +751,10 @@ class LLMInteractionService:
                 cleanup_error: Optional[BaseException] = None
                 if browser_session is not None:
                     if primary_error is None and not exit_browser:
-                        self._retained_browser_sessions.append(browser_session)
+                        if approval_id:
+                            self._retained_browser_sessions_by_approval[approval_id] = browser_session
+                        else:
+                            self._retained_browser_sessions.append(browser_session)
                         self.logger.info(
                             "Browser agent returned control while leaving the browser session open."
                         )
@@ -788,6 +804,29 @@ class LLMInteractionService:
                     ) from cleanup_error
 
             return browser_result
+
+    async def resume_waiting_browser_task(
+        self,
+        *,
+        task: str,
+        approval_id: str,
+        user_answer: str,
+        event_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> str:
+        """Resume a paused visual browser task with the user's answer."""
+        answer = str(user_answer or "").strip()
+        if not answer:
+            raise ValueError("A non-empty answer is required to resume the browser task.")
+        resumed_task = (
+            f"{task.strip()}\n\nThe user answered the pending browser question: {answer}\n"
+            "Continue from the current browser state and verify the next outcome."
+        )
+        return await self._run_browser_agent(
+            task=resumed_task,
+            agent_depth=0,
+            approval_id=approval_id,
+            event_callback=event_callback,
+        )
 
     def _delegation_origin(self) -> tuple[str, dict[str, Any], Optional[str]]:
         metadata = current_interaction_metadata()

@@ -1,4 +1,4 @@
-"""Preflight the local visual browser and optional Fara multimodal endpoint.
+"""Preflight the local agent-agnostic visual browser and multimodal endpoint.
 
 Run this while the Ambient runtime is stopped:
 
@@ -58,7 +58,7 @@ async def _run(*, browser_only: bool) -> int:
         provider = object()
     else:
         if not model:
-            raise RuntimeError("[models] browser_agent_model must name Fara1.5-27B.")
+            raise RuntimeError("[models] browser_agent_model must name a configured multimodal model.")
         provider = LlamaCppAdapter(
             base_url=CONFIG.get_str("runtime", "api_base_url", "http://127.0.0.1:8080"),
             api_key=CONFIG.get_str("runtime", "api_key", "test"),

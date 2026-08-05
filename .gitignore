@@ -54,3 +54,4 @@ Skills/powershell_skill.md
 
 # Keep deployable dist assets, but omit large source maps from version control.
 /src/infrastructure/runtime_ui/dist/**/*.map
+/ambient-ai-video

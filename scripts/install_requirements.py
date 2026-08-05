@@ -13,7 +13,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
-CTRANSLATE2_ROCM_VERSION = "4.7.1"
+CTRANSLATE2_ROCM_VERSION = "4.8.1"
 FASTER_WHISPER_VERSION = "1.2.1"
 CTRANSLATE2_ROCM_ARCHIVES = {
     "rocm-linux": f"https://github.com/OpenNMT/CTranslate2/releases/download/v{CTRANSLATE2_ROCM_VERSION}/rocm-python-wheels-Linux.zip",

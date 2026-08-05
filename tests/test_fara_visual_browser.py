@@ -239,6 +239,35 @@ def test_fara_action_validation_is_coordinate_bounded(tmp_path):
         session._validate_action({"action": "run_javascript", "text": "alert(1)"})
 
 
+def test_generic_browser_action_accepts_bbox_and_derives_click_point(tmp_path):
+    session = _session(tmp_path)
+    action = session._validate_action(
+        {
+            "action": "click",
+            "target_bbox": [100, 200, 80, 40],
+            "detail": "Click the search button.",
+            "expected_outcome": "Search results are visible.",
+        }
+    )
+    assert action["action"] == "left_click"
+    assert action["target_bbox"] == [100.0, 200.0, 80.0, 40.0]
+    assert action["coordinate"] == [140.0, 220.0]
+
+
+def test_generic_browser_action_rejects_bbox_outside_current_screenshot(tmp_path):
+    session = _session(tmp_path)
+    with pytest.raises(ValueError, match="outside the viewport"):
+        session._validate_action(
+            {"action": "click", "target_bbox": [1400, 200, 80, 40]}
+        )
+
+
+def test_generic_prompt_does_not_depend_on_model_family(tmp_path):
+    session = _session(tmp_path)
+    assert "Fara" not in session.SYSTEM_PROMPT
+    assert "target_bbox" in session.BROWSER_ACTION_TOOL["function"]["parameters"]["properties"]
+
+
 def test_fara_validation_recovers_malformed_structured_action_field(tmp_path):
     session = _session(tmp_path)
     action = session._validate_action(

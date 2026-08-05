@@ -7,6 +7,7 @@ import time
 from contextlib import ExitStack
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any, Optional
 
 from application.ports.autonomy_port import AutonomyStorePort
@@ -661,7 +662,8 @@ Do not repeat an action already reported as performed.
             item = self.store.add_inbox_item(item)
             self.store.complete_run(run.run_id, summary=item.summary, output_text=result)
             self.store.update_opportunity_status(candidate.opportunity_id, inbox_status)
-            self.store.complete_event(event.event_id)
+            if getattr(event, "event_id", ""):
+                self.store.complete_event(event.event_id)
             if self.temporal_memory_service is not None:
                 self.temporal_memory_service.record_ambient_event(
                     event,
@@ -1274,7 +1276,8 @@ Do not repeat an action already reported as performed.
             except Exception:
                 self.logger.exception("Recurring monitor evaluation failed for visual observation %s", updated.observation_id)
         downstream = self._enqueue_visual_batch_or_single(updated, payload)
-        self.store.complete_event(event.event_id)
+        if getattr(event, "event_id", ""):
+            self.store.complete_event(event.event_id)
         return {
             "processed": True,
             "outcome": status,
@@ -1448,6 +1451,38 @@ Do not repeat an action already reported as performed.
         self, *, event: AmbientEvent, delegated: DelegatedTask, result_payload: dict[str, Any]
     ) -> dict[str, Any]:
         raw_status = str(result_payload.get("status") or "completed").lower()
+        if raw_status == "needs_user_input":
+            self.store.update_delegated_task(
+                delegated.delegation_id,
+                status="waiting_for_user",
+                result_json=json.dumps(result_payload, ensure_ascii=False),
+            )
+            if getattr(event, "event_id", ""):
+                self.store.complete_event(event.event_id)
+            if hasattr(self.store, "audit"):
+                self.store.audit(
+                    "ambient_agent", "delegation.waiting_for_user", delegated.delegation_id,
+                    {"approval_id": delegated.approval_id, "question": result_payload.get("question")},
+                )
+            origin = self._safe_json(delegated.origin_json)
+            message_id = str(origin.get("chat_message_id") or "")
+            if message_id and self.chat_store is not None and self.chat_store.get_message(message_id):
+                question = str(result_payload.get("question") or result_payload.get("task_summary") or "")
+                self.chat_store.mark_awaiting_approval(
+                    message_id,
+                    f"Browser task is waiting for your answer:\n\n{question}",
+                )
+                if self.chat_event_broker is not None:
+                    self.chat_event_broker.publish(
+                        message_id,
+                        {"type": "status", "status": "waiting_for_user", "question": question},
+                    )
+            return {
+                "processed": True,
+                "outcome": "delegation_waiting_for_user",
+                "delegation_id": delegated.delegation_id,
+                "result": result_payload,
+            }
         status = raw_status if raw_status in {"completed", "blocked", "failed", "terminated", "interrupted"} else "completed"
         continuation_event_id = uuid.uuid4().hex
         completion_payload = {
@@ -1491,7 +1526,8 @@ Do not repeat an action already reported as performed.
                 "ambient_agent", "delegation.completed", delegated.delegation_id,
                 {"status": status, "approval_id": delegated.approval_id},
             )
-        self.store.complete_event(event.event_id)
+        if getattr(event, "event_id", ""):
+            self.store.complete_event(event.event_id)
         return {
             "processed": True,
             "outcome": f"delegation_{status}",
@@ -1499,6 +1535,32 @@ Do not repeat an action already reported as performed.
             "continuation_event_id": stored_event.event_id,
             "result": result_payload,
         }
+
+    async def resume_waiting_browser_for_chat(
+        self, *, session_id: str, user_answer: str, llm_service, event_callback=None
+    ) -> dict[str, Any] | None:
+        """Use a new chat turn as the answer to a browser question, if applicable."""
+        for delegated in self.store.list_delegated_tasks(limit=100):
+            if delegated.capability != "browser.use" or delegated.status != "waiting_for_user":
+                continue
+            origin = self._safe_json(delegated.origin_json)
+            if str(origin.get("chat_session_id") or "") != str(session_id):
+                continue
+            result = await llm_service.resume_waiting_browser_task(
+                task=delegated.task,
+                approval_id=delegated.approval_id,
+                user_answer=user_answer,
+                event_callback=event_callback,
+            )
+            result_payload = self._safe_json(result)
+            if not result_payload:
+                result_payload = {"status": "completed", "summary": str(result)}
+            return await self._finish_delegation_execution(
+                event=SimpleNamespace(event_id=""),
+                delegated=delegated,
+                result_payload=result_payload,
+            )
+        return None
 
     async def _continue_delegated_task(
         self,

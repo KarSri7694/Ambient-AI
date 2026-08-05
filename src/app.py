@@ -1158,12 +1158,12 @@ class AmbientRuntime:
             filesystem_max_list_entries=FILESYSTEM_MAX_LIST_ENTRIES,
             computer_agent_model=COMPUTER_AGENT_MODEL,
             computer_agent_family=COMPUTER_AGENT_FAMILY,
-            computer_uiat_max_items=COMPUTER_UIAT_MAX_ITEMS,
-            computer_uiat_max_chars=COMPUTER_UIAT_MAX_CHARS,
-            computer_uiat_name_max_chars=COMPUTER_UIAT_NAME_MAX_CHARS,
             computer_task_timeout_seconds=COMPUTER_TASK_TIMEOUT_SECONDS,
             computer_max_actions_per_task=COMPUTER_MAX_ACTIONS_PER_TASK,
             computer_screenshot_dir=COMPUTER_SCREENSHOT_DIR,
+            computer_uiat_max_items=COMPUTER_UIAT_MAX_ITEMS,
+            computer_uiat_max_chars=COMPUTER_UIAT_MAX_CHARS,
+            computer_uiat_name_max_chars=COMPUTER_UIAT_NAME_MAX_CHARS,
             computer_enabled=COMPUTER_ENABLED,
             local_control_approval_ttl_minutes=AUTONOMY_APPROVAL_TTL_MINUTES,
             scheduled_task_service=scheduled_task_service,
@@ -1558,6 +1558,7 @@ class AmbientRuntime:
         llm_service: LLMInteractionService,
         services_initialized: bool,
         parallel: bool = False,
+        autonomy_coordinator: Optional[AutonomyCoordinatorService] = None,
     ) -> tuple[bool, bool]:
         if self.chat_store is None:
             return False, services_initialized
@@ -1571,6 +1572,22 @@ class AmbientRuntime:
         session_id = turn["session_id"]
         user_message = turn["user_message"]
         self._publish_chat_event(message_id, {"type": "status", "status": "running"})
+        if autonomy_coordinator is not None:
+            resumed = await autonomy_coordinator.resume_waiting_browser_for_chat(
+                session_id=session_id,
+                user_answer=str(user_message.get("content") or ""),
+                llm_service=llm_service,
+            )
+            if resumed is not None:
+                self.chat_store.complete_message(
+                    message_id,
+                    "Your answer was sent to the paused browser task. It is continuing from the latest browser state.",
+                )
+                self._publish_chat_event(
+                    message_id,
+                    {"type": "done", "message": self.chat_store.get_message(message_id)},
+                )
+                return True, services_initialized
         streamed_parts: list[str] = []
         last_checkpoint = time.monotonic()
         preferred_chat_model = LIGHTWEIGHT_CHAT_MODEL or CHAT_MODEL
@@ -1906,6 +1923,7 @@ class AmbientRuntime:
         *,
         llm_adapter: ModelResidencyManager,
         llm_service: LLMInteractionService,
+        autonomy_coordinator: Optional[AutonomyCoordinatorService] = None,
     ) -> None:
         """Keep direct chat responsive while the main loop handles ambient work."""
         while not self.stop_event.is_set():
@@ -1914,6 +1932,7 @@ class AmbientRuntime:
                 llm_service=llm_service,
                 services_initialized=bool(llm_adapter.status().get("loaded_model")),
                 parallel=True,
+                autonomy_coordinator=autonomy_coordinator,
             )
             if handled:
                 await asyncio.sleep(0)
@@ -2542,7 +2561,11 @@ class AmbientRuntime:
             )
             if PARALLEL_CHAT_ENABLED:
                 self._chat_dispatch_task = asyncio.create_task(
-                    self._chat_dispatch_loop(llm_adapter=llm_adapter, llm_service=llm_service),
+                    self._chat_dispatch_loop(
+                        llm_adapter=llm_adapter,
+                        llm_service=llm_service,
+                        autonomy_coordinator=autonomy_coordinator,
+                    ),
                     name="AmbientChatDispatcher",
                 )
                 logger.info(
@@ -2661,6 +2684,7 @@ class AmbientRuntime:
                         llm_adapter=llm_adapter,
                         llm_service=llm_service,
                         services_initialized=services_initialized,
+                        autonomy_coordinator=autonomy_coordinator,
                     )
                     if handled_chat:
                         if await self._sleep_or_stop(0.1):
