@@ -2420,8 +2420,13 @@ class AmbientRuntime:
                         "Parallel visual worker completed %s capture event(s).",
                         result.get("count") or 1,
                     )
-            except (asyncio.CancelledError, WorkInterrupted):
+            except asyncio.CancelledError:
                 raise
+            except WorkInterrupted as exc:
+                # A user/runtime interrupt should cancel only the current
+                # visual request, not permanently kill the worker task.
+                logger.info("Parallel visual worker interrupted; continuing with queued captures: %s", exc)
+                await asyncio.sleep(0.25)
             except Exception:
                 logger.exception("Parallel visual worker failed; retrying.")
                 await asyncio.sleep(0.25)
