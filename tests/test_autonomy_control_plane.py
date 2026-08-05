@@ -713,7 +713,8 @@ def test_policy_blocks_inferred_shell_and_requires_approval_for_browser_mutation
 
     assert denied.decision == "deny"
     assert browser.requires_approval is True
-    assert low_confidence_reminder.requires_approval is True
+    assert low_confidence_reminder.requires_approval is False
+    assert low_confidence_reminder.matched_rule == "todoist_user_task"
 
 
 def test_automatic_reminders_require_verified_sources_and_shadow_calibration(tmp_path):
@@ -727,7 +728,7 @@ def test_automatic_reminders_require_verified_sources_and_shadow_calibration(tmp
     }
 
     gated = policy.evaluate(
-        tool_name="add_task",
+        tool_name="schedule_task_at",
         arguments=arguments,
         source="autonomy_investigation",
         confidence=0.95,
@@ -744,7 +745,7 @@ def test_automatic_reminders_require_verified_sources_and_shadow_calibration(tmp
         )
 
     allowed = policy.evaluate(
-        tool_name="add_task",
+        tool_name="schedule_task_at",
         arguments=arguments,
         source="autonomy_investigation",
         confidence=0.95,

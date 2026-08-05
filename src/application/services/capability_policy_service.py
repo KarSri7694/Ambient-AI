@@ -175,6 +175,11 @@ class AutonomyBudget:
 
 
 class CapabilityPolicyService:
+    # Todoist reminders are user-directed, bounded, and reversible (they can be
+    # edited or deleted). Keep them out of the generic inferred-reminder and
+    # calibration approval gates. Other communication and browser writes remain
+    # subject to their normal policy.
+    TODOIST_TASK_TOOLS = frozenset({"add_task"})
     DEFAULT_POLICIES = {
         "context.observe": "auto_reversible",
         "context.read": "auto_reversible",
@@ -260,6 +265,15 @@ class CapabilityPolicyService:
         configured = self.store.get_policy(descriptor.capability)
         policy = (configured or {}).get("decision") or self.DEFAULT_POLICIES.get(descriptor.capability, "deny")
         constraints = (configured or {}).get("constraints") or {}
+
+        if str(tool_name or "").strip().lower() in self.TODOIST_TASK_TOOLS:
+            if not self.budget.consume(descriptor):
+                return PolicyDecision("deny", descriptor.capability, "budget", "The capability budget is exhausted; defer this action.")
+            return PolicyDecision(
+                "auto_reversible", descriptor.capability, "todoist_user_task",
+                "User-directed Todoist reminder creation is allowed without an approval prompt.",
+                False, constraints,
+            )
 
         if source.startswith("autonomy") and descriptor.capability == "assistance.reminder" and confidence < self.reminder_confidence_threshold:
             return PolicyDecision("ask", descriptor.capability, "reminder_confidence", "Reminder confidence is below the automatic threshold.", True)
