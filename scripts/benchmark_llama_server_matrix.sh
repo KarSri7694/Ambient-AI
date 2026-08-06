@@ -124,7 +124,7 @@ if md_path:
 else:
     markdown_text = """# Radeon ROCm Benchmark Notes
 
-This fallback Markdown document is used when MD_SUMMARY_FILE is not set. It describes an AI agent benchmark plan that compares local inference performance across llama-server batch sizes, micro-batch sizes, and speculative MTP draft token counts. The benchmark records time to first token, prompt preprocessing throughput, generation throughput, server command lines, and per-turn responses. The goal is to identify a stable, high-throughput configuration for AMD Radeon GPU inference while preserving multi-turn context behavior."""
+This fallback Markdown document is used when MD_SUMMARY_FILE is not set. It describes an AI agent benchmark plan that compares local inference performance across llama-server batch sizes, micro-batch sizes, and speculative MTP draft token counts. The benchmark records client-observed time to first visible streamed token, prompt preprocessing throughput, generation throughput, server command lines, and per-turn responses. The first-visible-token metric includes request, scheduling, prompt processing, generation-before-visible-output, and streaming overhead; it is distinct from llama-server prompt-evaluation time. The goal is to identify a stable, high-throughput configuration for AMD Radeon GPU inference while preserving multi-turn context behavior."""
 
 prompts = [
     """Act as an expert game engineer specializing in retro rogue-like mechanics and 2D graphics math.
@@ -377,6 +377,8 @@ run_turn() {
   local prompt="$2"
   local response_file="$3"
   local max_tokens="$4"
+  # ttft_seconds is client-observed time from request start to the first non-empty
+  # streamed response content; it is not prompt-evaluation time.
   python3 - "$HOST" "$PORT" "$API_KEY" "$REQUEST_TIMEOUT" "$messages_file" "$prompt" "$response_file" "$max_tokens" <<'PY'
 import json, sys, time, urllib.request
 
