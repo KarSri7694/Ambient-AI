@@ -121,6 +121,7 @@ def main() -> int:
 
     provider = LlamaCppAdapter(
         base_url=args.api_base_url,
+        server_type=CONFIG.get_str("runtime", "server_type", "llama-server"),
         model_load_timeout_seconds=args.model_load_timeout_seconds,
     )
     benchmark_provider = BenchmarkingLLMProvider(provider)

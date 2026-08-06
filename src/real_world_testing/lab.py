@@ -463,6 +463,7 @@ class ProductionScenarioExecutor:
         max_generation_tokens = parser.getint("runtime", "max_generation_tokens", fallback=60000)
         raw = LlamaCppAdapter(
             base_url=api_url,
+            server_type=parser.get("runtime", "server_type", fallback="llama-server"),
             api_key=api_key,
             model_load_timeout_seconds=model_load_timeout_seconds,
             default_max_tokens=max_generation_tokens,

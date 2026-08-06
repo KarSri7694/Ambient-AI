@@ -23,6 +23,38 @@ def test_adapter_normalizes_trailing_slash_in_base_url():
     assert adapter.api_uri_v1 == "https://example.test/v1"
 
 
+def test_openai_compatible_mode_skips_llama_server_endpoints(monkeypatch):
+    adapter = LlamaCppAdapter(
+        "https://example.test/",
+        server_type="open_ai_compatible",
+    )
+
+    def fail_request(*_args, **_kwargs):
+        raise AssertionError("llama-server-specific endpoint was requested")
+
+    monkeypatch.setattr("infrastructure.adapter.llamaCppAdapter.requests.get", fail_request)
+    monkeypatch.setattr("infrastructure.adapter.llamaCppAdapter.requests.post", fail_request)
+
+    adapter.load_model_sync("provider-model")
+    assert adapter.get_current_model() == "provider-model"
+    assert adapter.slot_capacity() == {
+        "known": False,
+        "model": "provider-model",
+        "total": None,
+        "busy": None,
+        "idle": None,
+    }
+    assert adapter.count_text_tokens("hello") == 1
+    adapter.unload_model_sync()
+    assert adapter.get_current_model() is None
+
+
+def test_server_type_accepts_existing_compatibility_typo():
+    adapter = LlamaCppAdapter("https://example.test/", server_type="open_ai_compatbile")
+
+    assert adapter.server_type == "open-ai-compatible"
+
+
 def test_kv_state_filename_round_trips_model_name_with_path_chars():
     model_name = "Qwen/Qwen2.5-VL-3B Instruct:latest"
     filename = (

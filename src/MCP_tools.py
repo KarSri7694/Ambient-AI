@@ -66,6 +66,7 @@ def _build_semantic_dedupe_service() -> SemanticDeduplicationService:
             provider=LlamaCppAdapter(
                 base_url=CONFIG.get_str("runtime", "api_base_url", "http://localhost:8080"),
                 api_key=CONFIG.get_str("runtime", "api_key", "testkey"),
+                server_type=CONFIG.get_str("runtime", "server_type", "llama-server"),
                 model_load_timeout_seconds=CONFIG.get_float(
                     "runtime", "model_load_timeout_seconds", 600.0
                 ),

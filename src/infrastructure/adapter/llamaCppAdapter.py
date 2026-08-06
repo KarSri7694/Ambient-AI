@@ -29,6 +29,7 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         self,
         base_url: str,
         api_key: str = "testkey",
+        server_type: str = "llama-server",
         model_load_timeout_seconds: float = 600.0,
         isolated_model_tracking: bool = False,
         default_max_tokens: Optional[int] = None,
@@ -42,6 +43,14 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         # a different route and return an HTML 404 instead of the OpenAI API.
         self.base_url = str(base_url).rstrip("/")
         self.api_uri_v1 = f"{self.base_url}/v1"
+        normalized_server_type = str(server_type or "llama-server").strip().lower().replace("_", "-")
+        if normalized_server_type in {"open-ai-compatible", "openai-compatible", "open-ai-compatbile", "openai-compatbile"}:
+            normalized_server_type = "open-ai-compatible"
+        elif normalized_server_type != "llama-server":
+            raise ValueError(
+                "server_type must be 'llama-server' or 'open_ai_compatible'."
+            )
+        self.server_type = normalized_server_type
         self.client = openai.AsyncOpenAI(
             base_url=self.api_uri_v1,
             api_key=api_key
@@ -77,6 +86,12 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         model_name = str(model_name or "").strip()
         if not model_name:
             raise ValueError("A non-empty model name is required.")
+
+        # OpenAI-compatible providers select models on the completion request;
+        # they do not expose llama-server's router lifecycle endpoints.
+        if not self.uses_llama_server_endpoints:
+            self._set_loaded_model_state(model_name, ready=True)
+            return
 
         started_at = time.monotonic()
         deadline = started_at + self.model_load_timeout_seconds
@@ -140,6 +155,10 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
     def unload_model_sync(self, model_name: Optional[str] = None) -> Optional[str]:
         """Synchronously unload the currently tracked model and return its name."""
         self._raise_if_shutdown_requested()
+        if not self.uses_llama_server_endpoints:
+            loaded_model = str(model_name or self.get_current_model() or "").strip() or None
+            self._set_loaded_model_state(None)
+            return loaded_model
         loaded_model = str(model_name or "").strip() or (
             self.currently_loaded_model
             if getattr(self, "isolated_model_tracking", False)
@@ -177,12 +196,18 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
             return self.currently_loaded_model
         return self.currently_loaded_model or self.kv_state.read_shared_state().get("currently_loaded_model")
 
+    @property
+    def uses_llama_server_endpoints(self) -> bool:
+        return getattr(self, "server_type", "llama-server") == "llama-server"
+
     def _discover_loaded_model(self) -> Optional[str]:
         """Query the llama.cpp API for the currently loaded model, if any."""
         return self._sync_loaded_model_state()
 
     def _fetch_models(self, timeout_seconds: float = 10.0) -> List[Dict[str, Any]]:
         """Return router metadata, including each model's lifecycle status."""
+        if not self.uses_llama_server_endpoints:
+            return []
         response = requests.get(
             f"{self.base_url}/models",
             timeout=max(0.1, float(timeout_seconds)),
@@ -193,6 +218,8 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
 
     def count_text_tokens(self, text: str, model_name: Optional[str] = None) -> int:
         """Count text tokens using llama.cpp when available, else fall back to a stable estimate."""
+        if not self.uses_llama_server_endpoints:
+            return max(1, len(text or "") // 4) if text else 0
         payload: Dict[str, Any] = {
             "content": text or "",
             "add_special": False,
@@ -256,6 +283,8 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
             self._ready_model = None
 
     def _sync_loaded_model_state(self) -> Optional[str]:
+        if not self.uses_llama_server_endpoints:
+            return self.currently_loaded_model
         try:
             models = self._fetch_models()
         except requests.RequestException as exc:
@@ -295,6 +324,8 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         return chosen
 
     def _get_model_metadata(self, model_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        if not self.uses_llama_server_endpoints:
+            return None
         target = model_name or self.currently_loaded_model or self.get_current_model()
         if not target:
             return None
@@ -428,6 +459,8 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
 
     def _require_model_ready(self, model_name: str) -> None:
         """Confirm readiness for adapters attaching to an existing router model."""
+        if not self.uses_llama_server_endpoints:
+            return
         if getattr(self, "_ready_model", None) == model_name:
             return
 
@@ -452,6 +485,8 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
 
     def _slot_base_url(self) -> str:
         """Resolve the server URL that exposes llama.cpp slot save/restore endpoints."""
+        if not self.uses_llama_server_endpoints:
+            raise RuntimeError("Slot endpoints are unavailable for an OpenAI-compatible server.")
         try:
             response = requests.get(f"{self.base_url}/slots", timeout=5)
             if response.status_code == 200:
@@ -503,6 +538,8 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         than an unsafe capacity claim.
         """
         target = str(model_name or self.get_current_model() or "").strip()
+        if not self.uses_llama_server_endpoints:
+            return {"known": False, "model": target or None, "total": None, "busy": None, "idle": None}
         if not target:
             return {"known": False, "model": None, "total": None, "busy": None, "idle": None}
         try:
@@ -543,6 +580,23 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
 
         save_path = self.kv_state.kv_state_dir() / self.kv_state.safe_kv_state_filename()
         json_path = save_path.with_suffix(".json")
+        if not self.uses_llama_server_endpoints:
+            json_path.write_text(
+                json.dumps(
+                    {
+                        "model_name": self.currently_loaded_model,
+                        "messages": messages,
+                        "saved_at": datetime.now().isoformat(),
+                        "kv_cache_saved": False,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            self.kv_state.update_shared_state(currently_loaded_model=self.currently_loaded_model)
+            self.kv_state.push_kv_state(save_path)
+            return save_path
         json_path.write_text(
             json.dumps(
                 {
@@ -607,6 +661,8 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
 
     def restore_kv_state(self, kv_state_file: str) -> None:
         """Restore slot 0 KV state from the given saved state filename or path."""
+        if not self.uses_llama_server_endpoints:
+            return
         kv_state_path = Path(kv_state_file)
         slot_base_url = self._slot_base_url()
         payload = {"filename": kv_state_path.name}
@@ -664,7 +720,7 @@ class LlamaCppAdapter(LLMProvider, ModelManager):
         if self.currently_loaded_model != model_name:
             await self.load_model(model_name)
         kv_state_path = Path(kv_state_file)
-        if kv_state_path.exists():
+        if kv_state_path.exists() and self.uses_llama_server_endpoints:
             self._wait_for_model_restore_ready(model_name)
             self.restore_kv_state(kv_state_file)
         else:

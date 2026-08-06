@@ -90,6 +90,7 @@ logger = logging.getLogger(__name__)
 
 API_BASE_URL = CONFIG.get_str("runtime", "api_base_url", "http://localhost:8080")
 API_KEY = CONFIG.get_str("runtime", "api_key", "testkey")
+SERVER_TYPE = CONFIG.get_str("runtime", "server_type", "llama-server")
 MODEL_LOAD_TIMEOUT_SECONDS = CONFIG.get_float("runtime", "model_load_timeout_seconds", 600.0)
 MAX_GENERATION_TOKENS = CONFIG.get_int("runtime", "max_generation_tokens", 60000)
 LLM_STREAM_RETRY_ATTEMPTS = CONFIG.get_int("runtime", "llm_stream_retry_attempts", 3)
@@ -997,6 +998,7 @@ class AmbientRuntime:
         raw_llm_adapter = LlamaCppAdapter(
             base_url=API_BASE_URL,
             api_key=API_KEY,
+            server_type=SERVER_TYPE,
             model_load_timeout_seconds=MODEL_LOAD_TIMEOUT_SECONDS,
             isolated_model_tracking=True,
             default_max_tokens=MAX_GENERATION_TOKENS,
@@ -1035,6 +1037,7 @@ class AmbientRuntime:
             vision_raw_llm = LlamaCppAdapter(
                 base_url=VISION_EFFECTIVE_API_BASE_URL,
                 api_key=VISION_API_KEY,
+                server_type=CONFIG.get_str("vision_runtime", "server_type", SERVER_TYPE),
                 model_load_timeout_seconds=VISION_MODEL_LOAD_TIMEOUT_SECONDS,
                 isolated_model_tracking=True,
                 default_max_tokens=MAX_GENERATION_TOKENS,
